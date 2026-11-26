@@ -14,7 +14,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -147,7 +149,14 @@ JavaRuntimeProbe probe_java_runtime(const fs::path& javawPath) {
     return result;
 }
 
-void capture_java_stream(HANDLE readHandle, const fs::path& outputPath, const std::string& tokenForRedaction) {
+struct JavaStreamCaptureCompletion {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool complete = false;
+};
+
+void capture_java_stream(HANDLE readHandle, const fs::path& outputPath, const std::string& tokenForRedaction,
+                        const std::shared_ptr<JavaStreamCaptureCompletion>& completion) {
     std::string output;
     char chunk[4096];
     DWORD bytesRead = 0;
@@ -155,37 +164,58 @@ void capture_java_stream(HANDLE readHandle, const fs::path& outputPath, const st
     bool outputTruncated = false;
     DWORD readError = ERROR_SUCCESS;
     BOOL readSucceeded = TRUE;
-    while ((readSucceeded = ReadFile(readHandle, chunk, sizeof(chunk), &bytesRead, nullptr)) && bytesRead > 0) {
-        if (output.size() < maxCapture) {
-            const size_t take = std::min<size_t>(bytesRead, maxCapture - output.size());
-            output.append(chunk, take);
-            if (take < bytesRead) outputTruncated = true;
+    bool pipeClosed = false;
+    try {
+        while ((readSucceeded = ReadFile(readHandle, chunk, sizeof(chunk), &bytesRead, nullptr)) && bytesRead > 0) {
+            if (output.size() < maxCapture) {
+                const size_t take = std::min<size_t>(bytesRead, maxCapture - output.size());
+                output.append(chunk, take);
+                if (take < bytesRead) outputTruncated = true;
+            } else {
+                outputTruncated = true;
+            }
+        }
+        if (!readSucceeded) readError = GetLastError();
+        CloseHandle(readHandle);
+        pipeClosed = true;
+        if (outputTruncated) {
+            const size_t lineEnd = output.find_last_of("\r\n");
+            if (lineEnd != std::string::npos) output.resize(lineEnd + 1);
+            else output.clear();
+        }
+        if (!tokenForRedaction.empty()) {
+            size_t at = 0;
+            while ((at = output.find(tokenForRedaction, at)) != std::string::npos) {
+                output.replace(at, tokenForRedaction.size(), "[REDACTED_MC_TOKEN]");
+                at += sizeof("[REDACTED_MC_TOKEN]") - 1;
+            }
+        }
+        std::ofstream stream(outputPath, std::ios::binary | std::ios::trunc);
+        if (stream) {
+            stream << redact_tokens(output);
+            if (outputTruncated) stream << "\n[Capture truncated at 4 MiB.]\n";
+            if (readError != ERROR_SUCCESS && readError != ERROR_BROKEN_PIPE && readError != ERROR_HANDLE_EOF) {
+                stream << "\n[Pipe read failed with Win32 error " << readError << ".]\n";
+            }
+            stream.flush();
         } else {
-            outputTruncated = true;
+            std::ofstream errorStream(outputPath, std::ios::binary | std::ios::trunc);
+            errorStream << "[Could not write Java output capture file.]\n";
         }
+    } catch (const std::exception& ex) {
+        if (!pipeClosed) CloseHandle(readHandle);
+        std::ofstream errorStream(outputPath, std::ios::binary | std::ios::app);
+        if (errorStream) errorStream << "\n[Java output capture failed: " << redact_tokens(ex.what()) << "]\n";
+    } catch (...) {
+        if (!pipeClosed) CloseHandle(readHandle);
+        std::ofstream errorStream(outputPath, std::ios::binary | std::ios::app);
+        if (errorStream) errorStream << "\n[Java output capture failed with an unknown error.]\n";
     }
-    if (!readSucceeded) readError = GetLastError();
-    CloseHandle(readHandle);
-    if (outputTruncated) {
-        const size_t lineEnd = output.find_last_of("\r\n");
-        if (lineEnd != std::string::npos) output.resize(lineEnd + 1);
-        else output.clear();
+    {
+        std::lock_guard<std::mutex> lock(completion->mutex);
+        completion->complete = true;
     }
-    if (!tokenForRedaction.empty()) {
-        size_t at = 0;
-        while ((at = output.find(tokenForRedaction, at)) != std::string::npos) {
-            output.replace(at, tokenForRedaction.size(), "[REDACTED_MC_TOKEN]");
-            at += sizeof("[REDACTED_MC_TOKEN]") - 1;
-        }
-    }
-    std::ofstream stream(outputPath, std::ios::binary | std::ios::trunc);
-    if (stream) {
-        stream << redact_tokens(output);
-        if (outputTruncated) stream << "\n[Capture truncated at 4 MiB.]\n";
-        if (readError != ERROR_SUCCESS && readError != ERROR_BROKEN_PIPE && readError != ERROR_HANDLE_EOF) {
-            stream << "\n[Pipe read failed with Win32 error " << readError << ".]\n";
-        }
-    }
+    completion->cv.notify_all();
 }
 
 std::string query_param_from_target(const std::string& reqTarget, const std::string& key) {
@@ -465,6 +495,8 @@ public:
     fs::path lastMcNativeDir;
     fs::path lastMcStdoutPath;
     fs::path lastMcStderrPath;
+    std::shared_ptr<JavaStreamCaptureCompletion> lastStdoutCapture;
+    std::shared_ptr<JavaStreamCaptureCompletion> lastStderrCapture;
     ULONGLONG prevIdleTime = 0;
     ULONGLONG prevKernelTime = 0;
     ULONGLONG prevUserTime = 0;
@@ -525,6 +557,13 @@ public:
 
     void updateLaunchDiagnosticOnExit(DWORD processId, DWORD exitCode) {
         if (lastMcDiagnosticPath.empty()) return;
+        auto waitForCapture = [](const std::shared_ptr<JavaStreamCaptureCompletion>& capture) {
+            if (!capture) return false;
+            std::unique_lock<std::mutex> lock(capture->mutex);
+            return capture->cv.wait_for(lock, std::chrono::seconds(5), [&] { return capture->complete; });
+        };
+        const bool stdoutCaptureComplete = waitForCapture(lastStdoutCapture);
+        const bool stderrCaptureComplete = waitForCapture(lastStderrCapture);
         try {
         json record = json::parse(read_text_file(fs::u8path(lastMcDiagnosticPath)), nullptr, false);
         if (!record.is_object()) {
@@ -542,6 +581,11 @@ public:
         record["exitCode"] = exitCode;
         record["exitCodeHex"] = exitHex;
         record["exitedAt"] = iso_timestamp_now();
+        record["stdoutCaptureComplete"] = stdoutCaptureComplete;
+        record["stderrCaptureComplete"] = stderrCaptureComplete;
+        if (!stdoutCaptureComplete || !stderrCaptureComplete) {
+            record["captureWarning"] = "Java output pipes did not finish draining within five seconds; capture files may be incomplete.";
+        }
 
         const fs::path latestLog = lastMcInstanceDir / "logs" / "latest.log";
         const bool latestLogExists = fs::is_regular_file(latestLog);
@@ -3809,6 +3853,46 @@ public:
                 throw std::runtime_error("Cannot create launch diagnostics directory " + launchLogDir.string() +
                     ": " + launchLogDirError.message());
             }
+            fs::path instDir = resolveInstanceDir(prof);
+            const std::string launchAttemptId = std::to_string(static_cast<unsigned long long>(std::time(nullptr))) + "-" +
+                std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64());
+            const std::string launchStem = "launch-" + launchAttemptId;
+            lastMcDiagnosticPath = wide_to_utf8((launchLogDir / (launchStem + ".json")).wstring());
+            lastMcInstanceDir = instDir;
+            lastMcNativeDir = fs::u8path(prep.value("nativeDirectory", ""));
+            if (lastMcNativeDir.empty()) lastMcNativeDir = getGameRootDir() / "versions" / mcVer / ("natives-" + install_loader_key(loader));
+            lastMcStdoutPath = launchLogDir / (launchStem + ".stdout.log");
+            lastMcStderrPath = launchLogDir / (launchStem + ".stderr.log");
+            std::string classPath;
+            for (size_t i = 0; i + 1 < prep["jvmArguments"].size(); ++i) {
+                if (prep["jvmArguments"][i].is_string() && prep["jvmArguments"][i] == "-cp" &&
+                    prep["jvmArguments"][i + 1].is_string()) {
+                    classPath = prep["jvmArguments"][i + 1].get<std::string>();
+                    break;
+                }
+            }
+            json launchRecord = {
+                {"attemptId", launchAttemptId}, {"attemptedAt", iso_timestamp_now()},
+                {"version", mcVer}, {"loader", loader},
+                {"loaderVersion", prof.value("loaderVersion", loader == "vanilla" ? "" : "0.16.10")},
+                {"javaExecutable", wide_to_utf8(javaw.wstring())},
+                {"expectedJavaMajor", javaMajor}, {"javaReportedMajor", javaProbe.major},
+                {"javaArchitecture", javaProbe.architecture}, {"javaVersionOutput", javaProbe.versionOutput},
+                {"workingDirectory", wide_to_utf8(instDir.wstring())},
+                {"nativeLibraryPathArgument", wide_to_utf8(lastMcNativeDir.wstring())},
+                {"nativeDirectoryExists", fs::is_directory(lastMcNativeDir)},
+                {"classPath", classPath}, {"commandLineRedacted", wide_to_utf8(safeCommandLine)},
+                {"argumentCount", commandArgs.size()}, {"environment", "inherited from launcher"},
+                {"processCreation", "not_attempted"}, {"processCreationWin32Error", nullptr},
+                {"pid", nullptr}, {"exitCode", nullptr}, {"outcome", "preparing_process_creation"},
+                {"stageReached", "pre_process_creation"}, {"stdout", wide_to_utf8(lastMcStdoutPath.wstring())},
+                {"stderr", wide_to_utf8(lastMcStderrPath.wstring())}
+            };
+            if (!write_text_atomic(fs::u8path(lastMcDiagnosticPath), launchRecord.dump(2))) {
+                appendLog("[Launch] Could not write pre-launch diagnostic file " + lastMcDiagnosticPath);
+            }
+            { std::ofstream touch(lastMcStdoutPath, std::ios::binary | std::ios::trunc); }
+            { std::ofstream touch(lastMcStderrPath, std::ios::binary | std::ios::trunc); }
             std::wstring wcmd = fullCommandLine;
             STARTUPINFOW si{};
             si.cb = sizeof(si);
@@ -3846,15 +3930,20 @@ public:
             si.hStdError = stderrWrite;
             si.hStdInput = childStdin;
             PROCESS_INFORMATION pi{};
-            fs::path instDir = resolveInstanceDir(prof);
             if (!CreateProcessW(javaw.wstring().c_str(), wcmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr,
                                 instDir.wstring().c_str(), &si, &pi)) {
                 const DWORD error = GetLastError();
+                launchRecord["processCreation"] = "failed";
+                launchRecord["processCreationWin32Error"] = error;
+                launchRecord["outcome"] = "process_creation_failed";
+                launchRecord["failureStage"] = "CreateProcessW";
+                launchRecord["failedAt"] = iso_timestamp_now();
+                write_text_atomic(fs::u8path(lastMcDiagnosticPath), launchRecord.dump(2));
                 CloseHandle(stdoutRead); CloseHandle(stdoutWrite);
                 CloseHandle(stderrRead); CloseHandle(stderrWrite);
                 CloseHandle(childStdin);
                 appendLog("[Launch] CreateProcessW failed for Java executable " + wide_to_utf8(javaw.wstring()) +
-                    " in " + wide_to_utf8(instDir.wstring()) + " (Win32 error " + std::to_string(error) + ").");
+                    " in " + wide_to_utf8(instDir.wstring()) + " (Win32 error " + std::to_string(error) + "). Diagnostic: " + lastMcDiagnosticPath);
                 throw std::runtime_error("CreateProcessW failed for " + wide_to_utf8(javaw.wstring()) +
                     " (Win32 error " + std::to_string(error) + ")");
             }
@@ -3866,16 +3955,11 @@ public:
             activeMcPid = pi.dwProcessId;
             lastMcExitCode = STILL_ACTIVE;
             lastProcessQueryError = 0;
-            const std::string launchStem = "launch-" + std::to_string(static_cast<unsigned long long>(std::time(nullptr))) + "-" + std::to_string(activeMcPid);
-            lastMcDiagnosticPath = wide_to_utf8((launchLogDir / (launchStem + ".json")).wstring());
-            lastMcInstanceDir = instDir;
-            lastMcNativeDir = fs::u8path(prep.value("nativeDirectory", ""));
-            if (lastMcNativeDir.empty()) lastMcNativeDir = getGameRootDir() / "versions" / mcVer / ("natives-" + install_loader_key(loader));
-            lastMcStdoutPath = launchLogDir / (launchStem + ".stdout.log");
-            lastMcStderrPath = launchLogDir / (launchStem + ".stderr.log");
             const std::string tokenForRedaction = mcToken;
-            std::thread(capture_java_stream, stdoutRead, lastMcStdoutPath, tokenForRedaction).detach();
-            std::thread(capture_java_stream, stderrRead, lastMcStderrPath, tokenForRedaction).detach();
+            lastStdoutCapture = std::make_shared<JavaStreamCaptureCompletion>();
+            lastStderrCapture = std::make_shared<JavaStreamCaptureCompletion>();
+            std::thread(capture_java_stream, stdoutRead, lastMcStdoutPath, tokenForRedaction, lastStdoutCapture).detach();
+            std::thread(capture_java_stream, stderrRead, lastMcStderrPath, tokenForRedaction, lastStderrCapture).detach();
             const fs::path latestLogPath = instDir / "logs" / "latest.log";
             const bool latestLogExists = fs::is_regular_file(latestLogPath);
             const fs::path crashDir = instDir / "crash-reports";
@@ -3893,35 +3977,21 @@ public:
                     }
                 }
             }
-            std::string classPath;
-            for (size_t i = 0; i + 1 < prep["jvmArguments"].size(); ++i) {
-                if (prep["jvmArguments"][i].is_string() && prep["jvmArguments"][i] == "-cp" &&
-                    prep["jvmArguments"][i + 1].is_string()) {
-                    classPath = prep["jvmArguments"][i + 1].get<std::string>();
-                    break;
-                }
-            }
-            json launchRecord = {
-                {"version", mcVer}, {"loader", loader},
-                {"loaderVersion", prof.value("loaderVersion", loader == "vanilla" ? "" : "0.16.10")},
-                {"javaExecutable", wide_to_utf8(javaw.wstring())},
-                {"expectedJavaMajor", javaMajor}, {"javaReportedMajor", javaProbe.major},
-                {"javaArchitecture", javaProbe.architecture}, {"javaVersionOutput", javaProbe.versionOutput},
-                {"workingDirectory", wide_to_utf8(instDir.wstring())},
-                {"nativeLibraryPathArgument", wide_to_utf8(lastMcNativeDir.wstring())},
-                {"nativeDirectoryExists", fs::is_directory(lastMcNativeDir)}, {"nativeDllFiles", nativeDllFiles},
-                {"classPath", classPath}, {"commandLineRedacted", wide_to_utf8(safeCommandLine)},
-                {"processCreation", "success"}, {"processCreationWin32Error", nullptr},
-                {"pid", activeMcPid}, {"startedAt", iso_timestamp_now()}, {"exitCode", nullptr},
-                {"outcome", "process_running_or_starting"}, {"stageReached", "process_created"},
-                {"failureStage", nullptr}, {"terminationCause", nullptr}, {"exitCodeHex", nullptr},
-                {"stdout", wide_to_utf8(lastMcStdoutPath.wstring())}, {"stdoutExists", false},
-                {"stderr", wide_to_utf8(lastMcStderrPath.wstring())}, {"stderrExists", false},
-                {"latestLog", latestLogExists ? json(wide_to_utf8(latestLogPath.wstring())) : json(nullptr)},
-                {"latestLogExists", latestLogExists}, {"crashReportFiles", crashReportFiles},
-                {"crashReportDirectoryExists", fs::is_directory(crashDir)},
-                {"firstExceptionCandidate", nullptr}
-            };
+            launchRecord["processCreation"] = "success";
+            launchRecord["processCreationWin32Error"] = nullptr;
+            launchRecord["pid"] = activeMcPid;
+            launchRecord["startedAt"] = iso_timestamp_now();
+            launchRecord["exitCode"] = nullptr;
+            launchRecord["outcome"] = "process_running_or_starting";
+            launchRecord["stageReached"] = "process_created";
+            launchRecord["failureStage"] = nullptr;
+            launchRecord["exitCodeHex"] = nullptr;
+            launchRecord["nativeDllFiles"] = nativeDllFiles;
+            launchRecord["latestLog"] = latestLogExists ? json(wide_to_utf8(latestLogPath.wstring())) : json(nullptr);
+            launchRecord["latestLogExists"] = latestLogExists;
+            launchRecord["crashReportFiles"] = crashReportFiles;
+            launchRecord["crashReportDirectoryExists"] = fs::is_directory(crashDir);
+            launchRecord["firstExceptionCandidate"] = nullptr;
             if (!write_text_atomic(fs::u8path(lastMcDiagnosticPath), launchRecord.dump(2))) {
                 appendLog("[Launch] Could not write launch diagnostic file " + lastMcDiagnosticPath);
             }

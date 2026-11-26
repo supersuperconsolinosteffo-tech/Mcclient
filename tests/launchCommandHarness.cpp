@@ -12,6 +12,10 @@ int main() {
     assert(quote_windows_argument(L"space here") == L"\"space here\"");
     assert(quote_windows_argument(L"quote\"inside") == L"\"quote\\\"inside\"");
     assert(quote_windows_argument(L"ends\\\\") == L"\"ends\\\\\\\\\"");
+    assert(quote_windows_argument(L"C:\\Users\\Zoë\\Saved Games\\Minecraft & #1") ==
+           L"\"C:\\Users\\Zoë\\Saved Games\\Minecraft & #1\"");
+    assert(quote_windows_argument(L"unicode 雪 and quote \" plus trailing\\\\") ==
+           L"\"unicode 雪 and quote \\\" plus trailing\\\\\\\\\"");
 
     const std::wstring command = build_windows_command_line(
         L"C:\\Program Files\\Java\\bin\\javaw.exe",

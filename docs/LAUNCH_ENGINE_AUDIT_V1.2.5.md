@@ -108,3 +108,24 @@ These steps use the existing installation/data directory and do not ask you to d
 Record per mode: `main menu reached (yes/no)`, `normal close detected (yes/no)`, PID, Java major/architecture, process exit code, diagnostic JSON path, output log path, Minecraft latest.log/crash-report result, and any observed stage/error. Do not include tokens in the report.
 
 **Acceptance outcome in this environment:** Windows execution is unavailable. Windows 1.21.4 Vanilla and Fabric 0.16.10 visible-main-menu tests, plus normal-close detection, are **UNVERIFIED**. The Windows PE cross-build and automated tests are not substitutes for these acceptance checks.
+
+## Follow-up: fresh exit-code report and capture-race audit
+
+The user reports another attempt exits almost immediately with a reported code `-1`, with empty/no-useful diagnostics and no Minecraft `latest.log`. That report alone does not identify a Java/Minecraft cause. In this C++ source, process monitoring calls `GetExitCodeProcess()` into a Windows `DWORD`; a successful query records the returned DWORD in decimal and hex. `STILL_ACTIVE` (259) is treated as running, and query failure is logged as an unknown state rather than a process exit. There is no generic `-1` process-exit sentinel in this monitor. A displayed `-1` could be an actual `0xFFFFFFFF` exit status or a conversion/reporting issue elsewhere; the exact source of the user's display cannot be established without that attempt's JSON or machine-side UI trace.
+
+This source review did establish two diagnostics defects and fixed them on this branch:
+
+- Previously, launch JSON and stdout/stderr paths were initialized only after `CreateProcessW` succeeded, so failures while creating pipes or starting Java had no per-attempt JSON record. The code now writes a token-redacted pre-launch record before `CreateProcessW`; a direct process-creation failure updates it with the numeric `GetLastError()` immediately captured after the failed API call. Successful starts update that same attempt record with PID and result fields. The diagnostic filename uses a unique attempt ID rather than assuming a child PID exists before process creation.
+- Previously, output reader threads were detached and the exit monitor immediately inspected output paths. Since the readers only wrote their capture files after reaching EOF, a fast process could be marked exited before those files were saved; the JSON then reported absent/empty captures and was never enriched again. Capture workers now signal completion only after closing/flushing their files. The exit path waits up to five seconds for each stream before inspecting the saved output and records whether capture completed or timed out. Empty output after a completed capture is therefore distinguishable from a capture still pending.
+
+The native Windows argument builder remains a separate confirmed launch-engine gap: it manually assembles a limited list and does not evaluate Mojang `arguments.jvm` / `arguments.game`, feature flags, or version argument rules; the current native game args also omit `--versionType`. This is source evidence of incomplete metadata compliance, but without the matching crash output it is not proven to be the cause of this user's specific exit. No speculative argument change was made. Vanilla/Fabric launch behavior must be validated before attributing or fixing that user's failure.
+
+### Verification after the diagnostic changes
+
+- Linux x86_64 sandbox confirmed by `uname`; neither `wine` nor `wine64` is installed, and this environment has no Windows desktop/game runtime. The available Zig toolchain cross-compiled the x86_64 Windows PE release but cannot execute WebView2 or Minecraft.
+- `npm run build:windows`: **PASS** (Windows x64 PE cross-build only; not runtime validation).
+- Native `launchCommandHarness.cpp`, compiled for the Linux host using Zig, including quoting cases with spaces, embedded quotes, Unicode and shell metacharacters: **PASS** (string construction tests only; not a Windows process round-trip).
+- `npm test`: **PASS** — 50 unit tests, 23 mod tests, release artifact/signature/hash verification. These do not prove process creation or a game launch.
+- Java version/process tests, Windows argument round-trip, JVM initialization, actual Vanilla 1.21.4 launch, actual Fabric 1.21.4 / 0.16.10 launch, main-menu arrival and normal-close detection: **NOT TESTED** here.
+
+The installer was regenerated at `release/VesperaClient-1.2.5-win64-setup.exe`; the launcher is `release/bin/VesperaClient.exe`. Do not use these build artifacts as evidence of runtime acceptance.
