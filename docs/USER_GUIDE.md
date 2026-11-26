@@ -1,34 +1,43 @@
 # Vespera Client — User Guide
 
-Welcome to **Vespera Client v1.0.0** for Windows 10 and Windows 11 (64-bit). This guide walks you through installation, signing in with your official Microsoft Minecraft account, tuning FPS and shaders, customizing your in-game HUD, and managing isolated mod profiles.
+Welcome to **Vespera Client v1.2.0** for Windows 10 and Windows 11 (64-bit). This guide walks you through creating offline accounts, signing in with your official Microsoft Minecraft account, tuning FPS and shaders, customizing your in-game HUD, and managing isolated mod profiles.
 
 ---
 
 ## 1. Installation & First-Launch Setup Wizard
 
-1. Run **`VesperaClient-1.0.0-win64-setup.exe`**.
+1. Run **`VesperaClient-1.2.0-win64-setup.exe`**.
    - Standard user permissions (`asInvoker`) are used—no Administrator UAC prompt is required when installing to your user profile.
    - Default binary path: `%LOCALAPPDATA%\Programs\VesperaClient\`
    - Default managed data path: `%APPDATA%\VesperaClient\`
 2. Choose whether to create **Desktop** and **Start Menu** shortcuts, then click **Install Vespera**.
-   - Every embedded binary (`VesperaClient.exe`, `VesperaUninstall.exe`, `vespera-client-1.0.0+mc1.21.4.jar`) is cryptographically verified via **SHA-256** during extraction.
+   - Every embedded binary (`VesperaClient.exe`, `VesperaUninstall.exe`, `vespera-client-1.2.0+mc1.21.4.jar`) is cryptographically verified via **SHA-256** during extraction.
    - Silent enterprise/power-user installation is also supported:
      ```powershell
-     .\VesperaClient-1.0.0-win64-setup.exe /S /D=C:\Games\VesperaClient
+     .\VesperaClient-1.2.0-win64-setup.exe /S /D=C:\Games\VesperaClient
      ```
 3. On first launch, the **First-Launch Setup Wizard** detects your CPU cores, total system RAM, and Java runtime, and lets you pick your starting optimization preset (**Balanced**, **Maximum FPS**, or **Visual Quality + Shaders**) in one click.
 
 ---
 
-## 2. Signing In with Your Official Microsoft Account
+## 2. Offline Accounts & Microsoft Authentication
 
-1. Open the **Accounts** page in the left navigation rail (or click the account chip in the top bar).
-2. Click **Sign in with Microsoft**.
-   - Vespera requests an official Microsoft OAuth 2.0 Device Verification Code and displays the verification URL (`https://www.microsoft.com/link`) and one-time code.
-   - Complete sign-in in your default browser (supporting 2FA, passkeys, and Microsoft Authenticator—Vespera never sees your password).
-3. Click **Complete Verification** once approved in your browser. Vespera verifies your Xbox Live token, XSTS token, Minecraft Java Edition ownership entitlement, and player UUID/skin.
-4. **Multiple Accounts**: You can link multiple Microsoft accounts, switch active accounts in one click, refresh expiring tokens, or sign out cleanly.
-   - *Note on OAuth Client ID*: If no `VESPERA_MSA_CLIENT_ID` is configured yet, paste your Azure Public Client Application ID directly in the **OAuth Client ID Setup** card on the **Accounts** page (see `docs/DEVELOPER_AND_BUILD_GUIDE.md` for creating a free personal Client ID in 2 minutes).
+### Create an Offline Account
+
+1. Open the **Accounts** page and choose **Create Offline Account** (the first-launch form also offers this setup).
+2. Enter a Minecraft username from 3 to 16 characters using letters, numbers, or underscores. The form previews the deterministic UUID that will be assigned.
+3. Select the new Offline Account and launch Minecraft. Offline accounts work in Singleplayer, LAN, and multiplayer servers configured with `online-mode=false`; they cannot join servers that require official online authentication.
+4. If a server rejects an offline session, Vespera explains that an authenticated Microsoft account is required.
+
+### Sign In with Microsoft
+
+1. On the **Accounts** page, click **Sign in with Microsoft**.
+2. Complete the official sign-in in your default browser (including 2FA, passkeys, or Microsoft Authenticator). Vespera never sees your password.
+3. Vespera verifies Xbox Live, XSTS, Minecraft Java Edition ownership, and your player profile. Microsoft tokens are encrypted at rest.
+
+### Switch Accounts
+
+Use the **Accounts** page or the bottom-dock account switcher to switch between Offline and Microsoft accounts. Both account types remain separately stored, and your selected account is remembered across launcher restarts. Microsoft sign-in requires the build maintainer to configure the OAuth application; an unconfigured build shows a clear notice when sign-in is attempted.
 
 ---
 

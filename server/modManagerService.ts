@@ -32,7 +32,7 @@ export interface ModSearchItem {
 }
 
 const MODRINTH_API_BASE = 'https://api.modrinth.com/v2';
-const USER_AGENT = 'VesperaLabs/VesperaClient/1.1.1 (engineering@vesperaclient.gg)';
+const USER_AGENT = 'VesperaLabs/VesperaClient/1.2.0 (engineering@vesperaclient.gg)';
 
 export class ModManagerService {
   private readonly modsDir: string;

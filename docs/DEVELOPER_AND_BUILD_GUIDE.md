@@ -70,7 +70,7 @@ npm run build:branding
 npx tsc --noEmit
 npm run build:ui
 
-# 4. Compile the Kotlin Fabric 1.21.4 Client Mod JAR (release/mods/vespera-client-1.0.0+mc1.21.4.jar)
+# 4. Compile the Kotlin Fabric 1.21.4 Client Mod JAR (release/mods/vespera-client-1.2.0+mc1.21.4.jar)
 #    and standalone JVM benchmark harness (dist/bench/vespera-benchmark-runner.jar)
 npm run build:mod
 
@@ -118,4 +118,4 @@ npm test
 What `npm test` executes:
 1. **`npm run test:unit` (Vitest)**: Tests path-traversal defenses, token log redaction, AES-256-GCM encrypted vault tamper detection, RAM/GC flag synthesis, visual-fidelity preservation, Modrinth conflict blocking (`OptiFabric`/`Indium`), transitive dependency auto-installation, profile isolation, backup/rollback, `.vesperaprofile` import/export, `options.txt` materialization, and official auth gatekeeping.
 2. **`npm run test:mod` (OpenJDK 21)**: Compiles and runs 23 unit assertions against the Kotlin Fabric Mod classes (`FrameTimeAnalyzer`, `CpsRingTracker`, `ServerTpsEstimator`, `HudEditorSolver`, `HudColorCodec`, `HudFormatters`, `ZoomController`, `ToggleSprintController`, `ChatCompactProcessor`, `TooltipEnhancer`, and `LauncherSyncBridge`).
-3. **`npm run test:verify-artifacts` (PE32+ & Checksum Verifier)**: Parses the binary DOS/COFF/PE32+ headers of `VesperaClient-1.0.0-win64-setup.exe`, `VesperaClient.exe`, and `VesperaUninstall.exe` to confirm `IMAGE_FILE_MACHINE_AMD64` (`0x8664`), `IMAGE_SUBSYSTEM_WINDOWS_GUI` (`2`), embedded `.rsrc` icon/manifest sections, clean Fabric Mod JAR contents, and exact `SHA256SUMS.txt` integrity.
+3. **`npm run test:verify-artifacts` (PE32+ & Checksum Verifier)**: Parses the binary DOS/COFF/PE32+ headers of `VesperaClient-1.2.0-win64-setup.exe`, `VesperaClient.exe`, and `VesperaUninstall.exe` to confirm `IMAGE_FILE_MACHINE_AMD64` (`0x8664`), `IMAGE_SUBSYSTEM_WINDOWS_GUI` (`2`), embedded `.rsrc` icon/manifest sections, clean Fabric Mod JAR contents, and exact `SHA256SUMS.txt` integrity.

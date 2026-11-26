@@ -27,14 +27,14 @@ Vespera Client is engineered as a cleanly decoupled four-layer architecture so e
                     ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │ 3. Custom Fabric Client Mod (mod/src/main/kotlin/gg/vespera/client/*)   │
-│    - Compiled Kotlin 2.4 -> Java 21 Bytecode (vespera-client-1.0.0.jar) │
+│    - Compiled Kotlin 2.4 -> Java 21 Bytecode (vespera-client-1.2.0.jar) │
 │    - 12 HUD Modules, In-Game HUD Studio (RShift), Zoom (C), ToggleSprint│
 │    - LauncherSyncBridge: live hot-reload of HUD layouts + telemetry IPC │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Why Native Win32 + WebView2 Instead of Electron?
-- **Binary Size**: `VesperaClient.exe` is **1.10 MB** (`VesperaClient-1.0.0-win64-setup.exe` is **1.64 MB** total), compared to **180–320 MB** for Electron-based launchers.
+- **Binary Size**: `VesperaClient.exe` is **1.52 MB** (`VesperaClient-1.2.0-win64-setup.exe` is **2.07 MB** total), compared to **180–320 MB** for Electron-based launchers.
 - **Memory Overhead**: Uses Windows 10/11's built-in Evergreen WebView2 shared runtime and automatically sheds UI buffers (`idle_low_memory` mode) the moment Minecraft launches, freeing maximum physical RAM for the Java heap and GPU shader caches.
 - **Optional Tauri 2 Scaffold**: `src-tauri/` is also included for environments where a Rust/Cargo Tauri 2 build target is desired alongside the standalone C++17/Zig Windows build.
 
@@ -46,7 +46,7 @@ Vespera Client never pretends every mod works across every Minecraft release. Ea
 
 | Minecraft Version | Tier | Mod Loader | Required Java | Optimization & Mod Stack Status |
 | :--- | :--- | :--- | :--- | :--- |
-| **`1.21.4`** *(Primary)* | **Supported** | Fabric `0.16.10` | **Java 21 LTS** | Full Vespera Client Mod `1.0.0`, Sodium `0.6.5`, Iris `1.8.5`, Lithium, FerriteCore, ModernFix, ImmediatelyFast, ETF/EMF, Continuity |
+| **`1.21.4`** *(Primary)* | **Supported** | Fabric `0.16.10` | **Java 21 LTS** | Full Vespera Client Mod `1.2.0`, Sodium `0.6.5`, Iris `1.8.5`, Lithium, FerriteCore, ModernFix, ImmediatelyFast, ETF/EMF, Continuity |
 | **`1.21.3`** | **Experimental** | Fabric `0.16.10` | **Java 21 LTS** | Transitional protocol; select visual add-ons skip `1.21.3` in favor of `1.21.4` |
 | **`1.21.1`** | **Supported** | Fabric `0.16.10` | **Java 21 LTS** | Broad community modpack ecosystem; Sodium `0.6+` & Iris `1.8+` verified |
 | **`1.20.4`** | **Supported** | Fabric `0.16.9` | **Java 17 / 21** | Stable modern competitive multiplayer target |

@@ -146,8 +146,21 @@ export async function dispatchRpcMethod(
       );
       return coordinator.getSnapshot();
 
+    case 'createOfflineAccount': {
+      const account = coordinator.createOfflineAccount(String(params.username ?? ''));
+      return { account, snapshot: coordinator.getSnapshot() };
+    }
+
+    case 'dismissFirstLaunch':
+      coordinator.dismissFirstLaunch();
+      return coordinator.getSnapshot();
+
+    case 'dismissMultiplayerNotice':
+      coordinator.dismissMultiplayerNotice();
+      return coordinator.getSnapshot();
+
     case 'switchAccount':
-      coordinator.authService.switchActiveAccount(String(params.accountId ?? ''));
+      coordinator.switchSelectedAccount(String(params.accountId ?? ''));
       return coordinator.getSnapshot();
 
     case 'signOutAccount':
@@ -157,7 +170,7 @@ export async function dispatchRpcMethod(
       return coordinator.getSnapshot();
 
     case 'removeAccount':
-      coordinator.authService.removeAccount(String(params.accountId ?? ''));
+      coordinator.removeAccountById(String(params.accountId ?? ''));
       return coordinator.getSnapshot();
 
     case 'setSessionMode':
@@ -216,11 +229,13 @@ export async function dispatchRpcMethod(
 
     case 'prepareLaunch': {
       const mode =
-        params.mode === 'offline_singleplayer'
-          ? 'offline_singleplayer'
-          : params.mode === 'online_authenticated'
-            ? 'online_authenticated'
-            : undefined;
+        params.mode === 'offline_account'
+          ? 'offline_account'
+          : params.mode === 'offline_singleplayer'
+            ? 'offline_singleplayer'
+            : params.mode === 'online_authenticated'
+              ? 'online_authenticated'
+              : undefined;
       return coordinator.prepareActiveLaunch(mode);
     }
 
@@ -268,13 +283,20 @@ export async function dispatchRpcMethod(
 
     case 'launchMinecraft': {
       const mode =
-        params.mode === 'offline_singleplayer'
-          ? 'offline_singleplayer'
-          : params.mode === 'online_authenticated'
-            ? 'online_authenticated'
-            : undefined;
+        params.mode === 'offline_account'
+          ? 'offline_account'
+          : params.mode === 'offline_singleplayer'
+            ? 'offline_singleplayer'
+            : params.mode === 'online_authenticated'
+              ? 'online_authenticated'
+              : undefined;
       const launchRes = await coordinator.launchActiveProfile(mode);
       return { launchRes, snapshot: coordinator.getSnapshot() };
+    }
+
+    case 'inspectMultiplayerDisconnect': {
+      const notice = coordinator.inspectMultiplayerDisconnect(String(params.logText ?? ''));
+      return { notice, snapshot: coordinator.getSnapshot() };
     }
 
     case 'applyAutoFix':

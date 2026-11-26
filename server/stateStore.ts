@@ -19,15 +19,18 @@ import type {
   InstalledModRecord,
   LaunchPreparationReport,
   LauncherSettings,
+  MinecraftAccount,
   ModCategory,
   ModHistoryEvent,
   ModloaderType,
+  MultiplayerRejectionNotice,
   PerformanceModeId,
   PerformanceSettings,
   ProfileSnapshotBackup,
   ResourcePackEntry,
   ShaderPackEntry,
 } from '../shared/types';
+import { classifyMultiplayerServerRejection } from '../shared/offlineAccountUtils';
 import { getVersionDescriptor, isVesperaCustomModCompatible } from '../shared/versionCatalog';
 import { AuthService, type AuthServiceOptions } from './authService';
 import { DiagnosticsAndBenchmarkService } from './diagnosticsAndBenchmarkService';
@@ -40,6 +43,7 @@ import { redactSensitiveTokens, writeFileAtomicSync } from './securityUtils';
 
 interface PersistedStateFile {
   schemaVersion: number;
+  selectedAccountId?: string | null;
   profiles: ClientProfile[];
   activeProfileId: string;
   profileBackups: ProfileSnapshotBackup[];
@@ -64,6 +68,7 @@ export class VesperaStateCoordinator {
   private readonly ipcDir: string;
   private persisted: PersistedStateFile;
   private recentLogs: string[] = [];
+  private lastMultiplayerNotice: MultiplayerRejectionNotice | null = null;
 
   readonly authService: AuthService;
   readonly modManager: ModManagerService;
@@ -80,15 +85,15 @@ export class VesperaStateCoordinator {
     this.ipcDir = path.join(this.dataRootDir, 'ipc');
     fs.mkdirSync(this.ipcDir, { recursive: true });
 
-    const v110ModJar = path.resolve(
+    const v120ModJar = path.resolve(
+      process.cwd(),
+      'release/mods/vespera-client-1.2.0+mc1.21.4.jar'
+    );
+    const v111ModJar = path.resolve(
       process.cwd(),
       'release/mods/vespera-client-1.1.1+mc1.21.4.jar'
     );
-    const v100ModJar = path.resolve(
-      process.cwd(),
-      'release/mods/vespera-client-1.1.0+mc1.21.4.jar'
-    );
-    const bundledModJarPath = fs.existsSync(v110ModJar) ? v110ModJar : v100ModJar;
+    const bundledModJarPath = fs.existsSync(v120ModJar) ? v120ModJar : v111ModJar;
     const benchJarPath = path.resolve(
       process.cwd(),
       'dist/bench/vespera-benchmark-runner.jar'
@@ -115,6 +120,15 @@ export class VesperaStateCoordinator {
     );
 
     this.persisted = this.loadOrInitializeState();
+    // Restore remembered selected account across restarts
+    if (this.persisted.selectedAccountId) {
+      const exists = this.authService
+        .listAccounts()
+        .some((a) => a.id === this.persisted.selectedAccountId);
+      if (exists) {
+        this.authService.switchActiveAccount(this.persisted.selectedAccountId);
+      }
+    }
     this.handleCrashRecoveryCheck();
     this.syncActiveHudToIpc();
   }
@@ -194,9 +208,9 @@ export class VesperaStateCoordinator {
           const migrated = this.migratePersistedState(raw);
           if (raw.schemaVersion !== 2) {
             this.saveState(migrated);
-            this.appendLog('[Migration] Seamlessly upgraded v1.0.0 user profiles to v1.1.1 schema.');
+            this.appendLog('[Migration] Seamlessly upgraded v1.0.0 user profiles to v1.2.0 schema.');
           } else {
-            this.appendLog('[Core] Loaded persisted Vespera Client v1.1.1 configuration.');
+            this.appendLog('[Core] Loaded persisted Vespera Client v1.2.0 configuration.');
           }
           return migrated;
         }
@@ -225,7 +239,7 @@ export class VesperaStateCoordinator {
           profileId: profiles[0].id,
           action: 'install',
           modName: 'Vespera Optimization Bundle',
-          version: '1.1.1+mc1.21.4',
+          version: '1.2.0+mc1.21.4',
           details:
             'Initialized curated Sodium + Lithium + FerriteCore + ImmediatelyFast + Iris + Vespera Core stack.',
         },
@@ -248,7 +262,7 @@ export class VesperaStateCoordinator {
     };
 
     this.saveState(fresh);
-    this.appendLog(`[Core] Initialized Vespera Client v1.1.1 (Recommended Heap: ${recRam} MB).`);
+    this.appendLog(`[Core] Initialized Vespera Client v1.2.0 (Recommended Heap: ${recRam} MB).`);
     return fresh;
   }
 
@@ -796,11 +810,69 @@ export class VesperaStateCoordinator {
     return receipt;
   }
 
+  createOfflineAccount(username: string): MinecraftAccount {
+    const created = this.authService.createOfflineAccount(username);
+    this.persisted.selectedAccountId = created.id;
+    this.persisted.settings.firstLaunchCompleted = true;
+    this.lastMultiplayerNotice = null;
+    this.saveState();
+    return created;
+  }
+
+  switchSelectedAccount(accountId: string): MinecraftAccount[] {
+    const list = this.authService.switchActiveAccount(accountId);
+    this.persisted.selectedAccountId = this.authService.getActiveAccountId();
+    this.persisted.settings.firstLaunchCompleted = true;
+    this.lastMultiplayerNotice = null;
+    this.saveState();
+    return list;
+  }
+
+  removeAccountById(accountId: string): MinecraftAccount[] {
+    const list = this.authService.removeAccount(accountId);
+    this.persisted.selectedAccountId = this.authService.getActiveAccountId();
+    this.saveState();
+    return list;
+  }
+
+  dismissFirstLaunch(): void {
+    this.persisted.settings.firstLaunchCompleted = true;
+    this.saveState();
+  }
+
+  dismissMultiplayerNotice(): void {
+    this.lastMultiplayerNotice = null;
+  }
+
+  /**
+   * Evaluates game/network disconnect output against the currently selected account type
+   * and records a clear explanation if an `online-mode=true` server rejected an Offline Account.
+   */
+  inspectMultiplayerDisconnect(logText: string): MultiplayerRejectionNotice | null {
+    const activeAcc = this.authService.getActiveAccount();
+    const accType = activeAcc?.accountType ?? 'offline';
+    const notice = classifyMultiplayerServerRejection(
+      logText,
+      accType,
+      activeAcc?.username
+    );
+    if (notice) {
+      this.lastMultiplayerNotice = notice;
+      this.appendLog(`[Multiplayer] ${notice.title}: ${notice.message}`);
+    }
+    return notice;
+  }
+
   prepareActiveLaunch(
-    requestedMode?: 'online_authenticated' | 'offline_singleplayer'
+    requestedMode?: 'offline_account' | 'online_authenticated' | 'offline_singleplayer'
   ): LaunchPreparationReport {
     const active = this.getActiveProfile();
-    const sessionMode = requestedMode ?? this.authService.getActiveSessionMode();
+    const activeAccount = this.authService.getActiveAccount();
+    const resolvedMode: 'offline_account' | 'online_authenticated' | 'offline_singleplayer' =
+      requestedMode ??
+      (activeAccount?.accountType === 'offline'
+        ? 'offline_account'
+        : this.authService.getActiveSessionMode());
     const totalRamMb = Math.round(os.totalmem() / (1024 * 1024));
 
     this.launcherService.materializeInstanceFiles(
@@ -814,24 +886,83 @@ export class VesperaStateCoordinator {
     return this.launcherService.prepareLaunchCommand({
       profile: active,
       settings: this.persisted.settings,
-      account: this.authService.getActiveAccount(),
+      account: activeAccount,
       totalSystemRamMb: totalRamMb,
       installedMods: this.persisted.installedMods,
-      sessionMode,
+      sessionMode: resolvedMode,
     });
   }
 
-  async launchActiveProfile(requestedMode?: 'online_authenticated' | 'offline_singleplayer'): Promise<{
+  async launchActiveProfile(
+    requestedMode?: 'offline_account' | 'online_authenticated' | 'offline_singleplayer'
+  ): Promise<{
     launched: boolean;
     stageReached: string;
     pid?: number;
     instanceDir?: string;
-    sessionMode: 'online_authenticated' | 'offline_singleplayer';
+    sessionMode: 'offline_account' | 'online_authenticated' | 'offline_singleplayer';
     message: string;
   }> {
     const active = this.getActiveProfile();
-    const sessionMode = requestedMode ?? this.authService.getActiveSessionMode();
+    const activeAccount = this.authService.getActiveAccount();
+    const sessionMode: 'offline_account' | 'online_authenticated' | 'offline_singleplayer' =
+      requestedMode ??
+      (activeAccount?.accountType === 'offline'
+        ? 'offline_account'
+        : this.authService.getActiveSessionMode());
     const totalRamMb = Math.round(os.totalmem() / (1024 * 1024));
+
+    // 1. Genuine Local Offline Account Mode (Singleplayer, LAN, and online-mode=false servers)
+    if (sessionMode === 'offline_account') {
+      if (!activeAccount || activeAccount.accountType !== 'offline') {
+        return {
+          launched: false,
+          stageReached: 'account_selection_required',
+          sessionMode: 'offline_account',
+          message:
+            'Create or select an Offline Account (or sign in with Microsoft) on the Accounts page before launching.',
+        };
+      }
+
+      const spawned = await this.launcherService.installAndLaunchMinecraft({
+        profile: active,
+        settings: this.persisted.settings,
+        account: activeAccount,
+        mcAccessToken: null,
+        sessionMode: 'offline_account',
+        hudLayout: this.getActiveHudLayout(active),
+        installedMods: this.persisted.installedMods,
+        shaderPacks: this.persisted.shaderPacks,
+        totalSystemRamMb: totalRamMb,
+        onLog: (line) => this.appendLog(line),
+        onMultiplayerRejection: (notice) => {
+          this.lastMultiplayerNotice = notice;
+          this.appendLog(`[Multiplayer] ${notice.title}: ${notice.message}`);
+        },
+      });
+      active.lastPlayedAt = new Date().toISOString();
+      this.persisted.selectedAccountId = activeAccount.id;
+      this.persisted.settings.firstLaunchCompleted = true;
+      this.saveState();
+      return {
+        launched: true,
+        stageReached: 'process_spawned_offline_account',
+        pid: spawned.pid,
+        instanceDir: spawned.instanceDir,
+        sessionMode: 'offline_account',
+        message: `Launched Minecraft ${active.mcVersion} (${active.loader}) with Offline Account "${activeAccount.username}".`,
+      };
+    }
+
+    // Refuse any attempt to launch an Offline Account as an Online-Authenticated Microsoft session
+    if (activeAccount?.accountType === 'offline' && sessionMode === 'online_authenticated') {
+      return {
+        launched: false,
+        stageReached: 'online_mode_requires_microsoft',
+        sessionMode: 'online_authenticated',
+        message: `"${activeAccount.username}" is an Offline Account and cannot authenticate to online-mode Microsoft servers. Switch to or sign in with a Microsoft Account to use online authentication.`,
+      };
+    }
 
     if (sessionMode === 'offline_singleplayer') {
       const localStatus = this.launcherService.getVersionInstallStatus(
@@ -894,14 +1025,14 @@ export class VesperaStateCoordinator {
 
     if (!session) {
       this.appendLog(
-        '[Launch] Blocked online launch: Sign in with a Microsoft account owning Minecraft: Java Edition first.'
+        '[Launch] No account selected: Create an Offline Account or sign in with Microsoft before launching.'
       );
       return {
         launched: false,
         stageReached: 'authentication_required',
         sessionMode: 'online_authenticated',
         message:
-          'Sign in with Microsoft on the Accounts page before launching online multiplayer, or use Offline Singleplayer if previously verified.',
+          'Create an Offline Account or sign in with Microsoft on the Accounts page before launching.',
       };
     }
 
@@ -916,9 +1047,15 @@ export class VesperaStateCoordinator {
       shaderPacks: this.persisted.shaderPacks,
       totalSystemRamMb: totalRamMb,
       onLog: (line) => this.appendLog(line),
+      onMultiplayerRejection: (notice) => {
+        this.lastMultiplayerNotice = notice;
+        this.appendLog(`[Multiplayer] ${notice.title}: ${notice.message}`);
+      },
     });
 
     active.lastPlayedAt = new Date().toISOString();
+    this.persisted.selectedAccountId = session.account.id;
+    this.persisted.settings.firstLaunchCompleted = true;
     this.saveState();
     return {
       launched: true,
@@ -1010,11 +1147,12 @@ export class VesperaStateCoordinator {
     }));
 
     return {
-      version: '1.1.1',
+      version: '1.2.0',
       platformMode: 'node_preview_bridge',
       oauthConfig: this.authService.getOAuthConfigState(),
       authFlow: this.authService.getAuthFlowState(),
       offlineAvailability: this.authService.computeOfflineAvailability(activeVersionReady),
+      lastMultiplayerNotice: this.lastMultiplayerNotice,
       accounts,
       activeAccountId: activeAccount?.id ?? null,
       versions,

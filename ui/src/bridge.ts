@@ -248,6 +248,19 @@ class VesperaRpcBridge {
   switchAccount(accountId: string) {
     return this.invokeSnapshot('switchAccount', { accountId });
   }
+  async createOfflineAccount(username: string) {
+    const raw = await this.invoke<{ account: unknown; snapshot: unknown }>(
+      'createOfflineAccount',
+      { username }
+    );
+    return validateAndNormalizeSnapshot(raw.snapshot);
+  }
+  dismissFirstLaunch() {
+    return this.invokeSnapshot('dismissFirstLaunch');
+  }
+  dismissMultiplayerNotice() {
+    return this.invokeSnapshot('dismissMultiplayerNotice');
+  }
   signOutAccount(accountId: string) {
     return this.invokeSnapshot('signOutAccount', { accountId });
   }
@@ -257,7 +270,7 @@ class VesperaRpcBridge {
   setSessionMode(mode: 'online_authenticated' | 'offline_singleplayer') {
     return this.invokeSnapshot('setSessionMode', { mode });
   }
-  prepareLaunch(mode?: 'online_authenticated' | 'offline_singleplayer') {
+  prepareLaunch(mode?: 'offline_account' | 'online_authenticated' | 'offline_singleplayer') {
     return this.invoke<LaunchPreparationReport>('prepareLaunch', mode ? { mode } : {});
   }
   async verifyAndRepair() {
@@ -275,13 +288,15 @@ class VesperaRpcBridge {
       snapshot: validateAndNormalizeSnapshot(raw.snapshot),
     };
   }
-  async launchMinecraft(mode?: 'online_authenticated' | 'offline_singleplayer') {
+  async launchMinecraft(
+    mode?: 'offline_account' | 'online_authenticated' | 'offline_singleplayer'
+  ) {
     const raw = await this.invoke<{
       launchRes: {
         launched: boolean;
         pid?: number | null;
         stageReached: string;
-        sessionMode?: 'online_authenticated' | 'offline_singleplayer';
+        sessionMode?: 'offline_account' | 'online_authenticated' | 'offline_singleplayer';
         message: string;
         preparation?: LaunchPreparationReport;
       };

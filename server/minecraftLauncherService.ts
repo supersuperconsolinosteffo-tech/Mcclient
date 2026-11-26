@@ -13,10 +13,12 @@ import type {
   MinecraftAccount,
   MinecraftVersionDescriptor,
   ModloaderType,
+  MultiplayerRejectionNotice,
   ShaderPackEntry,
   VersionDownloadProgress,
   VersionInstallStatus,
 } from '../shared/types';
+import { classifyMultiplayerServerRejection } from '../shared/offlineAccountUtils';
 import {
   MINECRAFT_VERSION_CATALOG,
   OFFICIAL_MOJANG_SEED_MANIFEST,
@@ -1460,13 +1462,13 @@ export class MinecraftLauncherService {
         process.cwd(),
         'release',
         'mods',
-        'vespera-client-1.1.1+mc1.21.4.jar'
+        'vespera-client-1.2.0+mc1.21.4.jar'
       );
       const legacyReleaseModJar = path.join(
         process.cwd(),
         'release',
         'mods',
-        'vespera-client-1.1.0+mc1.21.4.jar'
+        'vespera-client-1.1.1+mc1.21.4.jar'
       );
 
       // Clean stale Vespera custom JAR if profile version is NOT 1.21.4
@@ -1523,7 +1525,7 @@ export class MinecraftLauncherService {
     account: MinecraftAccount | null;
     totalSystemRamMb: number;
     installedMods: InstalledModRecord[];
-    sessionMode?: 'online_authenticated' | 'offline_singleplayer';
+    sessionMode?: 'offline_account' | 'online_authenticated' | 'offline_singleplayer';
   }): LaunchPreparationReport {
     const {
       profile,
@@ -1531,7 +1533,9 @@ export class MinecraftLauncherService {
       account,
       totalSystemRamMb,
       installedMods,
-      sessionMode = 'online_authenticated',
+      sessionMode = account?.accountType === 'offline'
+        ? 'offline_account'
+        : 'online_authenticated',
     } = params;
     const warnings: string[] = [];
 
@@ -1632,22 +1636,32 @@ export class MinecraftLauncherService {
       );
     }
 
-    // Validate authentication OR legitimate offline singleplayer eligibility
-    if (sessionMode === 'offline_singleplayer') {
+    // Validate account readiness according to account type & session mode
+    if (sessionMode === 'offline_account') {
+      if (!account || account.accountType !== 'offline') {
+        warnings.push(
+          'Select or create an Offline Account (or sign in with Microsoft) on the Accounts page before launching.'
+        );
+      }
+    } else if (sessionMode === 'offline_singleplayer') {
       if (!account || !account.ownsMinecraftJava || account.lastValidatedAt <= 0) {
         warnings.push(
-          'Offline Singleplayer requires an account previously verified via Microsoft authentication with Minecraft: Java Edition ownership.'
+          'Offline Singleplayer fallback requires a Microsoft account previously verified on this device, or create an Offline Account directly.'
         );
       }
       if (!receipt) {
         warnings.push(
-          `Minecraft ${profile.mcVersion} is not installed locally yet. Download it while online before launching Offline Singleplayer.`
+          `Minecraft ${profile.mcVersion} is not installed locally yet. Download it before launching.`
         );
       }
     } else {
       if (!account) {
         warnings.push(
-          'No authenticated Microsoft account selected. Sign in on the Accounts page before launching online.'
+          'No account selected. Create an Offline Account or sign in with Microsoft on the Accounts page.'
+        );
+      } else if (account.accountType === 'offline') {
+        warnings.push(
+          `Account "${account.username}" is an Offline Account and uses offline session behavior (cannot authenticate to online-mode Microsoft servers).`
         );
       } else if (!account.ownsMinecraftJava) {
         warnings.push(
@@ -1655,7 +1669,7 @@ export class MinecraftLauncherService {
         );
       } else if (account.sessionStatus === 'signed_out') {
         warnings.push(
-          `Account "${account.username}" is currently signed out. Click "Sign in with Microsoft" or switch to Offline Singleplayer.`
+          `Microsoft account "${account.username}" is signed out. Click "Sign in with Microsoft" or switch to an Offline Account.`
         );
       }
     }
@@ -1684,11 +1698,15 @@ export class MinecraftLauncherService {
       settings.customJvmExtraArgs
     );
 
+    const isUnauthenticatedOfflineToken =
+      sessionMode === 'offline_account' || sessionMode === 'offline_singleplayer';
+
     const jvmArguments = [
       ...baseFlags,
       `-Djava.library.path=${nativesDir}`,
       `-Dminecraft.launcher.brand=VesperaClient`,
-      `-Dminecraft.launcher.version=1.1.1`,
+      `-Dminecraft.launcher.version=1.2.0`,
+      ...(sessionMode === 'offline_account' ? ['-Dvespera.accountType=offline'] : []),
       ...(sessionMode === 'offline_singleplayer'
         ? ['-Dvespera.offlineSingleplayer=true']
         : []),
@@ -1704,7 +1722,7 @@ export class MinecraftLauncherService {
 
     const playerName = account?.username || '<unauthenticated>';
     const playerUuid = account?.uuid || '00000000000000000000000000000000';
-    const userType = sessionMode === 'offline_singleplayer' ? 'legacy' : 'msa';
+    const userType = isUnauthenticatedOfflineToken ? 'legacy' : 'msa';
 
     let gameArguments: string[];
     if (metaJson?.minecraftArguments && !metaJson.arguments?.game) {
@@ -1717,7 +1735,7 @@ export class MinecraftLauncherService {
         game_assets: path.join(assetsDir, 'virtual', 'legacy'),
         assets_index_name: assetIndexName,
         auth_uuid: playerUuid,
-        auth_access_token: sessionMode === 'offline_singleplayer' ? '0' : '[REDACTED_MC_TOKEN]',
+        auth_access_token: isUnauthenticatedOfflineToken ? '0' : '[REDACTED_MC_TOKEN]',
         user_properties: '{}',
         user_type: userType,
         version_type: versionDescriptor.type,
@@ -1743,11 +1761,11 @@ export class MinecraftLauncherService {
         '--uuid',
         playerUuid,
         '--accessToken',
-        sessionMode === 'offline_singleplayer' ? '0' : '[REDACTED_MC_TOKEN]',
+        isUnauthenticatedOfflineToken ? '0' : '[REDACTED_MC_TOKEN]',
         '--userType',
         userType,
         '--versionType',
-        profile.loader === 'vanilla' ? 'Vespera-Vanilla/1.1.1' : 'Vespera-Fabric/1.1.1',
+        profile.loader === 'vanilla' ? 'Vespera-Vanilla/1.2.0' : 'Vespera-Fabric/1.2.0',
         '--width',
         String(profile.graphics.resolutionWidth),
         '--height',
@@ -1755,6 +1773,8 @@ export class MinecraftLauncherService {
       ];
     }
 
+    // Note: Genuine Offline Accounts (`offline_account`) keep multiplayer enabled for LAN & `online-mode=false` servers!
+    // `--disableMultiplayer` is ONLY passed for the restricted Microsoft-account offline singleplayer fallback.
     if (sessionMode === 'offline_singleplayer') {
       gameArguments.push('--disableMultiplayer', '--disableChat');
     }
@@ -1789,13 +1809,16 @@ export class MinecraftLauncherService {
     const commandPreview = `"${javaExe}" ${jvmArguments.join(' ')} ${mainClass} ${gameArguments.join(' ')}`;
 
     const authOk =
-      sessionMode === 'offline_singleplayer'
-        ? Boolean(account && account.ownsMinecraftJava && account.lastValidatedAt > 0 && receipt)
-        : Boolean(
-            account &&
-              account.ownsMinecraftJava &&
-              account.sessionStatus !== 'signed_out'
-          );
+      sessionMode === 'offline_account'
+        ? Boolean(account && account.accountType === 'offline')
+        : sessionMode === 'offline_singleplayer'
+          ? Boolean(account && account.ownsMinecraftJava && account.lastValidatedAt > 0 && receipt)
+          : Boolean(
+              account &&
+                account.accountType === 'microsoft' &&
+                account.ownsMinecraftJava &&
+                account.sessionStatus !== 'signed_out'
+            );
 
     return {
       ready:
@@ -1826,12 +1849,13 @@ export class MinecraftLauncherService {
     settings: LauncherSettings;
     account: MinecraftAccount;
     mcAccessToken: string | null;
-    sessionMode: 'online_authenticated' | 'offline_singleplayer';
+    sessionMode: 'offline_account' | 'online_authenticated' | 'offline_singleplayer';
     hudLayout: HudLayoutProfile;
     installedMods: InstalledModRecord[];
     shaderPacks: ShaderPackEntry[];
     totalSystemRamMb: number;
     onLog: (line: string) => void;
+    onMultiplayerRejection?: (notice: MultiplayerRejectionNotice) => void;
     onProgress?: (progress: VersionDownloadProgress) => void;
   }): Promise<{ pid: number; instanceDir: string; sessionMode: string }> {
     const {
@@ -1845,19 +1869,24 @@ export class MinecraftLauncherService {
       shaderPacks,
       totalSystemRamMb,
       onLog,
+      onMultiplayerRejection,
       onProgress,
     } = params;
 
     if (sessionMode === 'online_authenticated') {
-      if (!account.ownsMinecraftJava || !mcAccessToken) {
+      if (account.accountType !== 'microsoft' || !account.ownsMinecraftJava || !mcAccessToken) {
         throw new Error(
-          'Online launch requires a valid Microsoft-authenticated session with verified Minecraft: Java Edition entitlement.'
+          'Online-mode authenticated launch requires an active Microsoft account with verified Minecraft: Java Edition ownership.'
         );
+      }
+    } else if (sessionMode === 'offline_account') {
+      if (account.accountType !== 'offline') {
+        throw new Error('Offline account launch requires a local Offline Account profile.');
       }
     } else {
       if (!account.ownsMinecraftJava || account.lastValidatedAt <= 0) {
         throw new Error(
-          'Offline Singleplayer requires a local account that previously completed Microsoft authentication and Minecraft ownership verification.'
+          'Offline Singleplayer fallback requires a Microsoft account previously verified on this device.'
         );
       }
     }
@@ -1938,9 +1967,11 @@ export class MinecraftLauncherService {
     const spawnArgs = [...prep.jvmArguments, prep.mainClass, ...finalGameArgs];
     onLog(
       `[Launch] Starting Minecraft ${profile.mcVersion} (${profile.loader.toUpperCase()}, ${
-        sessionMode === 'offline_singleplayer'
-          ? 'OFFLINE SINGLEPLAYER — multiplayer disabled'
-          : 'ONLINE AUTHENTICATED'
+        sessionMode === 'offline_account'
+          ? `OFFLINE ACCOUNT "${account.username}"`
+          : sessionMode === 'offline_singleplayer'
+            ? 'OFFLINE SINGLEPLAYER — multiplayer disabled'
+            : `MICROSOFT AUTHENTICATED "${account.username}"`
       }) via ${prep.javaExecutable}...`
     );
 
@@ -1953,14 +1984,28 @@ export class MinecraftLauncherService {
     this.activeChildProcess = child;
     this.activeMcVersion = profile.mcVersion;
 
+    const inspectLine = (line: string, prefix: string) => {
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      onLog(`${prefix} ${trimmed}`);
+      const notice = classifyMultiplayerServerRejection(
+        trimmed,
+        account.accountType,
+        account.username
+      );
+      if (notice && onMultiplayerRejection) {
+        onMultiplayerRejection(notice);
+      }
+    };
+
     child.stdout?.on('data', (chunk: Buffer) => {
       for (const line of chunk.toString('utf8').split(/\r?\n/)) {
-        if (line.trim()) onLog(`[MC] ${line.trim()}`);
+        inspectLine(line, '[MC]');
       }
     });
     child.stderr?.on('data', (chunk: Buffer) => {
       for (const line of chunk.toString('utf8').split(/\r?\n/)) {
-        if (line.trim()) onLog(`[MC:ERR] ${line.trim()}`);
+        inspectLine(line, '[MC:ERR]');
       }
     });
     child.on('exit', (code) => {

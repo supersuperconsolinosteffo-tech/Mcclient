@@ -544,7 +544,7 @@ export function validateAndNormalizeSnapshot(raw: unknown): AppStateSnapshot {
       : defaultHudLayouts;
 
   return {
-    version: asNonEmptyString(raw.version, '1.1.1'),
+    version: asNonEmptyString(raw.version, '1.2.0'),
     platformMode:
       raw.platformMode === 'windows_native_webview2'
         ? 'windows_native_webview2'
@@ -569,8 +569,25 @@ export function validateAndNormalizeSnapshot(raw: unknown): AppStateSnapshot {
     offlineAvailability: isRecord(raw.offlineAvailability)
       ? (raw.offlineAvailability as unknown as AppStateSnapshot['offlineAvailability'])
       : undefined,
+    lastMultiplayerNotice: isRecord(raw.lastMultiplayerNotice)
+      ? (raw.lastMultiplayerNotice as unknown as AppStateSnapshot['lastMultiplayerNotice'])
+      : null,
     accounts: Array.isArray(raw.accounts)
-      ? (raw.accounts.filter(isRecord) as unknown as AppStateSnapshot['accounts'])
+      ? raw.accounts.filter(isRecord).map((a) => {
+          const isOffline =
+            a.accountType === 'offline' || a.authProvider === 'offline';
+          return {
+            ...(a as unknown as AppStateSnapshot['accounts'][number]),
+            accountType: isOffline ? 'offline' : 'microsoft',
+            authProvider: isOffline ? 'offline' : 'microsoft_oauth',
+            sessionStatus: isOffline
+              ? 'offline_ready'
+              : ((typeof a.sessionStatus === 'string'
+                  ? a.sessionStatus
+                  : 'valid') as AppStateSnapshot['accounts'][number]['sessionStatus']),
+            ownsMinecraftJava: isOffline ? false : asBoolean(a.ownsMinecraftJava, false),
+          };
+        })
       : [],
     activeAccountId: typeof raw.activeAccountId === 'string' && raw.activeAccountId.length > 0 ? raw.activeAccountId : null,
     versions:

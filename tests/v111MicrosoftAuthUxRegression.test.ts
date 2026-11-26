@@ -43,14 +43,11 @@ describe('Vespera Client v1.1.1 — Seamless Microsoft Login UX & PKCE Regressio
     expect(snap.oauthConfig?.configured).toBe(false);
     const html = renderAccountsPage(snap, null);
 
-    expect(html).toContain('Connect your Minecraft account');
-    expect(html).toContain(
-      'Sign in using your official Microsoft account to access Minecraft Java Edition.'
-    );
+    expect(html).toContain('Add Offline Account');
+    expect(html).toContain('Add Microsoft Account');
+    expect(html).toContain('Offline Accounts');
     expect(html).toContain('Sign in with Microsoft');
-    expect(html).toContain(
-      'Your credentials are handled directly by Microsoft. Vespera never asks for or stores your Microsoft password.'
-    );
+    expect(html).toContain('Vespera never asks for your password');
     expect(html).not.toContain('Developer Config Required');
     expect(html).not.toContain('Maintainer / Developer Build Configuration Notice');
     expect(html).not.toContain('msa-client-id-input');
@@ -80,8 +77,8 @@ describe('Vespera Client v1.1.1 — Seamless Microsoft Login UX & PKCE Regressio
     expect(errHtml).toContain('Microsoft Sign-In Not Configured in This Build');
     // Developer diagnostics remain tucked inside a separate <details> element
     expect(errHtml).toContain('View developer diagnostics');
-    // And the user can still see the clean Connect hero & dismiss the error cleanly
-    expect(errHtml).toContain('Connect your Minecraft account');
+    // Offline account creation remains available when Microsoft OAuth is unconfigured.
+    expect(errHtml).toContain('Add Offline Account');
 
     coord.authService.cancelActiveAuthFlow();
     expect(coord.getSnapshot().authFlow?.mode).toBe('idle');
@@ -277,7 +274,7 @@ describe('Vespera Client v1.1.1 — Seamless Microsoft Login UX & PKCE Regressio
     const connectedHtml = renderAccountsPage(afterSnap, null);
     expect(connectedHtml).not.toContain('id="auth-progress-panel"');
     expect(connectedHtml).toContain('LunarGradeUser');
-    expect(connectedHtml).toContain('Active Session');
+    expect(connectedHtml).toContain('Authenticated');
     expect(connectedHtml).not.toContain('secret_mc_jwt_tok_999999999999');
 
     // Replay protection: trying to reuse the exact same authorization code in a new session must be blocked!

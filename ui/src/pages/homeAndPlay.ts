@@ -9,6 +9,7 @@ import type {
   VersionInstallStatus,
 } from '@shared/types';
 import { escapeHtml } from '../icons';
+import { renderMultiplayerRejectionBanner } from './accountsSettingsDiagAbout';
 
 export interface PlayPageFilterState {
   searchQuery: string;
@@ -92,6 +93,7 @@ export function renderHomePage(snap: AppStateSnapshot): string {
   );
   const benchBest = snap.latestBenchmark?.results.find((r) => r.scenarioId === 'vespera_max_fps');
   const benchBase = snap.latestBenchmark?.results.find((r) => r.scenarioId === 'vanilla_baseline');
+  const isOfflineAccount = activeAcc?.accountType === 'offline';
   const isOfflineMode =
     snap.offlineAvailability?.activeSessionMode === 'offline_singleplayer';
 
@@ -103,6 +105,7 @@ export function renderHomePage(snap: AppStateSnapshot): string {
         : `FABRIC ${activeProfile.loaderVersion}`;
 
   return `
+    ${renderMultiplayerRejectionBanner(snap.lastMultiplayerNotice)}
     <div class="hero-banner">
       <div style="max-width:640px">
         <div class="hero-kicker">VESPERA ENGINE v${escapeHtml(snap.version)} · ${escapeHtml(loaderLabel)} · DYNAMIC MOJANG MANIFEST</div>
@@ -119,7 +122,13 @@ export function renderHomePage(snap: AppStateSnapshot): string {
         </p>
         <div style="display:flex;flex-wrap:wrap;gap:10px">
           <button class="btn btn-primary btn-launch" data-action="launch-now">
-            ▶ ${isOfflineMode ? `Play Offline Singleplayer (${escapeHtml(activeProfile.mcVersion)})` : `Launch Minecraft ${escapeHtml(activeProfile.mcVersion)}`}
+            ▶ ${
+              isOfflineAccount
+                ? `Play as ${escapeHtml(activeAcc.username)} · Offline (${escapeHtml(activeProfile.mcVersion)})`
+                : isOfflineMode
+                  ? `Play Offline Singleplayer (${escapeHtml(activeProfile.mcVersion)})`
+                  : `Launch Minecraft ${escapeHtml(activeProfile.mcVersion)}`
+            }
           </button>
           <button class="btn" data-nav-target="play">Browse Versions (${snap.versions.filter((v) => v.supportTier !== 'unsupported').length})</button>
           <button class="btn" data-nav-target="mods">Mods &amp; HUD Studio</button>
@@ -131,14 +140,24 @@ export function renderHomePage(snap: AppStateSnapshot): string {
         <div style="font-size:11px;font-family:var(--font-mono);color:var(--text-muted);text-transform:uppercase">Session Readiness</div>
         <div style="margin-top:8px;display:flex;flex-direction:column;gap:8px;font-size:12.5px">
           <div style="display:flex;justify-content:space-between;gap:8px">
-            <span style="color:var(--text-secondary)">Session:</span>
-            <strong style="color:${isOfflineMode ? '#38bdf8' : activeAcc && activeAcc.sessionStatus !== 'signed_out' ? '#34d399' : '#fbbf24'}">
-              ${
-                isOfflineMode
-                  ? `${escapeHtml(snap.offlineAvailability?.verifiedUsername || 'Verified')} (Offline SP)`
+            <span style="color:var(--text-secondary)">Account:</span>
+            <strong style="color:${
+              isOfflineAccount
+                ? 'var(--accent-amber-bright)'
+                : isOfflineMode
+                  ? '#38bdf8'
                   : activeAcc && activeAcc.sessionStatus !== 'signed_out'
-                    ? escapeHtml(activeAcc.username)
-                    : 'Sign-In Required'
+                    ? '#34d399'
+                    : '#fbbf24'
+            }">
+              ${
+                isOfflineAccount
+                  ? `${escapeHtml(activeAcc.username)} (Offline)`
+                  : isOfflineMode
+                    ? `${escapeHtml(snap.offlineAvailability?.verifiedUsername || 'Verified')} (Offline SP)`
+                    : activeAcc && activeAcc.sessionStatus !== 'signed_out'
+                      ? `${escapeHtml(activeAcc.username)} (Microsoft)`
+                      : 'Choose Account'
               }
             </strong>
           </div>
@@ -290,18 +309,24 @@ export function renderPlayPage(
       ? activeProfile.customGameDir
       : `${snap.settings.instancesDir}/${activeProfile.id}`;
 
+  const isOfflineAccount = activeAcc?.accountType === 'offline';
   const primaryBtnLabel =
     installingVersionId === activeProfile.mcVersion || dl?.active
       ? `⬇ INSTALLING ${activeProfile.mcVersion}…`
-      : isOfflineMode
-        ? `▶ PLAY OFFLINE SINGLEPLAYER (${activeProfile.mcVersion})`
-        : activeInstallStatus === 'ready'
-          ? `▶ PLAY MINECRAFT ${activeProfile.mcVersion}`
-          : activeInstallStatus === 'partially_downloaded'
-            ? `↻ RESUME & PLAY ${activeProfile.mcVersion}`
-            : `⬇ INSTALL & PLAY ${activeProfile.mcVersion}`;
+      : isOfflineAccount
+        ? activeInstallStatus === 'ready'
+          ? `▶ PLAY ${activeProfile.mcVersion} (OFFLINE: ${activeAcc.username})`
+          : `⬇ INSTALL & PLAY ${activeProfile.mcVersion} (OFFLINE)`
+        : isOfflineMode
+          ? `▶ PLAY OFFLINE SINGLEPLAYER (${activeProfile.mcVersion})`
+          : activeInstallStatus === 'ready'
+            ? `▶ PLAY MINECRAFT ${activeProfile.mcVersion}`
+            : activeInstallStatus === 'partially_downloaded'
+              ? `↻ RESUME & PLAY ${activeProfile.mcVersion}`
+              : `⬇ INSTALL & PLAY ${activeProfile.mcVersion}`;
 
   return `
+    ${renderMultiplayerRejectionBanner(snap.lastMultiplayerNotice)}
     <div class="page-header">
       <div>
         <h2 class="page-title">Play &amp; Dynamic Minecraft Version Manager</h2>
@@ -357,14 +382,16 @@ export function renderPlayPage(
               <button class="btn" id="play-account-jump" style="width:100%;margin-top:4px;justify-content:space-between">
                 <span>
                   ${
-                    isOfflineMode
-                      ? `◐ ${escapeHtml(snap.offlineAvailability?.verifiedUsername || 'Verified Local')} (Offline SP)`
-                      : activeAcc && activeAcc.sessionStatus !== 'signed_out'
-                        ? `● ${escapeHtml(activeAcc.username)}`
-                        : '○ Sign in with Microsoft'
+                    isOfflineAccount
+                      ? `◈ ${escapeHtml(activeAcc.username)} (Offline)`
+                      : isOfflineMode
+                        ? `◐ ${escapeHtml(snap.offlineAvailability?.verifiedUsername || 'Verified Local')} (Offline SP)`
+                        : activeAcc && activeAcc.sessionStatus !== 'signed_out'
+                          ? `● ${escapeHtml(activeAcc.username)} (Microsoft)`
+                          : '○ Add Offline or Microsoft Account'
                   }
                 </span>
-                <span style="font-size:11px;color:var(--text-muted)">Manage →</span>
+                <span style="font-size:11px;color:var(--text-muted)">Switch →</span>
               </button>
             </div>
           </div>

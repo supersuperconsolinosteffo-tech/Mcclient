@@ -107,15 +107,26 @@ export interface MinecraftAccount {
   id: string;
   uuid: string;
   username: string;
+  accountType: 'offline' | 'microsoft';
   xuid?: string;
   skinUrl?: string;
-  authProvider: 'microsoft_oauth';
+  authProvider: 'offline' | 'microsoft_oauth';
   tokenExpiresAt: number;
   lastValidatedAt: number;
-  sessionStatus: 'valid' | 'refresh_required' | 'expired' | 'signed_out';
+  createdAt?: string;
+  sessionStatus: 'offline_ready' | 'valid' | 'refresh_required' | 'expired' | 'signed_out';
   skinAvatarSeed: string;
   active: boolean;
   ownsMinecraftJava: boolean;
+}
+
+export interface MultiplayerRejectionNotice {
+  timestamp: string;
+  accountType: 'offline' | 'microsoft';
+  username: string;
+  reasonCode: 'online_mode_required' | 'microsoft_session_expired';
+  title: string;
+  message: string;
 }
 
 export interface OAuthAppConfigState {
@@ -538,7 +549,7 @@ export interface LaunchPreparationReport {
   mcVersion: string;
   loader?: ModloaderType;
   vesperaModActive?: boolean;
-  sessionMode?: 'online_authenticated' | 'offline_singleplayer';
+  sessionMode?: 'offline_account' | 'online_authenticated' | 'offline_singleplayer';
   javaExecutable: string;
   jvmArguments: string[];
   gameArguments: string[];
@@ -555,6 +566,7 @@ export interface AppStateSnapshot {
   oauthConfig?: OAuthAppConfigState;
   authFlow?: AuthFlowState;
   offlineAvailability?: OfflineAvailabilityState;
+  lastMultiplayerNotice?: MultiplayerRejectionNotice | null;
   accounts: MinecraftAccount[];
   activeAccountId: string | null;
   versions: MinecraftVersionDescriptor[];

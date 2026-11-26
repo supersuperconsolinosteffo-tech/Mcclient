@@ -326,7 +326,7 @@ public:
         if (state["profiles"].empty()) state["profiles"] = defaults["profiles"];
         if (state["versions"].empty()) state["versions"] = defaults["versions"];
         if (state["hudLayouts"].empty()) state["hudLayouts"] = defaults["hudLayouts"];
-        // Always refresh curatedCatalog to v1.1.0 definitions
+        // Always refresh curatedCatalog to v1.2.0 definitions
         state["curatedCatalog"] = defaults["curatedCatalog"];
         if (!state.contains("settings") || !state["settings"].is_object()) {
             state["settings"] = defaults["settings"];
@@ -345,7 +345,7 @@ public:
             bool vesperaOk = (p["loader"] == "fabric" && p.value("mcVersion", "") == "1.21.4");
             p["vesperaModCompatible"] = vesperaOk;
         }
-        state["version"] = "1.1.1";
+        state["version"] = "1.2.0";
         state["platformMode"] = "windows_native_webview2";
     }
 
@@ -358,10 +358,10 @@ public:
         }
         write_text_atomic(crashLockPath, "{\"active\":true}");
 
-        fs::path targetMod = modsPoolDir / "vespera-client-1.1.1+mc1.21.4.jar";
+        fs::path targetMod = modsPoolDir / "vespera-client-1.2.0+mc1.21.4.jar";
         if (!fs::exists(targetMod)) {
             write_file_atomic(targetMod, kEmbeddedModJarData, kEmbeddedModJarSize);
-            appendLog("[FirstLaunch] Provisioned verified vespera-client-1.1.1+mc1.21.4.jar to managed mods pool.");
+            appendLog("[FirstLaunch] Provisioned verified vespera-client-1.2.0+mc1.21.4.jar to managed mods pool.");
         }
 
         json defaults = json::parse(kDefaultSnapshotJson);
@@ -370,7 +370,7 @@ public:
                 state = json::parse(read_text_file(statePath));
                 sanitizeLoadedState(defaults);
                 saveState();
-                appendLog("[Core] Loaded and verified Vespera Client v1.1.1 Windows configuration.");
+                appendLog("[Core] Loaded and verified Vespera Client v1.2.0 Windows configuration.");
                 return;
             } catch (...) {
                 appendLog("[CrashRecovery] State file corrupted; restoring verified factory configuration.");
@@ -652,20 +652,31 @@ public:
         for (auto& rec : vaultAccounts) {
             if (!rec.contains("account")) continue;
             json acc = rec["account"];
-            bool hasTok = !rec.value("mcAccessToken", "").empty();
-            bool hasRef = !rec.value("msaRefreshToken", "").empty();
-            if (acc.value("sessionStatus", "") == "signed_out" || (!hasTok && !hasRef)) {
-                acc["sessionStatus"] = "signed_out";
-            } else if (acc.value("tokenExpiresAt", 0LL) > nowMs + 60000LL) {
-                acc["sessionStatus"] = "valid";
-            } else if (hasRef) {
-                acc["sessionStatus"] = "refresh_required";
+            bool isOfflineAcc = (acc.value("accountType", "") == "offline" || acc.value("authProvider", "") == "offline");
+            if (isOfflineAcc) {
+                acc["accountType"] = "offline";
+                acc["authProvider"] = "offline";
+                acc["sessionStatus"] = "offline_ready";
+                acc["ownsMinecraftJava"] = false;
             } else {
-                acc["sessionStatus"] = "expired";
+                acc["accountType"] = "microsoft";
+                acc["authProvider"] = "microsoft_oauth";
+                bool hasTok = !rec.value("mcAccessToken", "").empty();
+                bool hasRef = !rec.value("msaRefreshToken", "").empty();
+                if (acc.value("sessionStatus", "") == "signed_out" || (!hasTok && !hasRef)) {
+                    acc["sessionStatus"] = "signed_out";
+                } else if (acc.value("tokenExpiresAt", 0LL) > nowMs + 60000LL) {
+                    acc["sessionStatus"] = "valid";
+                } else if (hasRef) {
+                    acc["sessionStatus"] = "refresh_required";
+                } else {
+                    acc["sessionStatus"] = "expired";
+                }
             }
             publicAccs.push_back(acc);
             if (acc.value("active", false)) activeAccId = acc.value("id", "");
         }
+        state["version"] = "1.2.0";
         state["accounts"] = publicAccs;
         state["activeAccountId"] = activeAccId.empty() ? json(nullptr) : json(activeAccId);
         state["oauthConfig"] = {
@@ -824,8 +835,8 @@ public:
             }
 
             // Provision custom 1.21.4 mod ONLY on Fabric 1.21.4 when enabled
-            fs::path srcMod = modsPoolDir / "vespera-client-1.1.1+mc1.21.4.jar";
-            fs::path dstMod = instDir / "mods" / "vespera-client-1.1.1+mc1.21.4.jar";
+            fs::path srcMod = modsPoolDir / "vespera-client-1.2.0+mc1.21.4.jar";
+            fs::path dstMod = instDir / "mods" / "vespera-client-1.2.0+mc1.21.4.jar";
             if (mcVer == "1.21.4" && enabledSet.count("vespera-client") > 0 && fs::exists(srcMod)) {
                 if (!fs::exists(dstMod)) {
                     fs::copy_file(srcMod, dstMod, fs::copy_options::overwrite_existing, ec);
@@ -1168,7 +1179,17 @@ public:
         fs::path instDir = materializeInstance(prof);
         std::string mcVer = prof.value("mcVersion", "1.21.4");
         std::string loader = prof.value("loader", "fabric");
-        std::string mode = requestedMode.empty() ? activeSessionMode : requestedMode;
+        std::string mode = requestedMode;
+        if (mode.empty()) {
+            mode = activeSessionMode;
+            for (const auto& rec : vaultAccounts) {
+                const auto& acc = rec["account"];
+                if (acc.value("active", false) && acc.value("accountType", "") == "offline") {
+                    mode = "offline_account";
+                    break;
+                }
+            }
+        }
 
         fs::path gameRoot = getGameRootDir();
         fs::path vDir = gameRoot / "versions" / mcVer;
@@ -1209,7 +1230,9 @@ public:
         }
         jvmArgs.push_back("-Djava.library.path=" + wide_to_utf8(nativesDir.wstring()));
         jvmArgs.push_back("-Dvespera.ipc.dir=" + wide_to_utf8(ipcDir.wstring()));
-        if (mode == "offline_singleplayer") {
+        if (mode == "offline_account") {
+            jvmArgs.push_back("-Dvespera.accountType=offline");
+        } else if (mode == "offline_singleplayer") {
             jvmArgs.push_back("-Dvespera.offlineSingleplayer=true");
         }
 
@@ -1229,13 +1252,20 @@ public:
         for (const auto& rec : vaultAccounts) {
             const auto& acc = rec["account"];
             if (acc.value("active", false) || !hasAuth) {
-                if (mode == "offline_singleplayer" && acc.value("ownsMinecraftJava", false) && acc.value("lastValidatedAt", 0LL) > 0) {
+                if (mode == "offline_account" && acc.value("accountType", "") == "offline") {
                     username = acc.value("username", "Player");
                     uuid = acc.value("uuid", uuid);
                     hasAuth = true;
                     if (acc.value("active", false)) break;
-                } else if (mode != "offline_singleplayer" && acc.value("active", false) &&
-                           !rec.value("mcAccessToken", "").empty() && acc.value("sessionStatus", "") != "signed_out") {
+                } else if (mode == "offline_singleplayer" && acc.value("accountType", "microsoft") != "offline" &&
+                           acc.value("ownsMinecraftJava", false) && acc.value("lastValidatedAt", 0LL) > 0) {
+                    username = acc.value("username", "Player");
+                    uuid = acc.value("uuid", uuid);
+                    hasAuth = true;
+                    if (acc.value("active", false)) break;
+                } else if (mode == "online_authenticated" && acc.value("accountType", "microsoft") != "offline" &&
+                           acc.value("active", false) && !rec.value("mcAccessToken", "").empty() &&
+                           acc.value("sessionStatus", "") != "signed_out") {
                     username = acc.value("username", "Player");
                     uuid = acc.value("uuid", uuid);
                     hasAuth = true;
@@ -1244,6 +1274,7 @@ public:
             }
         }
 
+        bool isOfflineTok = (mode == "offline_account" || mode == "offline_singleplayer");
         std::string assetIndexName = receipt.is_object() ? receipt.value("assetIndexId", mcVer) : mcVer;
         json gameArgs = json::array({
             "--username", username,
@@ -1252,11 +1283,12 @@ public:
             "--assetsDir", wide_to_utf8((gameRoot / "assets").wstring()),
             "--assetIndex", assetIndexName,
             "--uuid", uuid,
-            "--accessToken", mode == "offline_singleplayer" ? "0" : "[REDACTED_MC_TOKEN]",
-            "--userType", mode == "offline_singleplayer" ? "legacy" : "msa",
+            "--accessToken", isOfflineTok ? "0" : "[REDACTED_MC_TOKEN]",
+            "--userType", isOfflineTok ? "legacy" : "msa",
             "--width", std::to_string(prof["graphics"].value("resolutionWidth", 1920)),
             "--height", std::to_string(prof["graphics"].value("resolutionHeight", 1080))
         });
+        // Genuine Offline Accounts keep multiplayer open for LAN & online-mode=false servers!
         if (mode == "offline_singleplayer") {
             gameArgs.push_back("--disableMultiplayer");
             gameArgs.push_back("--disableChat");
@@ -1378,9 +1410,11 @@ public:
             {"id", "acc-" + uuid},
             {"uuid", uuid},
             {"username", username},
+            {"accountType", "microsoft"},
             {"authProvider", "microsoft_oauth"},
             {"tokenExpiresAt", nowMs + expiresIn * 1000LL},
             {"lastValidatedAt", nowMs},
+            {"createdAt", iso_timestamp_now()},
             {"sessionStatus", "valid"},
             {"skinAvatarSeed", username},
             {"active", true},
@@ -1394,20 +1428,25 @@ public:
             {"msaRefreshToken", msaRefresh}
         });
         for (auto& existing : vaultAccounts) {
-            if (existing["account"].value("uuid", "") != uuid) {
+            // Never overwrite or convert any Offline Account when adding/refreshing a Microsoft Account!
+            bool sameMsa = (existing["account"].value("accountType", "microsoft") != "offline" &&
+                            existing["account"].value("uuid", "") == uuid);
+            if (!sameMsa) {
                 existing["account"]["active"] = false;
                 nextVault.push_back(existing);
             }
         }
         vaultAccounts = nextVault;
         activeSessionMode = "online_authenticated";
+        state["settings"]["firstLaunchCompleted"] = true;
+        saveState();
         saveDpapiVault();
         appendLog("[Auth] Verified Minecraft: Java Edition account " + username + " via DPAPI vault.");
         return account;
     }
 
     /**
-     * Primary Vespera v1.1.1 Windows Sign-In: OAuth 2.0 Authorization Code + PKCE (`S256`)
+     * Primary Vespera v1.2.0 Windows Sign-In: OAuth 2.0 Authorization Code + PKCE (`S256`)
      * via default system browser (`ShellExecuteW`) + temporary loopback listener (`http://localhost:<port>`).
      */
     json startBrowserPkceAuthNative() {
@@ -2284,9 +2323,77 @@ public:
             refreshTelemetry();
             return state;
         }
+        if (method == "createOfflineAccount") {
+            std::string rawName = params.value("username", "");
+            // Trim ASCII whitespace
+            while (!rawName.empty() && std::isspace(static_cast<unsigned char>(rawName.front()))) rawName.erase(rawName.begin());
+            while (!rawName.empty() && std::isspace(static_cast<unsigned char>(rawName.back()))) rawName.pop_back();
+
+            if (!is_valid_minecraft_username(rawName)) {
+                throw std::runtime_error("Minecraft usernames must be 3–16 characters using only letters (A–Z, a–z), digits (0–9), and underscores (_).");
+            }
+
+            std::string nameLower = rawName;
+            std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
+            for (const auto& rec : vaultAccounts) {
+                if (rec["account"].value("accountType", "") == "offline") {
+                    std::string ex = rec["account"].value("username", "");
+                    std::string exL = ex;
+                    std::transform(exL.begin(), exL.end(), exL.begin(), ::tolower);
+                    if (exL == nameLower) {
+                        throw std::runtime_error("An offline account named \"" + ex + "\" already exists.");
+                    }
+                }
+            }
+
+            std::string offUuid = generate_offline_minecraft_uuid(rawName);
+            json account = {
+                {"id", "acc-offline-" + offUuid},
+                {"uuid", offUuid},
+                {"username", rawName},
+                {"accountType", "offline"},
+                {"authProvider", "offline"},
+                {"tokenExpiresAt", 0},
+                {"lastValidatedAt", 0},
+                {"createdAt", iso_timestamp_now()},
+                {"sessionStatus", "offline_ready"},
+                {"skinAvatarSeed", rawName},
+                {"active", true},
+                {"ownsMinecraftJava", false}
+            };
+
+            json nextVault = json::array();
+            nextVault.push_back({{"account", account}});
+            for (auto& existing : vaultAccounts) {
+                existing["account"]["active"] = false;
+                nextVault.push_back(existing);
+            }
+            vaultAccounts = nextVault;
+            state["settings"]["firstLaunchCompleted"] = true;
+            state["lastMultiplayerNotice"] = nullptr;
+            saveState();
+            saveDpapiVault();
+            appendLog("[Accounts] Created local Offline Account \"" + rawName + "\" (UUID " + offUuid + ").");
+            refreshTelemetry();
+            return {{"account", account}, {"snapshot", state}};
+        }
+        if (method == "dismissFirstLaunch") {
+            state["settings"]["firstLaunchCompleted"] = true;
+            saveState();
+            refreshTelemetry();
+            return state;
+        }
+        if (method == "dismissMultiplayerNotice") {
+            state["lastMultiplayerNotice"] = nullptr;
+            refreshTelemetry();
+            return state;
+        }
         if (method == "switchAccount") {
             std::string aid = params.value("accountId", "");
             for (auto& rec : vaultAccounts) rec["account"]["active"] = (rec["account"].value("id", "") == aid);
+            state["settings"]["firstLaunchCompleted"] = true;
+            state["lastMultiplayerNotice"] = nullptr;
+            saveState();
             saveDpapiVault();
             refreshTelemetry();
             return state;
@@ -2394,12 +2501,42 @@ public:
         }
         if (method == "launchMinecraft") {
             auto& prof = activeProfileRef();
-            std::string mode = params.value("mode", activeSessionMode);
+            std::string mode = params.value("mode", "");
+            if (mode.empty()) {
+                mode = activeSessionMode;
+                for (const auto& rec : vaultAccounts) {
+                    if (rec["account"].value("active", false) && rec["account"].value("accountType", "") == "offline") {
+                        mode = "offline_account";
+                        break;
+                    }
+                }
+            }
             std::string mcVer = prof.value("mcVersion", "1.21.4");
             std::string loader = prof.value("loader", "fabric");
 
             std::string mcToken;
-            if (mode == "offline_singleplayer") {
+            std::string activeOfflineUsername;
+            if (mode == "offline_account") {
+                for (const auto& rec : vaultAccounts) {
+                    if (rec["account"].value("active", false) && rec["account"].value("accountType", "") == "offline") {
+                        activeOfflineUsername = rec["account"].value("username", "");
+                        break;
+                    }
+                }
+                if (activeOfflineUsername.empty()) {
+                    refreshTelemetry();
+                    return {
+                        {"launchRes", {
+                            {"launched", false},
+                            {"pid", nullptr},
+                            {"stageReached", "account_selection_required"},
+                            {"sessionMode", "offline_account"},
+                            {"message", "Create or select an Offline Account (or sign in with Microsoft) on the Accounts page before launching."}
+                        }},
+                        {"snapshot", state}
+                    };
+                }
+            } else if (mode == "offline_singleplayer") {
                 bool localReady = (getVersionInstallStatusOnDisk(mcVer) == "ready");
                 json off = computeOfflineAvailabilityJson(localReady);
                 if (!off.value("eligible", false)) {
@@ -2417,7 +2554,9 @@ public:
                 }
             } else {
                 for (const auto& rec : vaultAccounts) {
-                    if (rec["account"].value("active", false) && rec["account"].value("sessionStatus", "") != "signed_out") {
+                    if (rec["account"].value("active", false) &&
+                        rec["account"].value("accountType", "microsoft") != "offline" &&
+                        rec["account"].value("sessionStatus", "") != "signed_out") {
                         mcToken = rec.value("mcAccessToken", "");
                         break;
                     }
@@ -2430,7 +2569,7 @@ public:
                             {"pid", nullptr},
                             {"stageReached", "authentication_required"},
                             {"sessionMode", "online_authenticated"},
-                            {"message", "Sign in with Microsoft on the Accounts page before launching online multiplayer."}
+                            {"message", "Create an Offline Account or sign in with Microsoft on the Accounts page before launching."}
                         }},
                         {"snapshot", state}
                     };
@@ -2459,7 +2598,7 @@ public:
             cmd << prep["mainClass"].get<std::string>() << " ";
             for (const auto& a : prep["gameArguments"]) {
                 std::string s = a.get<std::string>();
-                if (s == "[REDACTED_MC_TOKEN]") s = (mode == "offline_singleplayer") ? "0" : mcToken;
+                if (s == "[REDACTED_MC_TOKEN]") s = (mode == "offline_account" || mode == "offline_singleplayer") ? "0" : mcToken;
                 cmd << "\"" << s << "\" ";
             }
 
@@ -2481,11 +2620,15 @@ public:
                 {"launchRes", {
                     {"launched", true},
                     {"pid", static_cast<int>(activeMcPid)},
-                    {"stageReached", mode == "offline_singleplayer" ? "process_spawned_offline_singleplayer" : "process_spawned_authenticated"},
+                    {"stageReached", mode == "offline_account"
+                        ? "process_spawned_offline_account"
+                        : (mode == "offline_singleplayer" ? "process_spawned_offline_singleplayer" : "process_spawned_authenticated")},
                     {"sessionMode", mode},
-                    {"message", mode == "offline_singleplayer"
-                        ? "Launched Minecraft " + mcVer + " in Offline Singleplayer mode (multiplayer disabled)."
-                        : "Launched Minecraft " + mcVer + " cleanly! Vespera Launcher is now idle."},
+                    {"message", mode == "offline_account"
+                        ? "Launched Minecraft " + mcVer + " with Offline Account \"" + activeOfflineUsername + "\"."
+                        : (mode == "offline_singleplayer"
+                            ? "Launched Minecraft " + mcVer + " in Offline Singleplayer mode (multiplayer disabled)."
+                            : "Launched Minecraft " + mcVer + " cleanly! Vespera Launcher is now idle.")},
                     {"preparation", prep}
                 }},
                 {"snapshot", state}
@@ -2524,7 +2667,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
     VesperaNativeEngine engine;
 
     webview::webview w(false, nullptr);
-    w.set_title("Vespera Client v1.1.1 — Precision Minecraft Java Edition Client");
+    w.set_title("Vespera Client v1.2.0 — Precision Minecraft Java Edition Client");
     w.set_size(1340, 860, WEBVIEW_HINT_NONE);
 
     w.bind("vesperaNativeInvoke", [&engine](const std::string& reqArrayJson) -> std::string {

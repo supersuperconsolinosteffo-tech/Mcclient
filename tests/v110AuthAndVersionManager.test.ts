@@ -723,14 +723,15 @@ describe('Part 8.4 — End-to-End UX Flow, Legacy 1.8.9 Args, Mod Isolation & v1
 
     const coord = new VesperaStateCoordinator(dataDir);
     const migratedSnap = coord.getSnapshot();
-    expect(migratedSnap.version).toBe('1.1.1');
+    expect(migratedSnap.version).toBe('1.2.0');
     expect(migratedSnap.profiles[0].name).toBe('My Preserved v1.0.0 Profile');
 
     // Verify Accounts UI has ZERO manual Client ID input fields and renders Offline Availability section
     const accountsHtml = renderAccountsPage(migratedSnap, null);
     expect(accountsHtml).not.toContain('msa-client-id-input');
-    expect(accountsHtml).toContain('offline-availability-section');
-    expect(accountsHtml).toContain('Offline Availability');
+    expect(accountsHtml).toContain('offline-account-creator-card');
+    expect(accountsHtml).toContain('Offline Accounts');
+    expect(accountsHtml).toContain('multiplayer-compatibility-card');
 
     // Create a Fabric 1.20.4 profile -> must NEVER include vespera-client 1.21.4 custom mod!
     await dispatchRpcMethod(coord, 'createProfile', {

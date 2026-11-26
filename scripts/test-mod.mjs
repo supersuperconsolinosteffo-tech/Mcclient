@@ -7,7 +7,7 @@ const JAVA_HOME = path.join(ROOT, '.venv/lib/python3.11/site-packages/jdk4py/jav
 const JAVA = path.join(JAVA_HOME, 'bin/java');
 const KOTLINC = path.join(ROOT, 'node_modules/kotlin-compiler/bin/kotlinc');
 
-const modJarPath = path.join(ROOT, 'release/mods/vespera-client-1.1.1+mc1.21.4.jar');
+const modJarPath = path.join(ROOT, 'release/mods/vespera-client-1.2.0+mc1.21.4.jar');
 const stubsOut = path.join(ROOT, 'mod/build/local-compile/stubs-classes');
 const testJarPath = path.join(ROOT, 'mod/build/local-compile/vespera-mod-tests.jar');
 

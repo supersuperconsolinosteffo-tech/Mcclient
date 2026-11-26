@@ -15,6 +15,10 @@ import {
   resolveBuildTimeOAuthConfig,
   type ResolvedOAuthBuildConfig,
 } from '../shared/oauthBuildConfig';
+import {
+  generateOfflineMinecraftUuid,
+  validateMinecraftUsername,
+} from '../shared/offlineAccountUtils';
 import { EncryptedTokenVault, redactSensitiveTokens } from './securityUtils';
 
 interface SecretAccountRecord extends MinecraftAccount {
@@ -279,10 +283,18 @@ export class AuthService {
 
   private getVerifiedOfflineCandidateAccount(): SecretAccountRecord | null {
     const active = this.accounts.find(
-      (a) => a.active && a.ownsMinecraftJava && a.lastValidatedAt > 0
+      (a) =>
+        a.accountType !== 'offline' &&
+        a.active &&
+        a.ownsMinecraftJava &&
+        a.lastValidatedAt > 0
     );
     if (active) return active;
-    return this.accounts.find((a) => a.ownsMinecraftJava && a.lastValidatedAt > 0) ?? null;
+    return (
+      this.accounts.find(
+        (a) => a.accountType !== 'offline' && a.ownsMinecraftJava && a.lastValidatedAt > 0
+      ) ?? null
+    );
   }
 
   public computeOfflineAvailability(localGameReady: boolean): OfflineAvailabilityState {
@@ -341,16 +353,89 @@ export class AuthService {
 
   private loadVault(): void {
     const parsed = this.vault.loadDecrypted<SecretAccountRecord[]>([]);
-    this.accounts = Array.isArray(parsed) ? parsed : [];
+    this.accounts = Array.isArray(parsed)
+      ? parsed.map((a) => {
+          const isOffline =
+            a.accountType === 'offline' || (a.authProvider as string) === 'offline';
+          return {
+            ...a,
+            accountType: isOffline ? 'offline' : 'microsoft',
+            authProvider: isOffline ? 'offline' : 'microsoft_oauth',
+            ownsMinecraftJava: isOffline ? false : Boolean(a.ownsMinecraftJava),
+          };
+        })
+      : [];
   }
 
   private saveVault(): void {
     this.vault.saveEncrypted(this.accounts);
   }
 
+  /**
+   * Creates and persists a genuine local Minecraft: Java Edition offline-mode account profile
+   * using Mojang's deterministic `OfflinePlayer:<username>` MD5 v3 UUID algorithm.
+   * Never requires Microsoft credentials and never pretends to be an online Microsoft account.
+   */
+  public createOfflineAccount(rawUsername: string): MinecraftAccount {
+    const check = validateMinecraftUsername(rawUsername);
+    if (!check.valid) {
+      throw new Error(check.error || 'Invalid Minecraft username.');
+    }
+    const username = check.normalized;
+    const duplicate = this.accounts.find(
+      (a) => a.accountType === 'offline' && a.username.toLowerCase() === username.toLowerCase()
+    );
+    if (duplicate) {
+      throw new Error(
+        `An offline account named "${duplicate.username}" already exists. Select it in your accounts list.`
+      );
+    }
+
+    const offlineUuid = generateOfflineMinecraftUuid(username);
+    const record: SecretAccountRecord = {
+      id: `acc-offline-${offlineUuid}`,
+      uuid: offlineUuid,
+      username,
+      accountType: 'offline',
+      authProvider: 'offline',
+      tokenExpiresAt: 0,
+      lastValidatedAt: 0,
+      createdAt: new Date().toISOString(),
+      sessionStatus: 'offline_ready',
+      skinAvatarSeed: username,
+      active: true,
+      ownsMinecraftJava: false,
+    };
+
+    this.accounts = this.accounts.map((a) => ({ ...a, active: false }));
+    this.accounts.unshift(record);
+    this.saveVault();
+    this.log(
+      `[Accounts] Created local Offline Account "${username}" (UUID: ${offlineUuid}).`
+    );
+    return this.listAccounts().find((a) => a.id === record.id)!;
+  }
+
   public listAccounts(): MinecraftAccount[] {
     const now = Date.now();
     return this.accounts.map((acc) => {
+      if (acc.accountType === 'offline' || acc.authProvider === 'offline') {
+        return {
+          id: acc.id,
+          uuid: acc.uuid,
+          username: acc.username,
+          accountType: 'offline',
+          authProvider: 'offline',
+          tokenExpiresAt: 0,
+          lastValidatedAt: 0,
+          createdAt: acc.createdAt,
+          sessionStatus: 'offline_ready',
+          skinAvatarSeed: acc.skinAvatarSeed || acc.username,
+          active: acc.active,
+          ownsMinecraftJava: false,
+        };
+      }
+
       let sessionStatus: MinecraftAccount['sessionStatus'] = 'expired';
       if (acc.sessionStatus === 'signed_out' || (!acc.mcAccessToken && !acc.msRefreshToken)) {
         sessionStatus = 'signed_out';
@@ -363,11 +448,13 @@ export class AuthService {
         id: acc.id,
         uuid: acc.uuid,
         username: acc.username,
+        accountType: 'microsoft',
         xuid: acc.xuid,
         skinUrl: acc.skinUrl,
         authProvider: 'microsoft_oauth',
         tokenExpiresAt: acc.tokenExpiresAt,
         lastValidatedAt: acc.lastValidatedAt,
+        createdAt: acc.createdAt,
         sessionStatus,
         skinAvatarSeed: acc.skinAvatarSeed,
         active: acc.active,
@@ -395,27 +482,34 @@ export class AuthService {
   }
 
   public switchAccount(accountId: string): MinecraftAccount[] {
-    const exists = this.accounts.some((a) => a.id === accountId);
-    if (!exists) {
+    const target = this.accounts.find((a) => a.id === accountId);
+    if (!target) {
       throw new Error(`Account "${accountId}" not found.`);
     }
     this.accounts = this.accounts.map((a) => ({
       ...a,
       active: a.id === accountId,
     }));
+    if (target.accountType === 'microsoft' && target.sessionStatus !== 'signed_out') {
+      this.activeSessionMode = 'online_authenticated';
+    }
     this.saveVault();
     return this.listAccounts();
   }
 
   /**
-   * Signs out of an account by purging its live access & refresh tokens from the encrypted vault
-   * while retaining the verified account record (so the user can easily sign back in or use legitimate
-   * offline singleplayer if previously verified).
+   * Signs out of a Microsoft account by purging its live access & refresh tokens from the encrypted vault
+   * while retaining the verified account record.
    */
   public signOutAccount(accountId: string): MinecraftAccount[] {
     const record = this.accounts.find((a) => a.id === accountId);
     if (!record) {
       throw new Error(`Account "${accountId}" not found.`);
+    }
+    if (record.accountType === 'offline') {
+      throw new Error(
+        `Offline account "${record.username}" does not use an online session. Use Switch or Remove instead.`
+      );
     }
     delete record.mcAccessToken;
     delete record.msRefreshToken;
@@ -486,7 +580,7 @@ export class AuthService {
   }
 
   /**
-   * Primary Vespera v1.1.1 sign-in flow:
+   * Primary Vespera v1.2.0 sign-in flow:
    * Starts a temporary localhost loopback HTTP callback listener (`http://localhost:<port>`),
    * generates RFC 7636 PKCE (`S256`) + cryptographic `state`, opens the official Microsoft login
    * website in the OS default browser, validates callback & prevents replay, and completes
@@ -1350,11 +1444,13 @@ export class AuthService {
       id: `acc-${profileJson.id}`,
       uuid: profileJson.id,
       username: profileJson.name,
+      accountType: 'microsoft',
       xuid: xstsJson.DisplayClaims?.xui?.[0]?.xid,
       skinUrl: activeSkinUrl,
       authProvider: 'microsoft_oauth',
       tokenExpiresAt: now + (mcAuthJson.expires_in || 86400) * 1000,
       lastValidatedAt: now,
+      createdAt: new Date().toISOString(),
       sessionStatus: 'valid',
       skinAvatarSeed: profileJson.name,
       active: true,
@@ -1363,8 +1459,9 @@ export class AuthService {
       msRefreshToken,
     };
 
+    // Replace existing Microsoft entry for the same UUID, never touching any local Offline accounts!
     this.accounts = this.accounts
-      .filter((a) => a.uuid !== record.uuid)
+      .filter((a) => !(a.accountType === 'microsoft' && a.uuid === record.uuid))
       .map((a) => ({ ...a, active: false }));
     this.accounts.unshift(record);
     this.saveVault();
@@ -1380,6 +1477,11 @@ export class AuthService {
     const record = this.accounts.find((a) => a.id === accountId);
     if (!record) {
       throw new Error(`Account "${accountId}" not found.`);
+    }
+    if (record.accountType === 'offline') {
+      throw new Error(
+        `Account "${record.username}" is an Offline Account and cannot be converted into or refreshed as a Microsoft session.`
+      );
     }
 
     if (record.sessionStatus === 'signed_out') {
@@ -1469,7 +1571,9 @@ export class AuthService {
    */
   public getDecryptedMcAccessToken(accountId: string): string | null {
     const record = this.accounts.find((a) => a.id === accountId);
-    if (!record || record.sessionStatus === 'signed_out') return null;
+    if (!record || record.accountType === 'offline' || record.sessionStatus === 'signed_out') {
+      return null;
+    }
     if (record.tokenExpiresAt <= Date.now()) return null;
     return record.mcAccessToken ?? null;
   }
@@ -1479,7 +1583,7 @@ export class AuthService {
     mcAccessToken: string;
   } | null> {
     const active = this.getActiveAccountRecord();
-    if (!active || active.sessionStatus === 'signed_out') {
+    if (!active || active.accountType === 'offline' || active.sessionStatus === 'signed_out') {
       return null;
     }
     const validated = await this.refreshOrValidateSession(active.id);

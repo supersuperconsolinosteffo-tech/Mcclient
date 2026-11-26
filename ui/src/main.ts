@@ -1,4 +1,8 @@
 import './styles.css';
+import {
+  generateOfflineMinecraftUuid,
+  validateMinecraftUsername,
+} from '@shared/offlineAccountUtils';
 import { computeRecommendedRam } from '@shared/performanceEngine';
 import type {
   AppStateSnapshot,
@@ -13,8 +17,10 @@ import { escapeHtml, NAV_ICONS } from './icons';
 import {
   bindAccountsSettingsDiagEvents,
   renderAboutPage,
+  renderAccountAvatar,
   renderAccountsPage,
   renderDiagnosticsPage,
+  renderFirstLaunchAccountModal,
   renderSettingsPage,
 } from './pages/accountsSettingsDiagAbout';
 import {
@@ -325,17 +331,28 @@ function renderApp(): void {
           </select>
         </div>
 
-        <div>
-          <div style="font-size:10.5px;color:var(--text-muted);font-family:var(--font-mono)">MINECRAFT SESSION</div>
-          <button class="btn" id="dock-account-btn" style="margin-top:2px">
+        <div style="display:flex;align-items:flex-end;gap:8px">
+          <div>
+            <div style="font-size:10.5px;color:var(--text-muted);font-family:var(--font-mono)">SELECTED ACCOUNT</div>
             ${
-              snap.offlineAvailability?.activeSessionMode === 'offline_singleplayer'
-                ? `◐ ${escapeHtml(snap.offlineAvailability.verifiedUsername || 'Verified')} (Offline SP)`
-                : activeAcc && activeAcc.sessionStatus !== 'signed_out'
-                  ? `● ${escapeHtml(activeAcc.username)} (Verified MSA)`
-                  : '○ Sign in with Microsoft'
+              snap.accounts.length > 0
+                ? `<div style="display:flex;align-items:center;gap:6px;margin-top:2px">
+                    ${activeAcc ? renderAccountAvatar(activeAcc, 28) : ''}
+                    <select class="select" id="dock-account-select" style="min-width:195px">
+                      ${snap.accounts
+                        .map(
+                          (a) =>
+                            `<option value="${escapeHtml(a.id)}" ${a.id === activeAcc?.id ? 'selected' : ''}>${escapeHtml(a.username)} [${a.accountType === 'offline' ? 'Offline' : 'Microsoft'}]</option>`
+                        )
+                        .join('')}
+                    </select>
+                    <button class="btn btn-sm" id="dock-account-btn" title="Manage Offline & Microsoft Accounts">+ / Manage</button>
+                  </div>`
+                : `<button class="btn" id="dock-account-btn" style="margin-top:2px">
+                    + Choose Offline or Microsoft Account
+                  </button>`
             }
-          </button>
+          </div>
         </div>
       </div>
 
@@ -361,13 +378,16 @@ function renderApp(): void {
           ${
             state.launchingGame
               ? 'PREPARING…'
-              : snap.offlineAvailability?.activeSessionMode === 'offline_singleplayer'
-                ? `▶ PLAY OFFLINE (${escapeHtml(activeProfile.mcVersion)})`
-                : `▶ PLAY ${escapeHtml(activeProfile.mcVersion)}`
+              : activeAcc?.accountType === 'offline'
+                ? `▶ PLAY ${escapeHtml(activeProfile.mcVersion)} (OFFLINE)`
+                : snap.offlineAvailability?.activeSessionMode === 'offline_singleplayer'
+                  ? `▶ PLAY OFFLINE (${escapeHtml(activeProfile.mcVersion)})`
+                  : `▶ PLAY ${escapeHtml(activeProfile.mcVersion)}`
           }
         </button>
       </div>
     </footer>
+    ${renderFirstLaunchAccountModal(snap)}
   `;
 
   bindGlobalAndStageEvents(root, snap);
@@ -432,8 +452,105 @@ function bindGlobalAndStageEvents(root: HTMLElement, snap: AppStateSnapshot): vo
     }
   });
 
+  root.querySelector('#dock-account-select')?.addEventListener('change', async (ev) => {
+    try {
+      const accountId = (ev.target as HTMLSelectElement).value;
+      state.snapshot = await bridge.switchAccount(accountId);
+      state.launchPrep = null;
+      const switched = state.snapshot.accounts.find((a) => a.id === accountId);
+      showToast(
+        switched
+          ? `Selected ${switched.username} (${switched.accountType === 'offline' ? 'Offline Account' : 'Microsoft Account'}).`
+          : 'Switched active account.',
+        'success'
+      );
+      renderApp();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : String(err), 'error');
+    }
+  });
+
   root.querySelector('#dock-account-btn')?.addEventListener('click', () => {
     navigateTo('accounts');
+  });
+
+  // First-Launch Dual Account Selector Modal events
+  const modalOfflineInput = root.querySelector<HTMLInputElement>('#modal-offline-username');
+  const modalOfflinePreview = root.querySelector<HTMLElement>('#modal-offline-uuid-preview');
+  if (modalOfflineInput && modalOfflinePreview) {
+    modalOfflineInput.addEventListener('input', () => {
+      const val = modalOfflineInput.value.trim();
+      if (!val) {
+        modalOfflinePreview.textContent = `Offline UUID preview: ${generateOfflineMinecraftUuid('VesperaPlayer')}`;
+        modalOfflinePreview.style.color = 'var(--text-muted)';
+        return;
+      }
+      const check = validateMinecraftUsername(val);
+      if (!check.valid) {
+        modalOfflinePreview.textContent = check.error || 'Invalid Minecraft username.';
+        modalOfflinePreview.style.color = '#fca5a5';
+      } else {
+        modalOfflinePreview.textContent = `Offline UUID preview: ${generateOfflineMinecraftUuid(check.normalized)}`;
+        modalOfflinePreview.style.color = '#34d399';
+      }
+    });
+    modalOfflineInput.addEventListener('keydown', async (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        root.querySelector<HTMLButtonElement>('#btn-modal-create-offline')?.click();
+      }
+    });
+  }
+
+  root.querySelector('#btn-modal-create-offline')?.addEventListener('click', async () => {
+    const val = root.querySelector<HTMLInputElement>('#modal-offline-username')?.value ?? '';
+    const check = validateMinecraftUsername(val);
+    if (!check.valid) {
+      showToast(check.error || 'Enter a valid Minecraft username (3–16 chars).', 'error');
+      return;
+    }
+    try {
+      state.snapshot = await bridge.createOfflineAccount(check.normalized);
+      showToast(
+        `Offline Account "${check.normalized}" created and ready to play!`,
+        'success'
+      );
+      renderApp();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : String(err), 'error');
+    }
+  });
+
+  root.querySelector('#btn-modal-start-microsoft')?.addEventListener('click', async () => {
+    try {
+      await bridge.dismissFirstLaunch();
+      state.currentPage = 'accounts';
+      state.snapshot = await bridge.getSnapshot();
+      renderApp();
+      document.getElementById('btn-start-pkce-auth')?.click();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : String(err), 'error');
+    }
+  });
+
+  root.querySelector('#btn-dismiss-first-launch')?.addEventListener('click', async () => {
+    try {
+      state.snapshot = await bridge.dismissFirstLaunch();
+      renderApp();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : String(err), 'error');
+    }
+  });
+
+  root.querySelectorAll<HTMLElement>('[data-dismiss-mp-notice]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      try {
+        state.snapshot = await bridge.dismissMultiplayerNotice();
+        renderApp();
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : String(err), 'error');
+      }
+    });
   });
 
   root.querySelectorAll<HTMLElement>('[data-action="launch-now"]').forEach((btn) => {
@@ -450,7 +567,11 @@ function bindGlobalAndStageEvents(root: HTMLElement, snap: AppStateSnapshot): vo
           showToast(launchRes.message, 'success');
         } else {
           showToast(launchRes.message, 'info');
-          if (launchRes.stageReached === 'authentication_required') {
+          if (
+            launchRes.stageReached === 'authentication_required' ||
+            launchRes.stageReached === 'account_selection_required' ||
+            launchRes.stageReached === 'online_mode_requires_microsoft'
+          ) {
             state.currentPage = 'accounts';
           }
         }
@@ -792,6 +913,32 @@ function bindGlobalAndStageEvents(root: HTMLElement, snap: AppStateSnapshot): vo
   );
 
   bindAccountsSettingsDiagEvents(stage, {
+    onCreateOfflineAccount: async (username) => {
+      const check = validateMinecraftUsername(username);
+      if (!check.valid) {
+        showToast(check.error || 'Enter a valid Minecraft username (3–16 chars).', 'error');
+        return;
+      }
+      try {
+        state.snapshot = await bridge.createOfflineAccount(check.normalized);
+        state.launchPrep = null;
+        showToast(
+          `Created Offline Account "${check.normalized}" (deterministic v3 UUID ready).`,
+          'success'
+        );
+        renderApp();
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : String(err), 'error');
+      }
+    },
+    onDismissMultiplayerNotice: async () => {
+      try {
+        state.snapshot = await bridge.dismissMultiplayerNotice();
+        renderApp();
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : String(err), 'error');
+      }
+    },
     onStartPkceAuth: async () => {
       try {
         const { flow, snapshot } = await bridge.startPkceAuth();

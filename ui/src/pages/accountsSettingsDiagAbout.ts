@@ -4,17 +4,194 @@ import type {
   DeviceCodeAuthChallenge,
   GraphicsSettings,
   LauncherSettings,
+  MinecraftAccount,
+  MultiplayerRejectionNotice,
 } from '@shared/types';
+import {
+  generateOfflineMinecraftUuid,
+  validateMinecraftUsername,
+} from '@shared/offlineAccountUtils';
 import { escapeHtml } from '../icons';
 
 function formatTimestampShort(ts: number | null | undefined): string {
-  if (!ts || ts <= 0) return 'Never';
+  if (!ts || ts <= 0) return 'Local Profile';
   const d = new Date(ts);
   if (Number.isNaN(d.getTime())) return 'Unknown';
   return d.toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
 }
 
-const MICROSOFT_EMBLEM_SVG = `<svg width="18" height="18" viewBox="0 0 21 21" aria-hidden="true" style="flex-shrink:0"><rect x="1" y="1" width="9" height="9" fill="#F25022"/><rect x="11" y="1" width="9" height="9" fill="#7FBA00"/><rect x="1" y="11" width="9" height="9" fill="#00A4EF"/><rect x="11" y="11" width="9" height="9" fill="#FFB900"/></svg>`;
+export const MICROSOFT_EMBLEM_SVG = `<svg width="18" height="18" viewBox="0 0 21 21" aria-hidden="true" style="flex-shrink:0"><rect x="1" y="1" width="9" height="9" fill="#F25022"/><rect x="11" y="1" width="9" height="9" fill="#7FBA00"/><rect x="1" y="11" width="9" height="9" fill="#00A4EF"/><rect x="11" y="11" width="9" height="9" fill="#FFB900"/></svg>`;
+
+/**
+ * Renders an unmistakable pixel-art player avatar:
+ * - For Offline Accounts: crisp deterministic blocky Minecraft player head SVG (never calling online Mojang skin servers or pretending to be an authenticated Microsoft profile).
+ * - For Microsoft Accounts: official skin head image with a crisp blocky fallback icon.
+ */
+export function renderAccountAvatar(acc: MinecraftAccount, sizePx = 46): string {
+  const palette = [
+    { hair: '#3b2416', skin: '#c68c63', eye: '#f59e0b' },
+    { hair: '#1e293b', skin: '#d69e72', eye: '#38bdf8' },
+    { hair: '#4c1d24', skin: '#b97c56', eye: '#34d399' },
+    { hair: '#312e81', skin: '#cfa07a', eye: '#a78bfa' },
+    { hair: '#27272a', skin: '#b57b52', eye: '#fbbf24' },
+  ];
+  let hash = 0;
+  for (let i = 0; i < acc.uuid.length; i++) {
+    hash = (hash * 31 + acc.uuid.charCodeAt(i)) >>> 0;
+  }
+  const tone = palette[hash % palette.length];
+
+  const defaultSvg = `<svg width="${sizePx}" height="${sizePx}" viewBox="0 0 8 8" shape-rendering="crispEdges" aria-label="${escapeHtml(acc.username)} avatar" style="border-radius:8px;border:1px solid ${
+    acc.active ? 'var(--accent-amber)' : 'var(--border-strong)'
+  };background:#0f172a;flex-shrink:0">
+    <rect x="0" y="0" width="8" height="8" fill="${tone.skin}"/>
+    <rect x="0" y="0" width="8" height="2" fill="${tone.hair}"/>
+    <rect x="0" y="2" width="1" height="2" fill="${tone.hair}"/>
+    <rect x="7" y="2" width="1" height="2" fill="${tone.hair}"/>
+    <rect x="1" y="4" width="1" height="1" fill="#ffffff"/>
+    <rect x="2" y="4" width="1" height="1" fill="${tone.eye}"/>
+    <rect x="5" y="4" width="1" height="1" fill="${tone.eye}"/>
+    <rect x="6" y="4" width="1" height="1" fill="#ffffff"/>
+    <rect x="3" y="5" width="2" height="1" fill="#8b5a3c"/>
+    <rect x="2" y="6" width="4" height="1" fill="#5c3522"/>
+  </svg>`;
+
+  if (acc.accountType === 'offline') {
+    return defaultSvg;
+  }
+
+  const cleanUuid = acc.uuid.replace(/-/g, '');
+  const avatarUrl = `https://mc-heads.net/avatar/${encodeURIComponent(cleanUuid)}/${sizePx}`;
+  return `<span style="position:relative;display:inline-flex;width:${sizePx}px;height:${sizePx}px;flex-shrink:0">
+    ${defaultSvg}
+    <img
+      src="${avatarUrl}"
+      alt="${escapeHtml(acc.username)}"
+      width="${sizePx}"
+      height="${sizePx}"
+      style="position:absolute;inset:0;border-radius:8px;image-rendering:pixelated;border:1px solid ${
+        acc.active ? 'var(--accent-amber)' : 'var(--border-strong)'
+      };background:#0f172a"
+      onerror="this.style.display='none'"
+    />
+  </span>`;
+}
+
+export function renderMultiplayerRejectionBanner(
+  notice: MultiplayerRejectionNotice | null | undefined
+): string {
+  if (!notice) return '';
+  return `
+    <div id="multiplayer-rejection-banner" style="margin-bottom:18px;padding:15px 18px;border-radius:10px;background:rgba(245,158,11,0.10);border:1px solid rgba(245,158,11,0.45);display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap">
+      <div style="max-width:740px">
+        <div style="font-weight:700;font-size:13.5px;color:var(--accent-amber-bright);display:flex;align-items:center;gap:8px">
+          <span>⚠ ${escapeHtml(notice.title)}</span>
+          <span class="badge badge-experimental">${
+            notice.accountType === 'offline' ? 'Offline Account' : 'Microsoft Session'
+          }</span>
+        </div>
+        <div style="font-size:12.5px;color:var(--text-secondary);margin-top:5px;line-height:1.55">
+          ${escapeHtml(notice.message)}
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button class="btn btn-sm" data-dismiss-mp-notice="1">Dismiss</button>
+      </div>
+    </div>
+  `;
+}
+
+/**
+ * Non-blocking First-Launch Dual Account Selector modal.
+ * Never forces Microsoft login — Offline Account is immediately available on first launch alongside optional Microsoft OAuth!
+ */
+export function renderFirstLaunchAccountModal(snap: AppStateSnapshot): string {
+  if (snap.accounts.length > 0 || snap.settings.firstLaunchCompleted) {
+    return '';
+  }
+  const sampleUuid = generateOfflineMinecraftUuid('VesperaPlayer');
+  return `
+    <div id="first-launch-account-modal" style="position:fixed;inset:0;z-index:1200;background:rgba(6,8,13,0.82);backdrop-filter:blur(8px);display:grid;place-items:center;padding:24px">
+      <div class="card elevated" style="width:100%;max-width:860px;padding:28px 30px;border:1px solid rgba(245,158,11,0.38);box-shadow:0 24px 64px rgba(0,0,0,0.65)">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap">
+          <div>
+            <div style="display:inline-flex;align-items:center;gap:8px;margin-bottom:6px">
+              <span class="badge badge-supported">Welcome to Vespera Client v1.2.0</span>
+              <span class="badge badge-cyan">No Forced Login</span>
+            </div>
+            <h2 style="font-size:22px;font-weight:800;margin:0;color:var(--text-primary)">
+              Choose How You Want to Play
+            </h2>
+            <p style="font-size:13px;color:var(--text-secondary);margin:6px 0 0;line-height:1.55;max-width:650px">
+              Play right away with a local <strong>Offline Account</strong> (no Microsoft login required), or connect an official <strong>Microsoft Account</strong> for online-mode servers &amp; Realms. You can add, switch, or remove accounts anytime.
+            </p>
+          </div>
+          <button class="btn btn-sm" id="btn-dismiss-first-launch" title="Explore Vespera before creating an account">
+            Decide Later
+          </button>
+        </div>
+
+        <div class="grid-2" style="margin-top:20px;gap:16px">
+          <!-- OPTION 1: OFFLINE ACCOUNT (IMMEDIATELY AVAILABLE) -->
+          <div style="padding:20px;border-radius:12px;background:var(--bg-canvas);border:1px solid rgba(245,158,11,0.45);display:flex;flex-direction:column;justify-content:space-between;gap:14px">
+            <div>
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+                <span style="font-size:16px;font-weight:800;color:var(--text-primary)">Offline Account</span>
+                <span class="badge badge-supported">Ready Immediately</span>
+              </div>
+              <p style="font-size:12.5px;color:var(--text-secondary);margin:8px 0 12px;line-height:1.5">
+                Create a local Minecraft Java username right now. Uses Mojang's deterministic offline UUID (<code style="font-size:11px">OfflinePlayer:&lt;name&gt;</code>) and works for <strong>Singleplayer</strong>, <strong>LAN worlds</strong>, and <strong>offline-mode servers</strong> (<code style="font-size:11px">online-mode=false</code>).
+              </p>
+
+              <label style="display:block;font-size:11.5px;font-weight:700;color:var(--text-secondary);margin-bottom:6px">
+                CHOOSE MINECRAFT USERNAME (3–16 CHARS: A–Z, 0–9, _)
+              </label>
+              <input
+                class="input"
+                id="modal-offline-username"
+                type="text"
+                maxlength="16"
+                placeholder="e.g. VesperaPlayer"
+                autocomplete="off"
+                spellcheck="false"
+                style="width:100%;font-family:var(--font-mono);font-size:13.5px"
+              />
+              <div id="modal-offline-uuid-preview" style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);margin-top:7px">
+                Offline UUID preview: ${escapeHtml(sampleUuid)}
+              </div>
+            </div>
+
+            <button class="btn btn-primary btn-launch" id="btn-modal-create-offline" style="width:100%;justify-content:center;padding:11px 16px">
+              Create Offline Account &amp; Continue
+            </button>
+          </div>
+
+          <!-- OPTION 2: MICROSOFT ACCOUNT (OFFICIAL OAUTH) -->
+          <div style="padding:20px;border-radius:12px;background:var(--bg-canvas);border:1px solid var(--border-subtle);display:flex;flex-direction:column;justify-content:space-between;gap:14px">
+            <div>
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+                <span style="font-size:16px;font-weight:800;color:var(--text-primary)">Microsoft Account</span>
+                <span class="badge badge-cyan">Official OAuth</span>
+              </div>
+              <p style="font-size:12.5px;color:var(--text-secondary);margin:8px 0 12px;line-height:1.5">
+                Sign in through your system web browser using official Microsoft OAuth 2.0 + PKCE. Required for <strong>online-mode multiplayer servers</strong> (<code style="font-size:11px">online-mode=true</code>), <strong>Realms</strong>, and official skin sync.
+              </p>
+              <div style="padding:10px 12px;border-radius:8px;background:rgba(56,189,248,0.06);border:1px solid rgba(56,189,248,0.2);font-size:11.5px;color:var(--text-secondary);line-height:1.5">
+                • Opens login directly on <strong>microsoft.com</strong> in your default browser.<br/>
+                • Vespera never sees or asks for your Microsoft password.
+              </div>
+            </div>
+
+            <button class="btn" id="btn-modal-start-microsoft" style="width:100%;justify-content:center;padding:11px 16px;display:inline-flex;align-items:center;gap:10px;border-color:rgba(56,189,248,0.45)">
+              ${MICROSOFT_EMBLEM_SVG}
+              <span>Sign in with Microsoft</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
 
 const AUTH_PROGRESS_STEPS: Array<{ id: AuthProgressStep; label: string }> = [
   { id: 'opening_browser', label: 'Opening Microsoft login...' },
@@ -150,208 +327,218 @@ export function renderAccountsPage(
     `
     : '';
 
-  const emptyStateConnectHero =
-    snap.accounts.length === 0 && !isAuthenticating && !activeChallenge
-      ? `
-      <div class="card elevated" id="connect-account-hero" style="margin-bottom:18px;padding:38px 28px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:14px">
-        <div style="width:52px;height:52px;border-radius:14px;background:rgba(245,158,11,0.12);border:1px solid rgba(245,158,11,0.32);display:grid;place-items:center">
-          ${MICROSOFT_EMBLEM_SVG}
+  const defaultPreviewUuid = generateOfflineMinecraftUuid('Steve');
+  const dualAddAccountSection = `
+    <div class="grid-2" id="dual-account-creator" style="margin-bottom:18px;gap:16px">
+      <!-- OFFLINE ACCOUNT CARD -->
+      <div class="card elevated" id="offline-account-creator-card" style="display:flex;flex-direction:column;justify-content:space-between;gap:14px;border:1px solid rgba(245,158,11,0.34)">
+        <div>
+          <div class="card-title" style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+            <span>Add Offline Account</span>
+            <span class="badge badge-supported">Offline / SP · No Login Needed</span>
+          </div>
+          <p class="card-desc" style="margin-top:6px;line-height:1.5">
+            Play immediately using a locally created Minecraft Java username. Generates Mojang's genuine deterministic offline UUID (<code style="font-size:11px">OfflinePlayer:&lt;username&gt;</code>) for Singleplayer, LAN worlds, and multiplayer servers configured with <code style="font-size:11px">online-mode=false</code>.
+          </p>
+
+          <div style="margin-top:12px">
+            <label for="input-offline-username" style="display:block;font-size:11.5px;font-weight:700;color:var(--text-secondary);margin-bottom:6px">
+              MINECRAFT USERNAME (3–16 CHARS: A–Z, a–z, 0–9, _)
+            </label>
+            <div style="display:flex;gap:8px;align-items:center">
+              <input
+                class="input"
+                id="input-offline-username"
+                type="text"
+                maxlength="16"
+                placeholder="Enter offline username (e.g. VesperaBuilder)"
+                autocomplete="off"
+                spellcheck="false"
+                style="flex:1;font-family:var(--font-mono)"
+              />
+              <button class="btn btn-primary" id="btn-create-offline-account" style="white-space:nowrap">
+                + Add Offline Account
+              </button>
+            </div>
+            <div id="offline-uuid-preview" style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);margin-top:7px">
+              Deterministic Offline UUID (v3): ${escapeHtml(defaultPreviewUuid)} (for "Steve")
+            </div>
+          </div>
         </div>
-        <div style="max-width:480px">
-          <h3 style="font-size:21px;font-weight:800;margin:0;color:var(--text-primary)">
-            Connect your Minecraft account
-          </h3>
-          <p style="font-size:13.5px;color:var(--text-secondary);margin:8px 0 0;line-height:1.55">
-            Sign in using your official Microsoft account to access Minecraft Java Edition.
+      </div>
+
+      <!-- MICROSOFT ACCOUNT CARD -->
+      <div class="card elevated" id="microsoft-account-creator-card" style="display:flex;flex-direction:column;justify-content:space-between;gap:14px">
+        <div>
+          <div class="card-title" style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+            <span>Add Microsoft Account</span>
+            <span class="badge badge-cyan">Official OAuth · Optional</span>
+          </div>
+          <p class="card-desc" style="margin-top:6px;line-height:1.5">
+            Optional official Microsoft OAuth 2.0 + PKCE browser sign-in. Verifies Minecraft: Java Edition entitlement for <strong>online-mode multiplayer servers</strong> (<code style="font-size:11px">online-mode=true</code>), Realms, and official skins.
           </p>
         </div>
 
-        <button
-          class="btn btn-primary btn-launch"
-          id="btn-start-pkce-auth"
-          style="margin-top:6px;padding:13px 28px;font-size:14.5px;display:inline-flex;align-items:center;gap:11px;border-radius:9px"
-        >
-          ${MICROSOFT_EMBLEM_SVG}
-          <span>Sign in with Microsoft</span>
-        </button>
-
-        <p style="max-width:460px;font-size:12px;color:var(--text-muted);margin:2px 0 0;line-height:1.5">
-          Your credentials are handled directly by Microsoft. Vespera never asks for or stores your Microsoft password.
-        </p>
-      </div>
-    `
-      : '';
-
-  const connectedAccountsSection =
-    snap.accounts.length > 0
-      ? `
-      <div class="card elevated" style="margin-bottom:18px">
-        <div class="card-title" style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
-          <div>
-            <span>Minecraft Accounts (${snap.accounts.length})</span>
-            <div style="font-size:12px;font-weight:400;color:var(--text-secondary);margin-top:3px">
-              Switch between verified accounts, refresh sessions, sign out, or remove an account from this PC.
-            </div>
+        <div>
+          <button
+            class="btn btn-primary btn-launch"
+            id="btn-start-pkce-auth"
+            ${isAuthenticating ? 'disabled' : ''}
+            style="width:100%;justify-content:center;padding:11px 20px;font-size:13.5px;display:inline-flex;align-items:center;gap:10px"
+          >
+            ${MICROSOFT_EMBLEM_SVG}
+            <span>${isAuthenticating ? 'Browser Sign-In in Progress…' : 'Sign in with Microsoft'}</span>
+          </button>
+          <div style="font-size:11.5px;color:var(--text-muted);margin-top:8px;line-height:1.45">
+            Handled directly in your default web browser. Vespera never asks for your password or silently converts offline profiles.
           </div>
-          ${
-            !isAuthenticating
-              ? `<button class="btn btn-primary" id="btn-start-pkce-auth" style="display:inline-flex;align-items:center;gap:8px">
-                  ${MICROSOFT_EMBLEM_SVG}
-                  <span>Sign in with Microsoft</span>
-                </button>`
-              : ''
-          }
         </div>
+      </div>
+    </div>
+  `;
 
-        <div style="display:flex;flex-direction:column;gap:10px;margin-top:16px">
-          ${snap.accounts
-            .map((acc) => {
-              const cleanUuid = acc.uuid.replace(/-/g, '');
-              const avatarUrl = `https://mc-heads.net/avatar/${encodeURIComponent(cleanUuid)}/48`;
-              const statusBadge =
-                acc.sessionStatus === 'valid'
-                  ? `<span class="badge badge-supported">Active Session</span>`
-                  : acc.sessionStatus === 'refresh_required'
-                    ? `<span class="badge badge-experimental">Refresh Ready</span>`
-                    : acc.sessionStatus === 'signed_out'
-                      ? `<span class="badge badge-legacy">Signed Out</span>`
-                      : `<span class="badge badge-warning">Session Expired</span>`;
-              return `
-                <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;padding:14px 16px;background:var(--bg-canvas);border:1px solid ${
-                  acc.active ? 'var(--accent-amber)' : 'var(--border-subtle)'
-                };border-radius:10px">
-                  <div style="display:flex;align-items:center;gap:13px">
-                    <img
-                      src="${avatarUrl}"
-                      alt="${escapeHtml(acc.username)}"
-                      width="46"
-                      height="46"
-                      style="border-radius:8px;image-rendering:pixelated;border:1px solid var(--border-strong);background:#1e293b"
-                      onerror="this.style.display='none'"
-                    />
-                    <div>
-                      <div style="font-weight:700;font-size:15px;display:flex;align-items:center;gap:7px;flex-wrap:wrap">
-                        <span>${escapeHtml(acc.username)}</span>
-                        ${statusBadge}
-                        ${acc.ownsMinecraftJava ? `<span class="badge badge-healthy">Java Edition</span>` : ''}
+  const savedAccountsSection = `
+    <div class="card elevated" id="saved-accounts-card" style="margin-bottom:18px">
+      <div class="card-title" style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+        <div>
+          <span>Saved Accounts (${snap.accounts.length})</span>
+          <div style="font-size:12px;font-weight:400;color:var(--text-secondary);margin-top:3px">
+            Your active selection is automatically remembered across Vespera restarts. Offline and Microsoft profiles stay strictly separate.
+          </div>
+        </div>
+        <span class="badge badge-supported">Auto-Remembered Selection</span>
+      </div>
+
+      ${
+        snap.accounts.length === 0
+          ? `<div style="margin-top:14px;padding:22px;border-radius:10px;background:var(--bg-canvas);border:1px dashed var(--border-strong);text-align:center;color:var(--text-secondary);font-size:13px">
+              No accounts added yet. Create an <strong>Offline Account</strong> above to play immediately, or click <strong>Sign in with Microsoft</strong> for online-mode servers.
+            </div>`
+          : `<div id="accounts-saved-list" style="display:flex;flex-direction:column;gap:10px;margin-top:16px">
+              ${snap.accounts
+                .map((acc) => {
+                  const isOfflineAcc = acc.accountType === 'offline';
+                  const typeBadge = isOfflineAcc
+                    ? `<span class="badge badge-experimental" title="Local Offline-Mode Account">Offline</span>`
+                    : `<span class="badge badge-cyan" title="Official Microsoft OAuth Account">Microsoft</span>`;
+
+                  const statusBadge = isOfflineAcc
+                    ? `<span class="badge badge-supported">Local Ready</span>`
+                    : acc.sessionStatus === 'valid'
+                      ? `<span class="badge badge-supported">Authenticated</span>`
+                      : acc.sessionStatus === 'refresh_required'
+                        ? `<span class="badge badge-experimental">Refresh Ready</span>`
+                        : acc.sessionStatus === 'signed_out'
+                          ? `<span class="badge badge-legacy">Signed Out</span>`
+                          : `<span class="badge badge-warning">Session Expired</span>`;
+
+                  const compatibilityLine = isOfflineAcc
+                    ? `UUID (v3 OfflinePlayer): ${escapeHtml(acc.uuid)} · Singleplayer, LAN &amp; online-mode=false servers`
+                    : `UUID: ${escapeHtml(acc.uuid)} · Verified: ${escapeHtml(formatTimestampShort(acc.lastValidatedAt))} · Online-mode &amp; Singleplayer`;
+
+                  return `
+                    <div class="account-profile-card" data-account-card="${escapeHtml(acc.id)}" data-account-type="${escapeHtml(acc.accountType)}" style="display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;padding:14px 16px;background:var(--bg-canvas);border:1.5px solid ${
+                      acc.active ? 'var(--accent-amber)' : 'var(--border-subtle)'
+                    };border-radius:10px;box-shadow:${
+                      acc.active ? '0 0 0 1px rgba(245,158,11,0.18)' : 'none'
+                    }">
+                      <div style="display:flex;align-items:center;gap:13px">
+                        ${renderAccountAvatar(acc, 46)}
+                        <div>
+                          <div style="font-weight:700;font-size:15px;display:flex;align-items:center;gap:7px;flex-wrap:wrap">
+                            <span>${escapeHtml(acc.username)}</span>
+                            ${typeBadge}
+                            ${statusBadge}
+                            ${!isOfflineAcc && acc.ownsMinecraftJava ? `<span class="badge badge-healthy">Java Edition</span>` : ''}
+                          </div>
+                          <div style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);margin-top:4px">
+                            ${compatibilityLine}
+                          </div>
+                        </div>
                       </div>
-                      <div style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);margin-top:3px">
-                        UUID: ${escapeHtml(acc.uuid)} · Verified: ${escapeHtml(formatTimestampShort(acc.lastValidatedAt))}
+
+                      <div style="display:flex;gap:7px;flex-wrap:wrap;align-items:center">
+                        ${
+                          !acc.active
+                            ? `<button class="btn btn-sm btn-primary" data-switch-account="${escapeHtml(acc.id)}">Switch</button>`
+                            : `<span class="badge badge-supported" data-selected-badge="${escapeHtml(acc.id)}">SELECTED</span>`
+                        }
+                        ${
+                          !isOfflineAcc
+                            ? acc.sessionStatus !== 'signed_out'
+                              ? `<button class="btn btn-sm" data-refresh-account="${escapeHtml(acc.id)}">Refresh</button>
+                                 <button class="btn btn-sm" data-signout-account="${escapeHtml(acc.id)}">Sign Out</button>`
+                              : `<button class="btn btn-sm btn-primary" data-reconnect-account="${escapeHtml(acc.id)}">Sign In Again</button>`
+                            : ''
+                        }
+                        <button class="btn btn-sm btn-danger" data-remove-account="${escapeHtml(acc.id)}">Remove</button>
                       </div>
                     </div>
-                  </div>
-
-                  <div style="display:flex;gap:7px;flex-wrap:wrap;align-items:center">
-                    ${
-                      !acc.active
-                        ? `<button class="btn btn-sm btn-primary" data-switch-account="${escapeHtml(acc.id)}">Switch Active</button>`
-                        : `<span class="badge badge-supported">ACTIVE</span>`
-                    }
-                    ${
-                      acc.sessionStatus !== 'signed_out'
-                        ? `<button class="btn btn-sm" data-refresh-account="${escapeHtml(acc.id)}">Refresh</button>
-                           <button class="btn btn-sm" data-signout-account="${escapeHtml(acc.id)}">Sign Out</button>`
-                        : `<button class="btn btn-sm btn-primary" data-reconnect-account="${escapeHtml(acc.id)}">Sign In Again</button>`
-                    }
-                    <button class="btn btn-sm btn-danger" data-remove-account="${escapeHtml(acc.id)}">Remove</button>
-                  </div>
-                </div>
-              `;
-            })
-            .join('')}
-        </div>
-      </div>
-    `
-      : '';
+                  `;
+                })
+                .join('')}
+            </div>`
+      }
+    </div>
+  `;
 
   return `
     <div class="page-header">
       <div>
         <h2 class="page-title">Accounts</h2>
         <p class="page-subtitle">
-          Sign in with your Microsoft account to play Minecraft: Java Edition online and manage your connected player profiles.
+          Play immediately with local Offline Accounts or connect an optional Microsoft Account for online-mode multiplayer servers.
         </p>
       </div>
-      <span class="badge badge-supported">Encrypted Account Vault</span>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span class="badge badge-experimental">Offline Mode Ready</span>
+        <span class="badge badge-cyan">Microsoft OAuth Optional</span>
+      </div>
     </div>
 
+    ${renderMultiplayerRejectionBanner(snap.lastMultiplayerNotice)}
     ${errorBannerHtml}
     ${progressCardHtml}
     ${deviceFallbackHtml}
-    ${emptyStateConnectHero}
-    ${connectedAccountsSection}
+    ${dualAddAccountSection}
+    ${savedAccountsSection}
 
-    <!-- LEGITIMATE OFFLINE SINGLEPLAYER SECTION -->
-    <div class="card" id="offline-availability-section">
+    <!-- MULTIPLAYER & SESSION COMPATIBILITY GUIDE -->
+    <div class="card" id="multiplayer-compatibility-card" style="margin-bottom:18px">
       <div class="card-title">
-        <span>Offline Availability (Legitimate Local Singleplayer)</span>
-        <span class="badge ${offline?.eligible ? 'badge-supported' : 'badge-legacy'}">
-          ${
-            offline?.activeSessionMode === 'offline_singleplayer'
-              ? 'Offline Singleplayer Active'
-              : offline?.eligible
-                ? 'Offline Singleplayer Ready'
-                : 'Online Verification Required First'
-          }
-        </span>
+        <span>Account Types &amp; Multiplayer Server Compatibility</span>
+        <span class="badge badge-supported">Strict Session Integrity</span>
       </div>
-      <div class="card-desc">
-        Allows launching local singleplayer worlds when your internet connection is unavailable — strictly for an account that previously completed official Microsoft authentication and Minecraft: Java Edition entitlement verification on this device.
-      </div>
-
-      <div class="grid-2" style="margin-top:14px">
-        <div style="padding:12px 14px;border-radius:8px;background:var(--bg-canvas);border:1px solid var(--border-subtle);font-size:12.5px;display:flex;flex-direction:column;gap:8px">
-          <div style="display:flex;justify-content:space-between">
-            <span style="color:var(--text-secondary)">Verified Local Account:</span>
-            <strong>${
-              offline?.verifiedUsername
-                ? `${escapeHtml(offline.verifiedUsername)} (${escapeHtml((offline.verifiedUuid || '').slice(0, 8))}…)`
-                : 'None Verified Yet'
-            }</strong>
-          </div>
-          <div style="display:flex;justify-content:space-between">
-            <span style="color:var(--text-secondary)">Last Successful Online Auth:</span>
-            <span style="font-family:var(--font-mono)">${escapeHtml(formatTimestampShort(offline?.lastOnlineAuthAt))}</span>
-          </div>
-          <div style="display:flex;justify-content:space-between">
-            <span style="color:var(--text-secondary)">Local Game Files (${escapeHtml(activeProfile.mcVersion)}):</span>
-            <span style="color:${offline?.localGameReady ? '#34d399' : '#fbbf24'};font-weight:700">
-              ${offline?.localGameReady ? '✓ Installed & Hash-Verified' : '○ Install While Online First'}
-            </span>
-          </div>
-          <div style="margin-top:4px;font-size:12px;color:var(--text-muted)">
-            ${escapeHtml(offline?.statusReason || '')}
+      <div class="grid-2" style="margin-top:12px;gap:14px;font-size:12.5px">
+        <div style="padding:12px 14px;border-radius:8px;background:var(--bg-canvas);border:1px solid var(--border-subtle)">
+          <div style="font-weight:700;color:var(--accent-amber-bright);margin-bottom:5px">Offline Accounts (Local / SP)</div>
+          <div style="color:var(--text-secondary);line-height:1.55">
+            • Uses Mojang's deterministic <code style="font-size:11px">OfflinePlayer:&lt;username&gt;</code> MD5 v3 UUID.<br/>
+            • Works in <strong>Singleplayer worlds</strong>, <strong>LAN sessions</strong>, and servers with <code style="font-size:11px">online-mode=false</code>.<br/>
+            • Never asks for Microsoft login, never pretends to be a Microsoft account, and never bypasses <code style="font-size:11px">online-mode=true</code> server verification.
           </div>
         </div>
-
-        <div style="padding:12px 14px;border-radius:8px;background:var(--bg-canvas);border:1px solid var(--border-subtle);font-size:12px;display:flex;flex-direction:column;justify-content:space-between;gap:10px">
-          <div>
-            <div style="font-weight:700;color:var(--text-primary);margin-bottom:6px">Enforced Offline Mode Restrictions</div>
-            ${(
-              offline?.restrictions || [
-                'Singleplayer and local worlds only (--disableMultiplayer enforced).',
-                'Multiplayer server connections are disabled while offline.',
-                'Identity locked to your previously Microsoft-verified account.',
-              ]
-            )
-              .map((r) => `<div style="color:var(--text-secondary);margin-bottom:3px">• ${escapeHtml(r)}</div>`)
-              .join('')}
+        <div style="padding:12px 14px;border-radius:8px;background:var(--bg-canvas);border:1px solid var(--border-subtle)">
+          <div style="font-weight:700;color:#38bdf8;margin-bottom:5px">Microsoft Accounts (Official Online OAuth)</div>
+          <div style="color:var(--text-secondary);line-height:1.55">
+            • Authenticated via official Microsoft OAuth 2.0 + PKCE in your system browser.<br/>
+            • Works on all <strong>online-mode servers</strong> (<code style="font-size:11px">online-mode=true</code>), <strong>Minecraft Realms</strong>, LAN, and Singleplayer.<br/>
+            • Includes offline singleplayer fallback (${offline?.eligible ? `Ready as ${escapeHtml(offline.verifiedUsername || '')}` : 'Available after first online sign-in'}) when your internet drops.
           </div>
-
-          <div style="display:flex;gap:8px;flex-wrap:wrap">
-            <button
-              class="btn btn-primary"
-              id="btn-launch-offline-sp"
-              ${offline?.eligible ? '' : 'disabled'}
-            >
-              ▶ Launch Offline Singleplayer (${escapeHtml(activeProfile.mcVersion)})
-            </button>
-            ${
-              offline?.activeSessionMode === 'offline_singleplayer'
-                ? `<button class="btn btn-cyan" id="btn-restore-online-session">↻ Restore Online Session</button>`
-                : ''
-            }
-          </div>
+          ${
+            offline?.eligible
+              ? `<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+                  <button class="btn btn-sm" id="btn-launch-offline-sp">
+                    ▶ Launch Verified Microsoft Offline Fallback (${escapeHtml(activeProfile.mcVersion)})
+                  </button>
+                  ${
+                    offline?.activeSessionMode === 'offline_singleplayer'
+                      ? `<button class="btn btn-sm btn-cyan" id="btn-restore-online-session">↻ Restore Online Session</button>`
+                      : ''
+                  }
+                </div>`
+              : ''
+          }
         </div>
       </div>
     </div>
@@ -666,7 +853,7 @@ export function renderAboutPage(snap: AppStateSnapshot): string {
           </div>
         </div>
         <div class="card-desc">
-          Vespera separates its lightweight native Windows desktop launcher (<code>VesperaClient.exe</code>, Win32 + Edge WebView2 + WinHTTP + WinSock2 PKCE + DPAPI + CNG BCrypt) from its decoupled client-side Fabric integration mod (<code>vespera-client-1.1.1+mc1.21.4.jar</code>), keeping launcher RAM overhead minimal and background CPU utilization at 0.0% during gameplay.
+          Vespera separates its lightweight native Windows desktop launcher (<code>VesperaClient.exe</code>, Win32 + Edge WebView2 + WinHTTP + WinSock2 PKCE + DPAPI + CNG BCrypt) from its decoupled client-side Fabric integration mod (<code>vespera-client-1.2.0+mc1.21.4.jar</code>), keeping launcher RAM overhead minimal and background CPU utilization at 0.0% during gameplay.
         </div>
       </div>
 
@@ -734,6 +921,8 @@ export function renderAboutPage(snap: AppStateSnapshot): string {
 export function bindAccountsSettingsDiagEvents(
   stage: HTMLElement,
   callbacks: {
+    onCreateOfflineAccount: (username: string) => void;
+    onDismissMultiplayerNotice: () => void;
     onStartPkceAuth: () => void;
     onStartDeviceAuth: () => void;
     onPollMsaAuth: () => void;
@@ -752,6 +941,43 @@ export function bindAccountsSettingsDiagEvents(
     onApplyAutoFix: (actionId: string) => void;
   }
 ): void {
+  const offlineInput = stage.querySelector<HTMLInputElement>('#input-offline-username');
+  const offlinePreview = stage.querySelector<HTMLElement>('#offline-uuid-preview');
+  if (offlineInput && offlinePreview) {
+    offlineInput.addEventListener('input', () => {
+      const val = offlineInput.value.trim();
+      if (!val) {
+        offlinePreview.textContent = `Deterministic Offline UUID (v3): ${generateOfflineMinecraftUuid('Steve')} (for "Steve")`;
+        offlinePreview.style.color = 'var(--text-muted)';
+        return;
+      }
+      const check = validateMinecraftUsername(val);
+      if (!check.valid) {
+        offlinePreview.textContent = check.error || 'Invalid Minecraft username.';
+        offlinePreview.style.color = '#fca5a5';
+      } else {
+        const uuid = generateOfflineMinecraftUuid(check.normalized);
+        offlinePreview.textContent = `Deterministic Offline UUID (v3): ${uuid}`;
+        offlinePreview.style.color = '#34d399';
+      }
+    });
+    offlineInput.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        callbacks.onCreateOfflineAccount(offlineInput.value);
+      }
+    });
+  }
+
+  stage.querySelector('#btn-create-offline-account')?.addEventListener('click', () => {
+    const val = stage.querySelector<HTMLInputElement>('#input-offline-username')?.value ?? '';
+    callbacks.onCreateOfflineAccount(val);
+  });
+
+  stage.querySelectorAll<HTMLElement>('[data-dismiss-mp-notice]').forEach((btn) => {
+    btn.addEventListener('click', () => callbacks.onDismissMultiplayerNotice());
+  });
+
   stage.querySelector('#btn-start-pkce-auth')?.addEventListener('click', callbacks.onStartPkceAuth);
   stage.querySelectorAll<HTMLElement>('[data-reconnect-account]').forEach((btn) => {
     btn.addEventListener('click', () => callbacks.onStartPkceAuth());

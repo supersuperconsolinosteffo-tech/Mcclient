@@ -168,6 +168,55 @@ inline std::string bcrypt_hash_file(const std::filesystem::path& filePath, LPCWS
 }
 
 /**
+ * Validates official Minecraft: Java Edition username format (3–16 chars: A-Z, a-z, 0-9, _).
+ */
+inline bool is_valid_minecraft_username(const std::string& username) {
+    if (username.size() < 3 || username.size() > 16) return false;
+    for (unsigned char c : username) {
+        bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/**
+ * Generates Mojang's deterministic offline UUID (`UUID.nameUUIDFromBytes("OfflinePlayer:" + username)`)
+ * using Windows CNG `BCRYPT_MD5_ALGORITHM` + RFC 4122 Version 3 bit masking.
+ */
+inline std::string generate_offline_minecraft_uuid(const std::string& username) {
+    std::string input = "OfflinePlayer:" + username;
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    BCRYPT_HASH_HANDLE hHash = nullptr;
+    unsigned char digest[16] = {};
+
+    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_MD5_ALGORITHM, nullptr, 0) == 0) {
+        DWORD objLen = 0, cbData = 0;
+        BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objLen), sizeof(DWORD), &cbData, 0);
+        std::vector<UCHAR> hashObj(objLen);
+        if (BCryptCreateHash(hAlg, &hHash, hashObj.data(), objLen, nullptr, 0, 0) == 0) {
+            BCryptHashData(hHash, reinterpret_cast<PUCHAR>(input.data()), static_cast<ULONG>(input.size()), 0);
+            BCryptFinishHash(hHash, digest, 16, 0);
+            BCryptDestroyHash(hHash);
+        }
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+    }
+
+    // RFC 4122 Version 3 (MD5 name-based) + IETF variant
+    digest[6] = static_cast<unsigned char>((digest[6] & 0x0fU) | 0x30U);
+    digest[8] = static_cast<unsigned char>((digest[8] & 0x3fU) | 0x80U);
+
+    static const char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(36);
+    for (int i = 0; i < 16; ++i) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) out.push_back('-');
+        out.push_back(kHex[(digest[i] >> 4) & 0xF]);
+        out.push_back(kHex[digest[i] & 0xF]);
+    }
+    return out;
+}
+
+/**
  * Windows DPAPI per-user token vault protection (CryptProtectData / CryptUnprotectData).
  */
 inline bool dpapi_save_secret(const std::filesystem::path& path, const std::string& plaintextJson) {
@@ -232,7 +281,7 @@ inline HttpResponse winhttp_request(
         return res;
     }
 
-    HINTERNET hSession = WinHttpOpen(L"VesperaClient/1.1.1 (Windows NT 10.0; Win64; x64)",
+    HINTERNET hSession = WinHttpOpen(L"VesperaClient/1.2.0 (Windows NT 10.0; Win64; x64)",
                                      WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                      WINHTTP_NO_PROXY_NAME,
                                      WINHTTP_NO_PROXY_BYPASS, 0);
@@ -401,7 +450,7 @@ inline bool winhttp_download_verified(
             return false;
         }
 
-        HINTERNET hSession = WinHttpOpen(L"VesperaClient/1.1.1 (Windows NT 10.0; Win64; x64)",
+        HINTERNET hSession = WinHttpOpen(L"VesperaClient/1.2.0 (Windows NT 10.0; Win64; x64)",
                                          WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                          WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         if (!hSession) {
