@@ -1,0 +1,378 @@
+#ifndef VESPERA_WIN32_PLATFORM_HPP
+#define VESPERA_WIN32_PLATFORM_HPP
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <windows.h>
+#include <shellapi.h>
+#include <wincrypt.h>
+#include <bcrypt.h>
+#include <winhttp.h>
+#include <shlobj.h>
+#include <shobjidl.h>
+#include <psapi.h>
+
+#include <cstdio>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <regex>
+#include <sstream>
+#include <string>
+#include <vector>
+
+namespace vespera_win32 {
+
+inline std::wstring utf8_to_wide(const std::string& str) {
+    if (str.empty()) return L"";
+    int needed = MultiByteToWideChar(CP_UTF8, 0, str.data(), static_cast<int>(str.size()), nullptr, 0);
+    if (needed <= 0) return L"";
+    std::wstring out(needed, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, str.data(), static_cast<int>(str.size()), out.data(), needed);
+    return out;
+}
+
+inline std::string wide_to_utf8(const std::wstring& wstr) {
+    if (wstr.empty()) return "";
+    int needed = WideCharToMultiByte(CP_UTF8, 0, wstr.data(), static_cast<int>(wstr.size()), nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) return "";
+    std::string out(needed, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wstr.data(), static_cast<int>(wstr.size()), out.data(), needed, nullptr, nullptr);
+    return out;
+}
+
+inline std::string get_known_folder_utf8(REFKNOWNFOLDERID rfid, const std::string& fallbackEnv) {
+    PWSTR rawPath = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(rfid, 0, nullptr, &rawPath)) && rawPath != nullptr) {
+        std::wstring ws(rawPath);
+        CoTaskMemFree(rawPath);
+        return wide_to_utf8(ws);
+    }
+    if (!fallbackEnv.empty()) {
+        const char* envVal = std::getenv(fallbackEnv.c_str());
+        if (envVal) return std::string(envVal);
+    }
+    return "C:\\Users\\Public";
+}
+
+inline std::string iso_timestamp_now() {
+    std::time_t t = std::time(nullptr);
+    std::tm gmt{};
+    gmtime_s(&gmt, &t);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+                  gmt.tm_year + 1900, gmt.tm_mon + 1, gmt.tm_mday,
+                  gmt.tm_hour, gmt.tm_min, gmt.tm_sec);
+    return std::string(buf);
+}
+
+inline std::string redact_tokens(const std::string& input) {
+    std::string out = input;
+    out = std::regex_replace(out, std::regex("(--accessToken\\s+)([^\\s\"']+)"), "$1[REDACTED_MC_TOKEN]");
+    out = std::regex_replace(out, std::regex("(Bearer\\s+)[A-Za-z0-9._~+/-]+=*"), "$1[REDACTED_BEARER]");
+    out = std::regex_replace(out, std::regex("(\"access_token\"\\s*:\\s*\")[^\"]+(\")"), "$1[REDACTED]$2");
+    out = std::regex_replace(out, std::regex("(\"refresh_token\"\\s*:\\s*\")[^\"]+(\")"), "$1[REDACTED]$2");
+    return out;
+}
+
+inline bool write_file_atomic(const std::filesystem::path& target, const void* data, size_t len) {
+    std::error_code ec;
+    std::filesystem::create_directories(target.parent_path(), ec);
+    std::filesystem::path tmp = target;
+    tmp += L".tmp";
+
+    HANDLE hFile = CreateFileW(tmp.wstring().c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    const uint8_t* ptr = static_cast<const uint8_t*>(data);
+    size_t remaining = len;
+    while (remaining > 0) {
+        DWORD chunk = static_cast<DWORD>(remaining > (1 << 20) ? (1 << 20) : remaining);
+        DWORD written = 0;
+        if (!WriteFile(hFile, ptr, chunk, &written, nullptr) || written == 0) {
+            CloseHandle(hFile);
+            DeleteFileW(tmp.wstring().c_str());
+            return false;
+        }
+        ptr += written;
+        remaining -= written;
+    }
+    FlushFileBuffers(hFile);
+    CloseHandle(hFile);
+
+    if (!MoveFileExW(tmp.wstring().c_str(), target.wstring().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(tmp.wstring().c_str());
+        return false;
+    }
+    return true;
+}
+
+inline bool write_text_atomic(const std::filesystem::path& target, const std::string& content) {
+    return write_file_atomic(target, content.data(), content.size());
+}
+
+inline std::string read_text_file(const std::filesystem::path& p) {
+    std::ifstream ifs(p, std::ios::binary);
+    if (!ifs) return "";
+    std::ostringstream ss;
+    ss << ifs.rdbuf();
+    return ss.str();
+}
+
+/**
+ * Computes SHA-1 or SHA-256 hex digest using Windows Cryptography Next Generation (CNG / bcrypt.lib).
+ */
+inline std::string bcrypt_hash_bytes(const void* data, size_t size, LPCWSTR algId = BCRYPT_SHA256_ALGORITHM) {
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    BCRYPT_HASH_HANDLE hHash = nullptr;
+    std::string hexResult;
+
+    if (BCryptOpenAlgorithmProvider(&hAlg, algId, nullptr, 0) != 0) return "";
+    DWORD objLen = 0, cbData = 0, hashLen = 0;
+    BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objLen), sizeof(DWORD), &cbData, 0);
+    BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hashLen), sizeof(DWORD), &cbData, 0);
+
+    std::vector<UCHAR> hashObj(objLen);
+    std::vector<UCHAR> digest(hashLen);
+
+    if (BCryptCreateHash(hAlg, &hHash, hashObj.data(), objLen, nullptr, 0, 0) == 0) {
+        if (BCryptHashData(hHash, reinterpret_cast<PUCHAR>(const_cast<void*>(data)), static_cast<ULONG>(size), 0) == 0 &&
+            BCryptFinishHash(hHash, digest.data(), hashLen, 0) == 0) {
+            static const char kHex[] = "0123456789abcdef";
+            hexResult.reserve(hashLen * 2);
+            for (DWORD i = 0; i < hashLen; ++i) {
+                hexResult.push_back(kHex[(digest[i] >> 4) & 0xF]);
+                hexResult.push_back(kHex[digest[i] & 0xF]);
+            }
+        }
+        BCryptDestroyHash(hHash);
+    }
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    return hexResult;
+}
+
+inline std::string bcrypt_hash_file(const std::filesystem::path& filePath, LPCWSTR algId = BCRYPT_SHA256_ALGORITHM) {
+    std::ifstream ifs(filePath, std::ios::binary);
+    if (!ifs) return "";
+    std::vector<char> buf((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    return bcrypt_hash_bytes(buf.data(), buf.size(), algId);
+}
+
+/**
+ * Windows DPAPI per-user token vault protection (CryptProtectData / CryptUnprotectData).
+ */
+inline bool dpapi_save_secret(const std::filesystem::path& path, const std::string& plaintextJson) {
+    DATA_BLOB inBlob{};
+    inBlob.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(plaintextJson.data()));
+    inBlob.cbData = static_cast<DWORD>(plaintextJson.size());
+    DATA_BLOB outBlob{};
+    if (!CryptProtectData(&inBlob, L"VesperaClientVault", nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &outBlob)) {
+        return false;
+    }
+    bool ok = write_file_atomic(path, outBlob.pbData, outBlob.cbData);
+    LocalFree(outBlob.pbData);
+    return ok;
+}
+
+inline std::string dpapi_load_secret(const std::filesystem::path& path) {
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs) return "";
+    std::vector<BYTE> enc((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    if (enc.empty()) return "";
+    DATA_BLOB inBlob{ static_cast<DWORD>(enc.size()), enc.data() };
+    DATA_BLOB outBlob{};
+    if (!CryptUnprotectData(&inBlob, nullptr, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &outBlob)) {
+        return "";
+    }
+    std::string out(reinterpret_cast<char*>(outBlob.pbData), outBlob.cbData);
+    SecureZeroMemory(outBlob.pbData, outBlob.cbData);
+    LocalFree(outBlob.pbData);
+    return out;
+}
+
+struct HttpResponse {
+    int statusCode = 0;
+    std::string body;
+    std::string error;
+};
+
+/**
+ * Native TLS 1.2/1.3 HTTPS request over WinHTTP.
+ */
+inline HttpResponse winhttp_request(
+    const std::string& method,
+    const std::string& urlUtf8,
+    const std::string& requestBody = "",
+    const std::string& contentType = "application/json",
+    const std::string& bearerToken = ""
+) {
+    HttpResponse res;
+    std::wstring wurl = utf8_to_wide(urlUtf8);
+
+    URL_COMPONENTS uc{};
+    uc.dwStructSize = sizeof(uc);
+    wchar_t hostBuf[256] = {};
+    wchar_t pathBuf[2048] = {};
+    uc.lpszHostName = hostBuf;
+    uc.dwHostNameLength = 255;
+    uc.lpszUrlPath = pathBuf;
+    uc.dwUrlPathLength = 2047;
+
+    if (!WinHttpCrackUrl(wurl.c_str(), static_cast<DWORD>(wurl.size()), 0, &uc)) {
+        res.error = "Invalid URL";
+        return res;
+    }
+
+    HINTERNET hSession = WinHttpOpen(L"VesperaClient/1.0.0 (Windows NT 10.0; Win64; x64)",
+                                     WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                     WINHTTP_NO_PROXY_NAME,
+                                     WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) {
+        res.error = "WinHttpOpen failed";
+        return res;
+    }
+    WinHttpSetTimeouts(hSession, 6000, 6000, 15000, 30000);
+
+    HINTERNET hConnect = WinHttpConnect(hSession, hostBuf, uc.nPort, 0);
+    if (!hConnect) {
+        WinHttpCloseHandle(hSession);
+        res.error = "WinHttpConnect failed";
+        return res;
+    }
+
+    DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+    std::wstring wmethod = utf8_to_wide(method);
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, wmethod.c_str(), pathBuf, nullptr,
+                                            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!hRequest) {
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        res.error = "WinHttpOpenRequest failed";
+        return res;
+    }
+
+    std::wstring headers = L"Accept: application/json\r\n";
+    if (!contentType.empty() && !requestBody.empty()) {
+        headers += L"Content-Type: " + utf8_to_wide(contentType) + L"\r\n";
+    }
+    if (!bearerToken.empty()) {
+        headers += L"Authorization: Bearer " + utf8_to_wide(bearerToken) + L"\r\n";
+    }
+
+    BOOL sent = WinHttpSendRequest(
+        hRequest,
+        headers.c_str(),
+        static_cast<DWORD>(headers.size()),
+        requestBody.empty() ? WINHTTP_NO_REQUEST_DATA : const_cast<char*>(requestBody.data()),
+        static_cast<DWORD>(requestBody.size()),
+        static_cast<DWORD>(requestBody.size()),
+        0
+    );
+
+    if (sent && WinHttpReceiveResponse(hRequest, nullptr)) {
+        DWORD status = 0;
+        DWORD statusSize = sizeof(status);
+        WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize, WINHTTP_NO_HEADER_INDEX);
+        res.statusCode = static_cast<int>(status);
+
+        DWORD avail = 0;
+        do {
+            avail = 0;
+            if (!WinHttpQueryDataAvailable(hRequest, &avail) || avail == 0) break;
+            std::vector<char> chunk(avail);
+            DWORD readBytes = 0;
+            if (WinHttpReadData(hRequest, chunk.data(), avail, &readBytes) && readBytes > 0) {
+                res.body.append(chunk.data(), readBytes);
+            }
+        } while (avail > 0);
+    } else {
+        res.error = "Network request failed (WinHTTP error " + std::to_string(GetLastError()) + ")";
+    }
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return res;
+}
+
+inline bool winhttp_download_file(const std::string& urlUtf8, const std::filesystem::path& destFile) {
+    HttpResponse r = winhttp_request("GET", urlUtf8);
+    if (r.statusCode < 200 || r.statusCode >= 300 || r.body.empty()) return false;
+    return write_file_atomic(destFile, r.body.data(), r.body.size());
+}
+
+/**
+ * Creates a standard Windows Shell Shortcut (.lnk) via COM IShellLinkW + IPersistFile.
+ */
+inline bool create_windows_shortcut(
+    const std::filesystem::path& lnkPath,
+    const std::filesystem::path& targetExe,
+    const std::filesystem::path& workingDir,
+    const std::filesystem::path& iconPath,
+    const std::wstring& description
+) {
+    std::error_code ec;
+    std::filesystem::create_directories(lnkPath.parent_path(), ec);
+
+    IShellLinkW* psl = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLinkW, reinterpret_cast<void**>(&psl));
+    if (FAILED(hr) || !psl) return false;
+
+    psl->SetPath(targetExe.wstring().c_str());
+    psl->SetWorkingDirectory(workingDir.wstring().c_str());
+    psl->SetIconLocation(iconPath.wstring().c_str(), 0);
+    psl->SetDescription(description.c_str());
+
+    IPersistFile* ppf = nullptr;
+    bool saved = false;
+    if (SUCCEEDED(psl->QueryInterface(IID_IPersistFile, reinterpret_cast<void**>(&ppf))) && ppf) {
+        saved = SUCCEEDED(ppf->Save(lnkPath.wstring().c_str(), TRUE));
+        ppf->Release();
+    }
+    psl->Release();
+    return saved;
+}
+
+inline std::string query_windows_gpu_name() {
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                      L"SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\0000",
+                      0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        wchar_t buf[256] = {};
+        DWORD sz = sizeof(buf);
+        DWORD type = 0;
+        if (RegQueryValueExW(hKey, L"DriverDesc", nullptr, &type, reinterpret_cast<LPBYTE>(buf), &sz) == ERROR_SUCCESS && type == REG_SZ) {
+            RegCloseKey(hKey);
+            return wide_to_utf8(buf);
+        }
+        RegCloseKey(hKey);
+    }
+    return "";
+}
+
+inline std::string query_windows_cpu_name() {
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                      L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                      0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        wchar_t buf[256] = {};
+        DWORD sz = sizeof(buf);
+        DWORD type = 0;
+        if (RegQueryValueExW(hKey, L"ProcessorNameString", nullptr, &type, reinterpret_cast<LPBYTE>(buf), &sz) == ERROR_SUCCESS && type == REG_SZ) {
+            RegCloseKey(hKey);
+            return wide_to_utf8(buf);
+        }
+        RegCloseKey(hKey);
+    }
+    return "x86_64 Processor";
+}
+
+} // namespace vespera_win32
+
+#endif

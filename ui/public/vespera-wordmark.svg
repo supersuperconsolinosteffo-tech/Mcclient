@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 96" fill="none">
+  <g transform="translate(8,8) scale(0.3125)">
+    <polygon points="72,15 184,15 241,72 241,184 184,241 72,241 15,184 15,72" fill="#F59E0B"/>
+    <polygon points="77,25 179,25 231,77 231,179 179,231 77,231 25,179 25,77" fill="#0D1017"/>
+    <polygon points="54,62 95,62 128,158 128,210 110,210" fill="#FBBF24"/>
+    <polygon points="202,62 161,62 128,158 128,210 146,210" fill="#D97706"/>
+    <polygon points="128,66 149,107 128,144 107,107" fill="#22D3EE"/>
+  </g>
+  <text x="106" y="54" fill="#F8FAFC" font-family="Segoe UI, Inter, system-ui, sans-serif" font-weight="800" font-size="38" letter-spacing="4">VESPERA</text>
+  <text x="108" y="76" fill="#94A3B8" font-family="Consolas, JetBrains Mono, monospace" font-weight="600" font-size="13" letter-spacing="3.5">PRECISION MINECRAFT CLIENT</text>
+</svg>

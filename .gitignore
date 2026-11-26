@@ -1,0 +1,24 @@
+# Toolchains & caches
+.venv/
+node_modules/
+.cache/
+.vite/
+
+# Intermediate build outputs
+dist/
+build/
+out/
+target/
+native/obj/
+mod/.gradle/
+mod/build/
+
+# Runtime local test data
+.vespera-dev-data/
+*.log
+*.tmp
+
+# Secrets & local overrides
+.env
+.env.local
+*.dpapi

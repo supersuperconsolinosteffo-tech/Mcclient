@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="none">
+  <defs>
+    <linearGradient id="rim" x1="24" y1="16" x2="232" y2="240" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FBBF24"/>
+      <stop offset="38%" stop-color="#334155"/>
+      <stop offset="100%" stop-color="#1E293B"/>
+    </linearGradient>
+    <linearGradient id="chassis" x1="128" y1="24" x2="128" y2="232" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#141821"/>
+      <stop offset="100%" stop-color="#090B10"/>
+    </linearGradient>
+    <linearGradient id="wingL" x1="54" y1="60" x2="128" y2="210" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FDE68A"/>
+      <stop offset="45%" stop-color="#F59E0B"/>
+      <stop offset="100%" stop-color="#EA580C"/>
+    </linearGradient>
+    <linearGradient id="wingR" x1="202" y1="60" x2="128" y2="210" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F59E0B"/>
+      <stop offset="100%" stop-color="#B45309"/>
+    </linearGradient>
+    <linearGradient id="core" x1="128" y1="66" x2="128" y2="144" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#A5F3FC"/>
+      <stop offset="100%" stop-color="#06B6D4"/>
+    </linearGradient>
+  </defs>
+  <polygon points="72,15 184,15 241,72 241,184 184,241 72,241 15,184 15,72" fill="url(#rim)"/>
+  <polygon points="77,25 179,25 231,77 231,179 179,231 77,231 25,179 25,77" fill="url(#chassis)"/>
+  <polygon points="54,62 95,62 128,158 128,210 110,210" fill="url(#wingL)"/>
+  <polygon points="202,62 161,62 128,158 128,210 146,210" fill="url(#wingR)"/>
+  <polygon points="128,66 149,107 128,144 107,107" fill="url(#core)"/>
+</svg>
