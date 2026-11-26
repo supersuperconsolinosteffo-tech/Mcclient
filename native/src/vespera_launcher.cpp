@@ -1,6 +1,7 @@
 #include "win32_platform.hpp"
 #include "native_zip.hpp"
 #include "native_classifier.hpp"
+#include "launch_command.hpp"
 #include "webview/webview.h"
 #include "nlohmann/json.hpp"
 
@@ -53,6 +54,96 @@ std::string url_decode_comp(const std::string& s) {
         }
     }
     return out;
+}
+
+struct JavaRuntimeProbe {
+    int major = 0;
+    std::string versionOutput;
+    std::string architecture = "unknown";
+};
+
+JavaRuntimeProbe probe_java_runtime(const fs::path& javawPath) {
+    JavaRuntimeProbe result;
+    DWORD binaryType = 0;
+    if (!GetBinaryTypeW(javawPath.wstring().c_str(), &binaryType)) {
+        throw std::runtime_error("Cannot inspect Java executable architecture (Win32 error " + std::to_string(GetLastError()) + ")");
+    }
+    result.architecture = binaryType == SCS_32BIT_BINARY ? "x86" : "unknown";
+    std::ifstream executable(javawPath, std::ios::binary);
+    unsigned char dosHeader[64]{};
+    executable.read(reinterpret_cast<char*>(dosHeader), sizeof(dosHeader));
+    if (executable && dosHeader[0] == 'M' && dosHeader[1] == 'Z') {
+        const uint32_t peOffset = static_cast<uint32_t>(dosHeader[0x3c]) |
+            (static_cast<uint32_t>(dosHeader[0x3d]) << 8) |
+            (static_cast<uint32_t>(dosHeader[0x3e]) << 16) |
+            (static_cast<uint32_t>(dosHeader[0x3f]) << 24);
+        executable.seekg(peOffset, std::ios::beg);
+        unsigned char peHeader[6]{};
+        executable.read(reinterpret_cast<char*>(peHeader), sizeof(peHeader));
+        if (executable && peHeader[0] == 'P' && peHeader[1] == 'E' && peHeader[2] == 0 && peHeader[3] == 0) {
+            const uint16_t machine = static_cast<uint16_t>(peHeader[4] | (peHeader[5] << 8));
+            result.architecture = machine == IMAGE_FILE_MACHINE_AMD64 ? "x64" :
+                (machine == IMAGE_FILE_MACHINE_ARM64 ? "arm64" :
+                 (machine == IMAGE_FILE_MACHINE_I386 ? "x86" : "unknown"));
+        }
+    }
+
+    fs::path javaExe = javawPath.parent_path() / "java.exe";
+    if (!fs::exists(javaExe)) javaExe = javawPath;
+    SECURITY_ATTRIBUTES security{};
+    security.nLength = sizeof(security);
+    security.bInheritHandle = TRUE;
+    HANDLE readPipe = nullptr, writePipe = nullptr;
+    if (!CreatePipe(&readPipe, &writePipe, &security, 0)) {
+        throw std::runtime_error("Cannot create pipe for Java version probe (Win32 error " + std::to_string(GetLastError()) + ")");
+    }
+    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdOutput = writePipe;
+    startup.hStdError = writePipe;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    PROCESS_INFORMATION process{};
+    std::vector<std::wstring> args{L"-version"};
+    std::wstring command = vespera::build_windows_command_line(javaExe.wstring(), args);
+    if (!CreateProcessW(javaExe.wstring().c_str(), command.data(), nullptr, nullptr, TRUE,
+                        CREATE_NO_WINDOW, nullptr, javaExe.parent_path().wstring().c_str(), &startup, &process)) {
+        const DWORD error = GetLastError();
+        CloseHandle(readPipe); CloseHandle(writePipe);
+        throw std::runtime_error("Java -version probe failed to start (Win32 error " + std::to_string(error) + ")");
+    }
+    CloseHandle(writePipe);
+    const DWORD waitResult = WaitForSingleObject(process.hProcess, 10000);
+    if (waitResult == WAIT_TIMEOUT) {
+        TerminateProcess(process.hProcess, ERROR_TIMEOUT);
+        WaitForSingleObject(process.hProcess, 2000);
+        CloseHandle(process.hThread); CloseHandle(process.hProcess); CloseHandle(readPipe);
+        throw std::runtime_error("Java -version probe timed out after 10 seconds");
+    }
+    DWORD exitCode = 1;
+    GetExitCodeProcess(process.hProcess, &exitCode);
+    CloseHandle(process.hThread); CloseHandle(process.hProcess);
+    char bytes[1024]; DWORD count = 0;
+    while (ReadFile(readPipe, bytes, sizeof(bytes), &count, nullptr) && count > 0) {
+        if (result.versionOutput.size() < 16384) result.versionOutput.append(bytes, std::min<size_t>(count, 16384 - result.versionOutput.size()));
+    }
+    CloseHandle(readPipe);
+    result.versionOutput = redact_tokens(result.versionOutput);
+    std::smatch match;
+    const std::regex versionPattern(R"((?:version|openjdk)\s+\"?([0-9]+)(?:\.[0-9]+)?)");
+    if (std::regex_search(result.versionOutput, match, versionPattern)) {
+        try { result.major = std::stoi(match[1].str()); } catch (...) { result.major = 0; }
+        if (result.major == 1) {
+            const std::regex legacyPattern(R"(version\s+\"1\.([0-9]+))");
+            if (std::regex_search(result.versionOutput, match, legacyPattern)) result.major = std::stoi(match[1].str());
+        }
+    }
+    if (exitCode != 0 || result.major == 0) {
+        throw std::runtime_error("Java -version probe returned exit code " + std::to_string(exitCode) +
+            " and could not identify the runtime version; output: " + result.versionOutput);
+    }
+    return result;
 }
 
 std::string query_param_from_target(const std::string& reqTarget, const std::string& key) {
@@ -325,6 +416,9 @@ public:
 
     HANDLE activeMcProcess = nullptr;
     DWORD activeMcPid = 0;
+    DWORD lastMcExitCode = STILL_ACTIVE;
+    DWORD lastProcessQueryError = 0;
+    std::string lastMcDiagnosticPath;
     ULONGLONG prevIdleTime = 0;
     ULONGLONG prevKernelTime = 0;
     ULONGLONG prevUserTime = 0;
@@ -1074,12 +1168,35 @@ public:
         bool mcRunning = false;
         if (activeMcProcess) {
             DWORD code = 0;
-            if (GetExitCodeProcess(activeMcProcess, &code) && code == STILL_ACTIVE) {
-                mcRunning = true;
+            if (GetExitCodeProcess(activeMcProcess, &code)) {
+                lastProcessQueryError = 0;
+                if (code == STILL_ACTIVE) {
+                    mcRunning = true;
+                } else {
+                    lastMcExitCode = code;
+                    if (!lastMcDiagnosticPath.empty()) {
+                        json record = json::parse(read_text_file(fs::u8path(lastMcDiagnosticPath)), nullptr, false);
+                        if (record.is_object()) {
+                            record["exitCode"] = code;
+                            record["exitedAt"] = iso_timestamp_now();
+                            write_text_atomic(fs::u8path(lastMcDiagnosticPath), record.dump(2));
+                        }
+                    }
+                    appendLog("[Launch] Minecraft process PID " + std::to_string(activeMcPid) +
+                              " exited with code " + std::to_string(code) +
+                              (lastMcDiagnosticPath.empty() ? std::string() : "; diagnostics: " + lastMcDiagnosticPath));
+                    CloseHandle(activeMcProcess);
+                    activeMcProcess = nullptr;
+                    activeMcPid = 0;
+                }
             } else {
-                CloseHandle(activeMcProcess);
-                activeMcProcess = nullptr;
-                activeMcPid = 0;
+                mcRunning = true; // Keep the handle and avoid inventing an exit on query failure.
+                const DWORD error = GetLastError();
+                if (error != lastProcessQueryError) {
+                    lastProcessQueryError = error;
+                    appendLog("[Launch] GetExitCodeProcess failed for PID " + std::to_string(activeMcPid) +
+                              "; process state remains unknown (Win32 error " + std::to_string(error) + ").");
+                }
             }
         }
 
@@ -3534,31 +3651,129 @@ public:
                 prep = buildLaunchPreparation(prof, mode);
                 javaw = fs::u8path(prep.value("javaExecutable", ""));
             }
-
-            std::ostringstream cmd;
-            cmd << "\"" << wide_to_utf8(javaw.wstring()) << "\" ";
-            for (const auto& a : prep["jvmArguments"]) cmd << "\"" << a.get<std::string>() << "\" ";
-            cmd << prep["mainClass"].get<std::string>() << " ";
-            for (const auto& a : prep["gameArguments"]) {
-                std::string s = a.get<std::string>();
-                if (s == "[REDACTED_MC_TOKEN]") s = (mode == "offline_account" || mode == "offline_singleplayer") ? "0" : mcToken;
-                cmd << "\"" << s << "\" ";
+            if (!fs::exists(javaw)) throw std::runtime_error("Selected Java executable is still missing after provisioning: " + wide_to_utf8(javaw.wstring()));
+            const JavaRuntimeProbe javaProbe = probe_java_runtime(javaw);
+            if (javaProbe.major != javaMajor) {
+                throw std::runtime_error("Selected Java runtime major " + std::to_string(javaProbe.major) +
+                    " does not match version metadata requirement Java " + std::to_string(javaMajor) +
+                    ". Probe output: " + javaProbe.versionOutput);
             }
+            if (javaProbe.architecture != "x64") {
+                throw std::runtime_error("Selected Java runtime architecture is " + javaProbe.architecture +
+                    "; this x64 launcher requires a 64-bit Java runtime.");
+            }
+            appendLog("[Launch] Java runtime validated: executable=" + wide_to_utf8(javaw.wstring()) +
+                ", major=" + std::to_string(javaProbe.major) + ", architecture=" + javaProbe.architecture +
+                ", versionOutput=" + javaProbe.versionOutput);
+
+            std::vector<std::wstring> commandArgs;
+            std::vector<std::wstring> redactedArgs;
+            for (const auto& a : prep["jvmArguments"]) {
+                const auto value = utf8_to_wide(a.get<std::string>());
+                commandArgs.push_back(value);
+                redactedArgs.push_back(value);
+            }
+            commandArgs.push_back(utf8_to_wide(prep["mainClass"].get<std::string>()));
+            redactedArgs.push_back(commandArgs.back());
+            for (const auto& a : prep["gameArguments"]) {
+                std::string value = a.get<std::string>();
+                if (value == "[REDACTED_MC_TOKEN]") value = (mode == "offline_account" || mode == "offline_singleplayer") ? "0" : mcToken;
+                commandArgs.push_back(utf8_to_wide(value));
+                redactedArgs.push_back(utf8_to_wide(a.get<std::string>()));
+            }
+            const std::wstring fullCommandLine = vespera::build_windows_command_line(javaw.wstring(), commandArgs);
+            const std::wstring safeCommandLine = vespera::build_windows_command_line(javaw.wstring(), redactedArgs);
 
             updateBackgroundTaskStage("launching", "Starting Minecraft Java process…");
-            std::wstring wcmd = utf8_to_wide(cmd.str());
+            std::wstring wcmd = fullCommandLine;
             STARTUPINFOW si{};
             si.cb = sizeof(si);
+            SECURITY_ATTRIBUTES pipeSecurity{};
+            pipeSecurity.nLength = sizeof(pipeSecurity);
+            pipeSecurity.bInheritHandle = TRUE;
+            HANDLE outputRead = nullptr;
+            HANDLE outputWrite = nullptr;
+            if (!CreatePipe(&outputRead, &outputWrite, &pipeSecurity, 0)) {
+                const DWORD error = GetLastError();
+                throw std::runtime_error("CreatePipe for Java output failed (Win32 error " + std::to_string(error) + ")");
+            }
+            SetHandleInformation(outputRead, HANDLE_FLAG_INHERIT, 0);
+            si.dwFlags |= STARTF_USESTDHANDLES;
+            si.hStdOutput = outputWrite;
+            si.hStdError = outputWrite;
+            si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
             PROCESS_INFORMATION pi{};
             fs::path instDir = resolveInstanceDir(prof);
-            if (!CreateProcessW(nullptr, wcmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
+            if (!CreateProcessW(javaw.wstring().c_str(), wcmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr,
                                 instDir.wstring().c_str(), &si, &pi)) {
-                throw std::runtime_error("Failed to spawn javaw.exe (Win32 error " + std::to_string(GetLastError()) + ")");
+                const DWORD error = GetLastError();
+                CloseHandle(outputRead);
+                CloseHandle(outputWrite);
+                appendLog("[Launch] CreateProcessW failed for Java executable " + wide_to_utf8(javaw.wstring()) +
+                    " in " + wide_to_utf8(instDir.wstring()) + " (Win32 error " + std::to_string(error) + ").");
+                throw std::runtime_error("CreateProcessW failed for " + wide_to_utf8(javaw.wstring()) +
+                    " (Win32 error " + std::to_string(error) + ")");
             }
+            CloseHandle(outputWrite);
             CloseHandle(pi.hThread);
             activeMcProcess = pi.hProcess;
             activeMcPid = pi.dwProcessId;
-            appendLog("[Launcher] Spawned Minecraft " + mcVer + " (" + mode + ", PID " + std::to_string(activeMcPid) + ").");
+            lastMcExitCode = STILL_ACTIVE;
+            lastProcessQueryError = 0;
+            fs::path launchLogDir = dataRoot / "logs" / "launches";
+            fs::create_directories(launchLogDir);
+            const std::string launchStem = "launch-" + std::to_string(static_cast<unsigned long long>(std::time(nullptr))) + "-" + std::to_string(activeMcPid);
+            lastMcDiagnosticPath = wide_to_utf8((launchLogDir / (launchStem + ".json")).wstring());
+            const fs::path outputLogPath = launchLogDir / (launchStem + ".stdout-stderr.log");
+            const std::string tokenForRedaction = mcToken;
+            std::thread([outputRead, outputLogPath, tokenForRedaction]() {
+                std::string output;
+                char chunk[4096];
+                DWORD bytesRead = 0;
+                constexpr size_t maxCapture = 4 * 1024 * 1024;
+                bool outputTruncated = false;
+                while (ReadFile(outputRead, chunk, sizeof(chunk), &bytesRead, nullptr) && bytesRead > 0) {
+                    if (output.size() < maxCapture) {
+                        const size_t take = std::min<size_t>(bytesRead, maxCapture - output.size());
+                        output.append(chunk, take);
+                        if (take < bytesRead) outputTruncated = true;
+                    } else {
+                        outputTruncated = true;
+                    }
+                }
+                CloseHandle(outputRead);
+                if (outputTruncated) {
+                    const size_t lineEnd = output.find_last_of("\r\n");
+                    if (lineEnd != std::string::npos) output.resize(lineEnd + 1);
+                    else output.clear();
+                }
+                if (!tokenForRedaction.empty()) {
+                    size_t at = 0;
+                    while ((at = output.find(tokenForRedaction, at)) != std::string::npos) {
+                        output.replace(at, tokenForRedaction.size(), "[REDACTED_MC_TOKEN]");
+                        at += sizeof("[REDACTED_MC_TOKEN]") - 1;
+                    }
+                }
+                const std::string safeOutput = redact_tokens(output);
+                std::ofstream stream(outputLogPath, std::ios::binary | std::ios::trunc);
+                if (stream) {
+                    stream << safeOutput;
+                    if (outputTruncated) stream << "\n[Capture truncated at 4 MiB.]\n";
+                }
+            }).detach();
+            json launchRecord = {
+                {"version", mcVer}, {"loader", loader}, {"javaExecutable", wide_to_utf8(javaw.wstring())},
+                {"expectedJavaMajor", javaMajor}, {"javaReportedMajor", javaProbe.major},
+                {"javaArchitecture", javaProbe.architecture}, {"javaVersionOutput", javaProbe.versionOutput},
+                {"workingDirectory", wide_to_utf8(instDir.wstring())},
+                {"commandLineRedacted", wide_to_utf8(safeCommandLine)}, {"processCreation", "success"},
+                {"pid", activeMcPid}, {"startedAt", iso_timestamp_now()}, {"exitCode", nullptr},
+                {"stdoutStderr", wide_to_utf8(outputLogPath.wstring())},
+                {"latestLog", wide_to_utf8((instDir / "logs" / "latest.log").wstring())},
+                {"crashReports", wide_to_utf8((instDir / "crash-reports").wstring())}
+            };
+            write_text_atomic(fs::u8path(lastMcDiagnosticPath), launchRecord.dump(2));
+            appendLog("[Launcher] CreateProcessW succeeded for Minecraft " + mcVer + " (" + mode + ", PID " + std::to_string(activeMcPid) + "); diagnostic: " + lastMcDiagnosticPath);
             refreshTelemetry();
             return {
                 {"launchRes", {
@@ -3569,10 +3784,10 @@ public:
                         : (mode == "offline_singleplayer" ? "process_spawned_offline_singleplayer" : "process_spawned_authenticated")},
                     {"sessionMode", mode},
                     {"message", mode == "offline_account"
-                        ? "Launched Minecraft " + mcVer + " with Offline Account \"" + activeOfflineUsername + "\"."
+                        ? "Minecraft " + mcVer + " Java process started with Offline Account \"" + activeOfflineUsername + "\" (PID " + std::to_string(activeMcPid) + "). Startup is not confirmed yet; see Diagnostics for process and game logs."
                         : (mode == "offline_singleplayer"
-                            ? "Launched Minecraft " + mcVer + " in Offline Singleplayer mode (multiplayer disabled)."
-                            : "Launched Minecraft " + mcVer + " cleanly! Vespera Launcher is now idle.")},
+                            ? "Minecraft " + mcVer + " Java process started in Offline Singleplayer mode (PID " + std::to_string(activeMcPid) + "). Startup is not confirmed yet; see Diagnostics for process and game logs."
+                            : "Minecraft " + mcVer + " Java process started (PID " + std::to_string(activeMcPid) + "). Startup is not confirmed yet; see Diagnostics for process and game logs.")},
                     {"preparation", prep}
                 }},
                 {"snapshot", state}

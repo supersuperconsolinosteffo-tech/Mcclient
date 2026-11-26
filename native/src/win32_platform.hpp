@@ -77,7 +77,7 @@ inline std::string iso_timestamp_now() {
 
 inline std::string redact_tokens(const std::string& input) {
     std::string out = input;
-    out = std::regex_replace(out, std::regex("(--accessToken\\s+)([^\\s\"']+)"), "$1[REDACTED_MC_TOKEN]");
+    out = std::regex_replace(out, std::regex("(--accessToken\\s+)(\"[^\"]*\"|'[^']*'|[^\\s]+)"), "$1[REDACTED_MC_TOKEN]");
     out = std::regex_replace(out, std::regex("(Bearer\\s+)[A-Za-z0-9._~+/-]+=*"), "$1[REDACTED_BEARER]");
     out = std::regex_replace(out, std::regex("(\"access_token\"\\s*:\\s*\")[^\"]+(\")"), "$1[REDACTED]$2");
     out = std::regex_replace(out, std::regex("(\"refresh_token\"\\s*:\\s*\")[^\"]+(\")"), "$1[REDACTED]$2");

@@ -572,7 +572,25 @@ function bindGlobalAndStageEvents(root: HTMLElement, snap: AppStateSnapshot): vo
         state.launchingGame = false;
 
         if (launchRes.launched) {
-          showToast(launchRes.message, 'success');
+          showToast(launchRes.message, 'info');
+          // The launch RPC only confirms process creation. Keep refreshing native
+          // telemetry until the game exits so the UI reports the process lifecycle.
+          let wasRunning = true;
+          const gameStatusTimer = setInterval(async () => {
+            try {
+              const next = await bridge.getSnapshot();
+              state.snapshot = next;
+              const running = Boolean(next.telemetry?.minecraftRunning);
+              renderApp();
+              if (!running) {
+                clearInterval(gameStatusTimer);
+                if (wasRunning) showToast('Minecraft process has exited. See Diagnostics and the recorded latest.log/crash report paths.', 'info');
+              }
+              wasRunning = running;
+            } catch {
+              // Keep polling through transient bridge failures; do not invent an exit.
+            }
+          }, 1500);
         } else {
           showToast(launchRes.message, 'info');
           if (
@@ -1072,7 +1090,25 @@ function bindGlobalAndStageEvents(root: HTMLElement, snap: AppStateSnapshot): vo
         const { launchRes, snapshot } = await bridge.launchMinecraft('offline_singleplayer');
         state.snapshot = snapshot;
         state.launchingGame = false;
-        showToast(launchRes.message, launchRes.launched ? 'success' : 'error');
+        showToast(launchRes.message, launchRes.launched ? 'info' : 'error');
+        if (launchRes.launched) {
+          let wasRunning = true;
+          const gameStatusTimer = setInterval(async () => {
+            try {
+              const next = await bridge.getSnapshot();
+              state.snapshot = next;
+              const running = Boolean(next.telemetry?.minecraftRunning);
+              renderApp();
+              if (!running) {
+                clearInterval(gameStatusTimer);
+                if (wasRunning) showToast('Minecraft process has exited. See Diagnostics and the recorded latest.log/crash report paths.', 'info');
+              }
+              wasRunning = running;
+            } catch {
+              // Transient bridge errors are not evidence that Minecraft exited.
+            }
+          }, 1500);
+        }
         renderApp();
       } catch (err) {
         state.launchingGame = false;
