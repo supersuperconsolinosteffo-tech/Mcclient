@@ -13,11 +13,11 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "Vespera Labs"
       VALUE "FileDescription", "Vespera Client Uninstaller"
-      VALUE "FileVersion", "1.2.4.0"
+      VALUE "FileVersion", "1.2.5.0"
       VALUE "InternalName", "VesperaUninstall"
       VALUE "OriginalFilename", "VesperaUninstall.exe"
       VALUE "ProductName", "Vespera Client"
-      VALUE "ProductVersion", "1.2.4"
+      VALUE "ProductVersion", "1.2.5"
     END
   END
   BLOCK "VarFileInfo"

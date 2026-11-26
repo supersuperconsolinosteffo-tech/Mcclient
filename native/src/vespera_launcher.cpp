@@ -693,7 +693,7 @@ public:
             bool vesperaOk = (p["loader"] == "fabric" && p.value("mcVersion", "") == "1.21.4");
             p["vesperaModCompatible"] = vesperaOk;
         }
-        state["version"] = "1.2.4";
+        state["version"] = "1.2.5";
         state["platformMode"] = "windows_native_webview2";
     }
 
@@ -718,7 +718,7 @@ public:
                 state = json::parse(read_text_file(statePath));
                 sanitizeLoadedState(defaults);
                 saveState();
-                appendLog("[Core] Loaded and verified Vespera Client v1.2.4 Windows configuration.");
+                appendLog("[Core] Loaded and verified Vespera Client v1.2.5 Windows configuration.");
                 return;
             } catch (...) {
                 appendLog("[CrashRecovery] State file corrupted; restoring verified factory configuration.");
@@ -1289,7 +1289,7 @@ public:
             publicAccs.push_back(acc);
             if (acc.value("active", false)) activeAccId = acc.value("id", "");
         }
-        state["version"] = "1.2.4";
+        state["version"] = "1.2.5";
         state["accounts"] = publicAccs;
         state["activeAccountId"] = activeAccId.empty() ? json(nullptr) : json(activeAccId);
         state["oauthConfig"] = {
@@ -2495,7 +2495,7 @@ public:
     }
 
     /**
-     * Primary Vespera v1.2.4 Windows Sign-In: OAuth 2.0 Authorization Code + PKCE (`S256`)
+     * Primary Vespera v1.2.5 Windows Sign-In: OAuth 2.0 Authorization Code + PKCE (`S256`)
      * via default system browser (`ShellExecuteW`) + temporary loopback listener (`http://localhost:<port>`).
      */
     json startBrowserPkceAuthNative() {
@@ -3831,7 +3831,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
     VesperaNativeEngine engine;
 
     webview::webview w(false, nullptr);
-    w.set_title("Vespera Client v1.2.4 — Precision Minecraft Java Edition Client");
+    w.set_title("Vespera Client v1.2.5 — Precision Minecraft Java Edition Client");
     w.set_size(1340, 860, WEBVIEW_HINT_NONE);
 
     NativeRpcTaskGroup rpcTasks;

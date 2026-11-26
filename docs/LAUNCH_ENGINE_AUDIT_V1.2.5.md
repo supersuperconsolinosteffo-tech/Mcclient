@@ -1,6 +1,6 @@
 # Vespera Client v1.2.5 — Launch Engine Root-Cause Audit
 
-**Audit completed before implementation.** Baseline: `fd0ed19` (`Repair native ZIP extraction for v1.2.4`) on `arena/f96b150b-mcclient`; working tree clean at audit start. This report records source-confirmed behavior separately from user-machine evidence. No v1.2.5 code changes had yet been made when this report was written.
+**Baseline audit and repair record.** The initial investigation began at `fd0ed19` (`Repair native ZIP extraction for v1.2.4`) on `arena/f96b150b-mcclient`, with a clean worktree. It separates source-confirmed behavior from user-machine evidence; subsequent implementation and verification are recorded below.
 
 ## Evidence boundary
 
@@ -80,7 +80,7 @@ The source changes now address the confirmed observability/lifecycle gaps withou
 
 These steps use the existing installation/data directory and do not ask you to delete profiles, accounts, or game artifacts.
 
-1. From this branch, run `npm ci` (if dependencies are absent) and `npm run build:windows`. In `release/bin`, copy the newly built `VesperaClient.exe` to a distinct filename such as `VesperaClient-launch-diagnostic.exe`; run that executable side-by-side rather than uninstalling the existing client. The checked-in v1.2.4 release executable is not evidence of this patched source.
+1. From this branch, run `npm ci` (if dependencies are absent) and `npm run build:windows`. Copy the generated `release/bin/VesperaClient.exe` to a distinct filename such as `VesperaClient-launch-diagnostic.exe`; run it side-by-side rather than uninstalling the existing client. The older `release/VesperaClient-1.2.4-win64-setup.exe` is historical and does not contain this patch.
 2. In the diagnostic launcher, select **Minecraft 1.21.4 / Vanilla**, click Play once, and record whether a window appears and whether the visible main menu is reached. Do not mark process creation as a pass for this criterion.
 3. If the menu appears, close Minecraft through its normal in-game Quit control. Wait for the launcher to report process exit. Repeat the same procedure with **Fabric Loader 0.16.10** selected.
 4. For each run, preserve the matching `%APPDATA%\VesperaClient\logs\launches\launch-*.json`, sibling `*.stdout-stderr.log`, `%APPDATA%\VesperaClient\logs\launcher.log`, and the `latest.log` / crash report paths named in the JSON. These contain the Java executable/version/architecture, redacted arguments, cwd, PID, output and observed exit code. Do not post account tokens or unredacted command lines.
