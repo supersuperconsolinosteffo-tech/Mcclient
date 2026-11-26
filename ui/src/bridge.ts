@@ -16,7 +16,9 @@ import type {
 
 declare global {
   interface Window {
-    vesperaNativeInvoke?: (payloadJson: string) => Promise<string>;
+    vesperaNativeInvoke?: (
+      payloadJson: string
+    ) => Promise<string | { ok: boolean; data?: unknown; error?: string }>;
   }
 }
 
@@ -51,11 +53,15 @@ export interface ModSearchResponse {
 class VesperaRpcBridge {
   async invoke<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
     // 1. Native Windows 10/11 Edge WebView2 C++ Host binding (VesperaClient.exe)
+    // Note: webview/webview's internal JS bridge (Webview_.prototype.onReply) already runs JSON.parse()
+    // on the C++ binding return string before resolving the Promise, so rawResp is already an object.
     if (typeof window !== 'undefined' && typeof window.vesperaNativeInvoke === 'function') {
       const rawResp = await window.vesperaNativeInvoke(JSON.stringify({ method, params }));
-      const parsed = JSON.parse(rawResp) as { ok: boolean; data?: T; error?: string };
-      if (!parsed.ok) {
-        throw new Error(parsed.error || `Native RPC error in ${method}`);
+      const parsed = (
+        typeof rawResp === 'string' ? JSON.parse(rawResp) : rawResp
+      ) as { ok: boolean; data?: T; error?: string };
+      if (!parsed || !parsed.ok) {
+        throw new Error(parsed?.error || `Native RPC error in ${method}`);
       }
       return parsed.data as T;
     }

@@ -38,13 +38,12 @@ function toCByteArrayHeader(guardName, symbolPrefix, buffer, nullTerminate = fal
   return lines.join('\n') + '\n';
 }
 
-// 1. Ensure branding, UI bundle, and Mod JAR exist
+// 1. Ensure branding, fresh UI bundle, and Mod JAR exist
 if (!fs.existsSync(path.join(ROOT, 'native/resources/vespera.ico'))) {
   execFileSync('node', ['scripts/generate-branding.mjs'], { stdio: 'inherit' });
 }
-if (!fs.existsSync(path.join(ROOT, 'dist/ui/index.html'))) {
-  execFileSync('npm', ['run', 'build:ui'], { stdio: 'inherit' });
-}
+console.log('[build-windows] Building fresh Vite UI bundle...');
+execFileSync('npm', ['run', 'build:ui'], { stdio: 'inherit' });
 const modJarPath = path.join(RELEASE_DIR, 'mods/vespera-client-1.0.0+mc1.21.4.jar');
 if (!fs.existsSync(modJarPath)) {
   execFileSync('node', ['scripts/build-mod.mjs'], { stdio: 'inherit' });

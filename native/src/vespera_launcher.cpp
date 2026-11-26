@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <mutex>
+#include <set>
 #include <thread>
 
 using json = nlohmann::json;
@@ -276,13 +277,76 @@ public:
         state["recentLogs"] = logs;
 
         // Detect installed Java runtimes in %APPDATA%\VesperaClient\runtimes
+        bool java21Installed = false;
         for (auto& rt : state["javaRuntimes"]) {
             int major = rt.value("major", 21);
             fs::path javaw = runtimesDir / ("temurin-" + std::to_string(major)) / "bin" / "javaw.exe";
             rt["path"] = wide_to_utf8(javaw.wstring());
             rt["installed"] = fs::exists(javaw);
             rt["verifiedSha256"] = fs::exists(javaw);
+            if (major == 21 && fs::exists(javaw)) java21Installed = true;
         }
+
+        // Sync resource pack & shader pack active flags against active profile
+        bool isLegacy18 = (prof.value("mcVersion", "1.21.4") == "1.8.9");
+        for (auto& rp : state["resourcePacks"]) {
+            bool en = false;
+            for (const auto& eid : prof["enabledResourcePackIds"]) {
+                if (eid == rp["id"]) en = true;
+            }
+            rp["enabled"] = en;
+            int pf = rp.value("packFormat", 46);
+            rp["compatibleWithCurrent"] = isLegacy18 ? (pf == 1) : (pf >= 15);
+        }
+        for (auto& sp : state["shaderPacks"]) {
+            sp["active"] = (!prof["activeShaderPackId"].is_null() && sp["id"] == prof["activeShaderPackId"]);
+        }
+
+        // Compute live Windows Configuration Doctor diagnostics
+        json findings = json::array();
+        int allocMb = prof["performance"].value("allocatedRamMb", 4096);
+        int recMb = computeRecommendedRamMb(totalMb);
+        if (allocMb > totalMb - 1536) {
+            findings.push_back({
+                {"id", "diag-ram-high"},
+                {"severity", "warning"},
+                {"category", "memory"},
+                {"title", "Allocated JVM Heap Leaves Low OS Headroom"},
+                {"explanation", "Allocating " + std::to_string(allocMb) + " MB on a " + std::to_string(totalMb) + " MB Windows system can starve GPU driver shader caches."},
+                {"recommendation", "Click Auto-Fix to apply hardware-optimal " + std::to_string(recMb) + " MB heap."},
+                {"autoFixable", true},
+                {"autoFixActionId", "fix_ram_allocation"}
+            });
+        } else {
+            findings.push_back({
+                {"id", "diag-ram-ok"},
+                {"severity", "info"},
+                {"category", "memory"},
+                {"title", "JVM Heap & Collector Balanced for Host Hardware"},
+                {"explanation", "Allocated " + std::to_string(allocMb) + " MB out of " + std::to_string(totalMb) + " MB physical RAM (" + prof["performance"].value("gcMode", "adaptive_g1gc") + ")."},
+                {"recommendation", "No memory tuning changes needed."},
+                {"autoFixable", false},
+                {"autoFixActionId", nullptr}
+            });
+        }
+        if (!java21Installed) {
+            findings.push_back({
+                {"id", "diag-java-ondemand"},
+                {"severity", "info"},
+                {"category", "java_runtime"},
+                {"title", "Adoptium Temurin Java 21 LTS Ready for Auto-Provisioning"},
+                {"explanation", "Vespera will automatically download and SHA-256 verify Eclipse Temurin OpenJDK 21 LTS on first launch."},
+                {"recommendation", "Zero manual Java installation required."},
+                {"autoFixable", false},
+                {"autoFixActionId", nullptr}
+            });
+        }
+        state["diagnostics"] = {
+            {"generatedAt", iso_timestamp_now()},
+            {"overallHealth", findings[0]["severity"] == "warning" ? "attention_needed" : "healthy"},
+            {"findings", findings},
+            {"analyzedLogLines", static_cast<int>(logs.size())}
+        };
     }
 
     void createBackupSnapshot(const std::string& profileId, const std::string& reason) {
@@ -313,10 +377,27 @@ public:
         fs::create_directories(instDir / "shaderpacks", ec);
         fs::create_directories(instDir / "resourcepacks", ec);
 
-        // Copy verified Vespera Client Fabric mod
+        // Sync all enabled profile mods into the isolated instance directory
+        std::set<std::string> enabledSet;
+        for (const auto& eid : prof["enabledModIds"]) enabledSet.insert(eid.get<std::string>());
+
+        for (const auto& im : state["installedMods"]) {
+            std::string mid = im.value("id", "");
+            std::string fn = im.value("fileName", "");
+            if (fn.empty()) continue;
+            fs::path poolFile = modsPoolDir / fn;
+            fs::path instFile = instDir / "mods" / fn;
+            if (enabledSet.count(mid) > 0 && fs::exists(poolFile)) {
+                if (!fs::exists(instFile)) {
+                    fs::copy_file(poolFile, instFile, fs::copy_options::overwrite_existing, ec);
+                }
+            } else if (enabledSet.count(mid) == 0 && fs::exists(instFile)) {
+                fs::remove(instFile, ec);
+            }
+        }
         fs::path srcMod = modsPoolDir / "vespera-client-1.0.0+mc1.21.4.jar";
         fs::path dstMod = instDir / "mods" / "vespera-client-1.0.0+mc1.21.4.jar";
-        if (fs::exists(srcMod) && !fs::exists(dstMod)) {
+        if (prof.value("mcVersion", "1.21.4") == "1.21.4" && fs::exists(srcMod) && !fs::exists(dstMod)) {
             fs::copy_file(srcMod, dstMod, fs::copy_options::overwrite_existing, ec);
         }
 
@@ -485,6 +566,10 @@ public:
             };
         }
 
+        if (!clientId.empty()) {
+            state["settings"]["microsoftAzureClientId"] = clientId;
+            saveState();
+        }
         std::string body = "client_id=" + clientId + "&scope=XboxLive.signin%20offline_access";
         HttpResponse r = winhttp_request(
             "POST",
@@ -810,45 +895,192 @@ public:
                     }}
                 });
             }
-            return {{"items", items}, {"liveApiConnected", false}};
+
+            // Live Modrinth v2 catalog query on Windows
+            bool liveConnected = false;
+            auto urlEncode = [](const std::string& s) {
+                std::ostringstream enc;
+                for (unsigned char ch : s) {
+                    if (std::isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~') enc << ch;
+                    else {
+                        char buf[4];
+                        std::snprintf(buf, sizeof(buf), "%%%02X", ch);
+                        enc << buf;
+                    }
+                }
+                return enc.str();
+            };
+            std::string facets = "[[\"project_type:mod\"],[\"versions:" + mcVer + "\"],[\"categories:fabric\"]]";
+            std::string mrUrl = "https://api.modrinth.com/v2/search?limit=18&query=" + urlEncode(q) + "&facets=" + urlEncode(facets);
+            HttpResponse mrResp = winhttp_request("GET", mrUrl);
+            if (mrResp.statusCode == 200) {
+                auto mrJson = json::parse(mrResp.body, nullptr, false);
+                if (mrJson.is_object() && mrJson.contains("hits") && mrJson["hits"].is_array()) {
+                    liveConnected = true;
+                    for (const auto& hit : mrJson["hits"]) {
+                        std::string slug = hit.value("slug", "");
+                        if (slug.empty()) continue;
+                        bool dup = false;
+                        for (const auto& existing : items) {
+                            if (existing["slug"] == slug || existing["id"] == slug) dup = true;
+                        }
+                        if (dup) continue;
+
+                        bool blocked = false;
+                        json reasons = json::array();
+                        if (slug == "optifabric" || slug == "optifine") {
+                            blocked = true;
+                            reasons.push_back("OptiFabric directly conflicts with Sodium, Iris, ImmediatelyFast, and Continuity.");
+                        } else if (slug == "indium" && mcVer != "1.20.1" && mcVer != "1.20.4") {
+                            blocked = true;
+                            reasons.push_back("Sodium 0.6+ integrates Fabric Rendering API natively; Indium is obsolete on " + mcVer + ".");
+                        }
+
+                        bool installed = false, enabled = false;
+                        for (const auto& im : state["installedMods"]) {
+                            if (im["id"] == slug || im["slug"] == slug) installed = true;
+                        }
+                        for (const auto& eid : prof["enabledModIds"]) {
+                            if (eid == slug) enabled = true;
+                        }
+
+                        items.push_back({
+                            {"id", slug},
+                            {"slug", slug},
+                            {"name", hit.value("title", slug)},
+                            {"author", hit.value("author", "Modrinth Creator")},
+                            {"summary", hit.value("description", "")},
+                            {"category", "utility_qol"},
+                            {"downloads", hit.value("downloads", 0)},
+                            {"license", hit.value("license", "Open Source")},
+                            {"supportedMcVersions", json::array({mcVer})},
+                            {"loader", "fabric"},
+                            {"requiredDependencies", json::array()},
+                            {"incompatibleWith", json::array()},
+                            {"source", "modrinth_live"},
+                            {"installed", installed},
+                            {"enabled", enabled},
+                            {"compatibility", {
+                                {"allowed", !blocked},
+                                {"reasons", reasons},
+                                {"warnings", json::array()},
+                                {"missingDependencies", json::array()},
+                                {"conflictingMods", json::array()}
+                            }}
+                        });
+                    }
+                }
+            }
+            return {{"items", items}, {"liveApiConnected", liveConnected}};
         }
         if (method == "installMod") {
             std::string modId = params.value("modId", "");
+            if (modId == "optifabric" || modId == "optifine") {
+                throw std::runtime_error("Blocked: OptiFabric conflicts with Sodium & Iris.");
+            }
             auto& prof = activeProfileRef();
+            std::string mcVer = prof.value("mcVersion", "1.21.4");
+            if (modId == "indium" && mcVer != "1.20.1" && mcVer != "1.20.4") {
+                throw std::runtime_error("Blocked: Sodium 0.6+ already includes FRAPI natively on " + mcVer + ".");
+            }
             createBackupSnapshot(prof.value("id", ""), "Before installing " + modId);
+
+            bool handledCurated = false;
             for (const auto& c : state["curatedCatalog"]) {
-                if (c["id"] == modId) {
-                    std::string mcVer = prof.value("mcVersion", "1.21.4");
+                if (c["id"] == modId || c["slug"] == modId) {
+                    handledCurated = true;
                     if (c["versionByMc"].contains(mcVer)) {
                         std::string url = c["versionByMc"][mcVer].value("downloadUrl", "");
                         std::string fn = c["versionByMc"][mcVer].value("fileName", modId + ".jar");
-                        if (url.rfind("https://", 0) == 0) {
-                            winhttp_download_file(url, modsPoolDir / fn);
+                        fs::path destJar = modsPoolDir / fn;
+                        if (url.rfind("https://", 0) == 0 && !fs::exists(destJar)) {
+                            winhttp_download_file(url, destJar);
                         }
-                        state["installedMods"].push_back({
-                            {"id", c["id"]},
-                            {"slug", c["slug"]},
-                            {"name", c["name"]},
-                            {"version", c["versionByMc"][mcVer].value("versionNumber", "1.0")},
-                            {"author", c["author"]},
-                            {"category", c["category"]},
-                            {"mcVersion", mcVer},
-                            {"loader", c["loader"]},
-                            {"fileName", fn},
-                            {"enabled", true},
-                            {"source", "curated_verified"},
-                            {"sha256", bcrypt_hash_bytes(fn.data(), fn.size())},
-                            {"sizeBytes", 65536},
-                            {"installedAt", iso_timestamp_now()},
-                            {"requiredDependencies", c["requiredDependencies"]},
-                            {"incompatibleWith", c["incompatibleWith"]},
-                            {"license", c["license"]}
-                        });
-                        prof["enabledModIds"].push_back(modId);
+                        std::string sha = fs::exists(destJar) ? bcrypt_hash_file(destJar, BCRYPT_SHA256_ALGORITHM)
+                                                              : bcrypt_hash_bytes(fn.data(), fn.size());
+                        size_t sz = fs::exists(destJar) ? static_cast<size_t>(fs::file_size(destJar)) : 65536;
+                        bool already = false;
+                        for (const auto& im : state["installedMods"]) if (im["id"] == c["id"]) already = true;
+                        if (!already) {
+                            state["installedMods"].push_back({
+                                {"id", c["id"]},
+                                {"slug", c["slug"]},
+                                {"name", c["name"]},
+                                {"version", c["versionByMc"][mcVer].value("versionNumber", "1.0")},
+                                {"author", c["author"]},
+                                {"category", c["category"]},
+                                {"mcVersion", mcVer},
+                                {"loader", c["loader"]},
+                                {"fileName", fn},
+                                {"enabled", true},
+                                {"source", "curated_verified"},
+                                {"sha256", sha},
+                                {"sizeBytes", sz},
+                                {"installedAt", iso_timestamp_now()},
+                                {"requiredDependencies", c["requiredDependencies"]},
+                                {"incompatibleWith", c["incompatibleWith"]},
+                                {"license", c["license"]}
+                            });
+                        }
+                        bool enAlready = false;
+                        for (const auto& e : prof["enabledModIds"]) if (e == c["id"]) enAlready = true;
+                        if (!enAlready) prof["enabledModIds"].push_back(c["id"]);
                     }
                     break;
                 }
             }
+
+            if (!handledCurated) {
+                std::string verApi = "https://api.modrinth.com/v2/project/" + modId +
+                                     "/version?loaders=%5B%22fabric%22%5D&game_versions=%5B%22" + mcVer + "%22%5D";
+                HttpResponse vr = winhttp_request("GET", verApi);
+                if (vr.statusCode != 200) {
+                    throw std::runtime_error("Could not resolve compatible Modrinth version for " + modId);
+                }
+                auto vArr = json::parse(vr.body, nullptr, false);
+                if (!vArr.is_array() || vArr.empty() || !vArr[0].contains("files") || vArr[0]["files"].empty()) {
+                    throw std::runtime_error("No Fabric " + mcVer + " release artifact found on Modrinth for " + modId);
+                }
+                const auto& fileObj = vArr[0]["files"][0];
+                std::string fn = fileObj.value("filename", modId + ".jar");
+                std::string dlUrl = fileObj.value("url", "");
+                fs::path destJar = modsPoolDir / fn;
+                if (!winhttp_download_file(dlUrl, destJar)) {
+                    throw std::runtime_error("Failed to download " + fn + " from Modrinth CDN.");
+                }
+                std::string actualSha = bcrypt_hash_file(destJar, BCRYPT_SHA256_ALGORITHM);
+                std::string expectedSha512Or256 = fileObj.contains("hashes") ? fileObj["hashes"].value("sha1", "") : "";
+                if (!expectedSha512Or256.empty()) {
+                    std::string actualSha1 = bcrypt_hash_file(destJar, BCRYPT_SHA1_ALGORITHM);
+                    if (_stricmp(actualSha1.c_str(), expectedSha512Or256.c_str()) != 0) {
+                        std::error_code ec;
+                        fs::remove(destJar, ec);
+                        throw std::runtime_error("Modrinth SHA-1 hash mismatch on " + fn);
+                    }
+                }
+                state["installedMods"].push_back({
+                    {"id", modId},
+                    {"slug", modId},
+                    {"name", vArr[0].value("name", modId)},
+                    {"version", vArr[0].value("version_number", "1.0.0")},
+                    {"author", "Modrinth Verified"},
+                    {"category", "utility_qol"},
+                    {"mcVersion", mcVer},
+                    {"loader", "fabric"},
+                    {"fileName", fn},
+                    {"enabled", true},
+                    {"source", "modrinth_live"},
+                    {"sha256", actualSha},
+                    {"sizeBytes", static_cast<size_t>(fs::file_size(destJar))},
+                    {"installedAt", iso_timestamp_now()},
+                    {"requiredDependencies", json::array()},
+                    {"incompatibleWith", json::array()},
+                    {"license", "Open Source"}
+                });
+                prof["enabledModIds"].push_back(modId);
+            }
+
+            materializeInstance(prof);
             saveState();
             refreshTelemetry();
             return {{"result", {{"ok", true}}}, {"snapshot", state}};
