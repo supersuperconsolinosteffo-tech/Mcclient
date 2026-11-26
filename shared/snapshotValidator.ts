@@ -544,7 +544,7 @@ export function validateAndNormalizeSnapshot(raw: unknown): AppStateSnapshot {
       : defaultHudLayouts;
 
   return {
-    version: asNonEmptyString(raw.version, '1.2.0'),
+    version: asNonEmptyString(raw.version, '1.2.1'),
     platformMode:
       raw.platformMode === 'windows_native_webview2'
         ? 'windows_native_webview2'

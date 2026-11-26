@@ -95,6 +95,8 @@ export interface InstallReceipt {
   assetIndexId: string;
   clientJarSha1: string;
   verifiedLibraries: string[];
+  verifiedAssets?: string[];
+  verifiedHashes?: Record<string, string>;
   nativesExtractedCount: number;
   installedAt: string;
 }
@@ -110,6 +112,51 @@ function sha1Hex(buf: Buffer): string {
 
 function sha1File(filePath: string): string {
   return crypto.createHash('sha1').update(fs.readFileSync(filePath)).digest('hex');
+}
+
+function atomicWriteFile(filePath: string, contents: string | Buffer): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.${process.pid}.${crypto.randomBytes(5).toString('hex')}.tmp`;
+  fs.writeFileSync(tempPath, contents);
+  fs.renameSync(tempPath, filePath);
+}
+
+function errorWithNetworkCategory(error: unknown, url: string): Error {
+  const err = error instanceof Error ? error : new Error(String(error));
+  const code = String((err as NodeJS.ErrnoException).code || (err.cause as NodeJS.ErrnoException | undefined)?.code || '');
+  if (err.name === 'AbortError' || err.name === 'TimeoutError') {
+    return new Error(`Network timeout fetching ${url} (request exceeded its deadline).`);
+  }
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN' || code === 'EAI_FAIL') {
+    return new Error(`DNS failure fetching ${url}${code ? ` (${code})` : ''}.`);
+  }
+  return new Error(`Network failure fetching ${url}${code ? ` (${code})` : ''}: ${err.message}`);
+}
+
+function validateOfficialManifest(value: unknown): value is RawMojangManifestV2 {
+  if (!value || typeof value !== 'object') return false;
+  const versions = (value as RawMojangManifestV2).versions;
+  if (!Array.isArray(versions) || versions.length === 0) return false;
+  const ids = new Set<string>();
+  for (const entry of versions) {
+    if (!entry || typeof entry.id !== 'string' || !entry.id || ids.has(entry.id) ||
+        typeof entry.url !== 'string' || !/^https:\/\//i.test(entry.url) ||
+        typeof entry.sha1 !== 'string' || !/^[a-f0-9]{40}$/i.test(entry.sha1) ||
+        typeof entry.releaseTime !== 'string') return false;
+    ids.add(entry.id);
+  }
+  return true;
+}
+
+function validateVersionMetadata(value: unknown, expectedId: string): value is MojangVersionMetadata {
+  if (!value || typeof value !== 'object') return false;
+  const meta = value as MojangVersionMetadata;
+  return meta.id === expectedId && typeof meta.mainClass === 'string' && meta.mainClass.length > 0 &&
+    Boolean(meta.downloads?.client?.url && /^https:\/\//i.test(meta.downloads.client.url)) &&
+    Boolean(meta.downloads?.client?.sha1 && /^[a-f0-9]{40}$/i.test(meta.downloads.client.sha1)) &&
+    Array.isArray(meta.libraries) &&
+    Boolean(meta.assetIndex?.id && meta.assetIndex.url && /^https:\/\//i.test(meta.assetIndex.url) &&
+      meta.assetIndex.sha1 && /^[a-f0-9]{40}$/i.test(meta.assetIndex.sha1));
 }
 
 /**
@@ -255,12 +302,15 @@ export class MinecraftLauncherService {
   private readonly runtimesDir: string;
   private readonly cacheDir: string;
   private readonly manifestCachePath: string;
+  private readonly manifestCacheInfoPath: string;
   private readonly fetchFn: typeof fetch;
   private readonly targetOs: 'windows' | 'linux' | 'osx';
 
   private activeChildProcess: ChildProcess | null = null;
   private activeMcVersion: string | null = null;
   private manifestSource: 'live_mojang' | 'local_cache' | 'embedded_seed' = 'embedded_seed';
+  private manifestFetchedAt = 0;
+  private lastManifestError: string | null = null;
   private latestReleaseId = '1.21.4';
   private latestSnapshotId = '25w09b';
   private cachedDescriptors: MinecraftVersionDescriptor[] = [];
@@ -273,6 +323,7 @@ export class MinecraftLauncherService {
     this.runtimesDir = path.join(dataDir, 'runtimes');
     this.cacheDir = path.join(dataDir, 'cache');
     this.manifestCachePath = path.join(this.cacheDir, 'version_manifest_v2.json');
+    this.manifestCacheInfoPath = `${this.manifestCachePath}.info.json`;
     fs.mkdirSync(this.runtimesDir, { recursive: true });
     fs.mkdirSync(this.cacheDir, { recursive: true });
 
@@ -291,19 +342,25 @@ export class MinecraftLauncherService {
   private loadInitialManifestFromCacheOrSeed(): void {
     if (fs.existsSync(this.manifestCachePath)) {
       try {
-        const raw = JSON.parse(
-          fs.readFileSync(this.manifestCachePath, 'utf8')
-        ) as RawMojangManifestV2;
-        if (Array.isArray(raw.versions) && raw.versions.length > 0) {
+        const raw = JSON.parse(fs.readFileSync(this.manifestCachePath, 'utf8')) as unknown;
+        if (validateOfficialManifest(raw)) {
           const parsed = parseMojangManifestV2(raw);
           this.cachedDescriptors = parsed.versions;
           this.latestReleaseId = parsed.latestReleaseId;
           this.latestSnapshotId = parsed.latestSnapshotId;
           this.manifestSource = 'local_cache';
+          if (fs.existsSync(this.manifestCacheInfoPath)) {
+            const info = JSON.parse(fs.readFileSync(this.manifestCacheInfoPath, 'utf8')) as { fetchedAt?: number };
+            this.manifestFetchedAt = Number.isFinite(info.fetchedAt) ? Number(info.fetchedAt) : 0;
+          }
           return;
         }
+        throw new Error('Cached Mojang manifest has an invalid structure.');
       } catch {
-        // Fall back to embedded seed if cache file was corrupted
+        // Corrupt or incomplete cache is never trusted; remove both cache pieces atomically by invalidation.
+        for (const file of [this.manifestCachePath, this.manifestCacheInfoPath]) {
+          try { fs.unlinkSync(file); } catch { /* absent */ }
+        }
       }
     }
 
@@ -312,17 +369,27 @@ export class MinecraftLauncherService {
     this.latestReleaseId = seeded.latestReleaseId;
     this.latestSnapshotId = seeded.latestSnapshotId;
     this.manifestSource = 'embedded_seed';
+    this.manifestFetchedAt = 0;
+  }
+
+  private manifestIsFresh(): boolean {
+    // The embedded catalogue is browse-only; a future timestamp is not a valid freshness proof.
+    const age = Date.now() - this.manifestFetchedAt;
+    return this.manifestSource !== 'embedded_seed' && this.manifestFetchedAt > 0 &&
+      age >= 0 && age < 6 * 60 * 60 * 1000;
   }
 
   public getManifestMetadata(): {
     latestReleaseId: string;
     latestSnapshotId: string;
     manifestSource: 'live_mojang' | 'local_cache' | 'embedded_seed';
+    manifestError: string | null;
   } {
     return {
       latestReleaseId: this.latestReleaseId,
       latestSnapshotId: this.latestSnapshotId,
       manifestSource: this.manifestSource,
+      manifestError: this.lastManifestError,
     };
   }
 
@@ -362,9 +429,23 @@ export class MinecraftLauncherService {
     if (fs.existsSync(receiptPath) && fs.existsSync(jarPath) && fs.existsSync(metaPath)) {
       try {
         const receipt = JSON.parse(fs.readFileSync(receiptPath, 'utf8')) as InstallReceipt;
-        if (receipt.clientJarSha1 && fs.statSync(jarPath).size > 0) {
+        const metaBytes = fs.readFileSync(metaPath);
+        const parsedMeta: unknown = JSON.parse(metaBytes.toString('utf8'));
+        const verifiedMetadata = this.readVerifiedCachedVersionMetadata(versionId, metaPath, this.cachedDescriptors.find((entry) => entry.id === versionId));
+        if (verifiedMetadata && receipt.clientJarSha1 && fs.statSync(jarPath).size > 0 &&
+            sha1File(jarPath).toLowerCase() === receipt.clientJarSha1.toLowerCase() &&
+            validateVersionMetadata(parsedMeta, versionId) &&
+            receipt.verifiedLibraries.every((rel) => fs.existsSync(path.join(path.dirname(path.dirname(versionDir)), 'libraries', rel))) &&
+            Array.isArray(receipt.verifiedAssets) &&
+            receipt.verifiedAssets.every((rel) => fs.existsSync(path.join(path.dirname(path.dirname(versionDir)), rel))) &&
+            Object.entries(receipt.verifiedHashes || {}).every(([rel, expected]) => {
+              const fullPath = path.join(path.dirname(path.dirname(versionDir)), rel);
+              return fs.existsSync(fullPath) && sha1File(fullPath).toLowerCase() === expected.toLowerCase();
+            })) {
           return 'ready';
         }
+        try { fs.unlinkSync(receiptPath); } catch { /* invalid receipt */ }
+        return 'partially_downloaded';
       } catch {
         return 'partially_downloaded';
       }
@@ -416,38 +497,131 @@ export class MinecraftLauncherService {
    * and returns all Release, Snapshot, Old Beta, and Old Alpha versions sorted newest-to-oldest.
    */
   public async syncOfficialVersionManifest(
-    gameDataDir?: string
+    gameDataDir?: string,
+    options: { force?: boolean } = {}
   ): Promise<MinecraftVersionDescriptor[]> {
-    try {
+    if (options.force || !this.manifestIsFresh()) {
+      const manifestUrl = 'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json';
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 8_000);
-      const res = await this.fetchFn(
-        'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json',
-        { signal: controller.signal }
-      );
-      clearTimeout(timeout);
-
-      if (res.ok) {
-        const manifest = (await res.json()) as RawMojangManifestV2;
-        if (Array.isArray(manifest?.versions) && manifest.versions.length > 0) {
-          const tmp = `${this.manifestCachePath}.tmp`;
-          fs.writeFileSync(tmp, JSON.stringify(manifest, null, 2), 'utf8');
-          fs.renameSync(tmp, this.manifestCachePath);
-
-          const parsed = parseMojangManifestV2(manifest);
-          this.cachedDescriptors = parsed.versions;
-          this.latestReleaseId = parsed.latestReleaseId;
-          this.latestSnapshotId = parsed.latestSnapshotId;
-          this.manifestSource = 'live_mojang';
+      try {
+        const res = await this.fetchFn(manifestUrl, { signal: controller.signal, cache: 'no-store' });
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status} fetching official Mojang version manifest ${manifestUrl}`);
         }
+        let manifest: unknown;
+        try {
+          manifest = await res.json();
+        } catch (err) {
+          throw new Error(`Invalid JSON from official Mojang version manifest ${manifestUrl}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        if (!validateOfficialManifest(manifest)) {
+          throw new Error(`Invalid Mojang version manifest structure from ${manifestUrl}.`);
+        }
+        const parsed = parseMojangManifestV2(manifest);
+        if (!parsed.versions.length) throw new Error(`Invalid Mojang version manifest: no usable version entries at ${manifestUrl}.`);
+
+        // Commit data first, then freshness metadata; a crash between writes leaves a stale cache, not a falsely fresh one.
+        atomicWriteFile(this.manifestCachePath, JSON.stringify(manifest, null, 2));
+        const fetchedAt = Date.now();
+        atomicWriteFile(this.manifestCacheInfoPath, JSON.stringify({ fetchedAt, manifestUrl }, null, 2));
+        this.cachedDescriptors = parsed.versions;
+        this.latestReleaseId = parsed.latestReleaseId;
+        this.latestSnapshotId = parsed.latestSnapshotId;
+        this.manifestSource = 'live_mojang';
+        this.manifestFetchedAt = fetchedAt;
+        this.lastManifestError = null;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.lastManifestError = /^HTTP \d{3}\b|^Invalid JSON|^Invalid Mojang version manifest/.test(message)
+          ? message
+          : errorWithNetworkCategory(err, manifestUrl).message;
+      } finally {
+        clearTimeout(timeout);
       }
-    } catch {
-      // Offline or sandbox-firewalled: preserve cached manifest or embedded seed gracefully
     }
 
-    return gameDataDir
-      ? this.getAnnotatedVersions(gameDataDir)
-      : [...this.cachedDescriptors];
+    return gameDataDir ? this.getAnnotatedVersions(gameDataDir) : [...this.cachedDescriptors];
+  }
+
+  private async fetchVersionMetadata(versionId: string, descriptor: MinecraftVersionDescriptor, destPath: string, signal: AbortSignal): Promise<MojangVersionMetadata> {
+    const metadataUrl = descriptor.manifestUrl;
+    const expectedSha1 = descriptor.sha1;
+    if (!metadataUrl || !expectedSha1 || !/^[a-f0-9]{40}$/i.test(expectedSha1)) {
+      throw new Error(`Invalid version metadata entry for ${versionId}: the official manifest must provide its metadata URL and SHA-1.`);
+    }
+    const fetchOnce = async (url: string, sha1: string): Promise<{ meta: MojangVersionMetadata; bytes: Buffer }> => {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 30_000);
+      const combined = AbortSignal.any([signal, controller.signal]);
+      try {
+        const res = await this.fetchFn(url, { signal: combined, cache: 'no-store' });
+        if (!res.ok) throw new Error(`HTTP ${res.status} fetching metadata for Minecraft ${versionId} from ${url}`);
+        const bytes = Buffer.from(await res.arrayBuffer());
+        if (!bytes.length) throw new Error(`Invalid version metadata for ${versionId}: empty response from ${url}.`);
+        const actualSha1 = sha1Hex(bytes);
+        if (actualSha1.toLowerCase() !== sha1.toLowerCase()) {
+          throw new Error(`SHA-1 mismatch for version metadata ${versionId} from ${url}: expected ${sha1}, got ${actualSha1}.`);
+        }
+        let value: unknown;
+        try { value = JSON.parse(bytes.toString('utf8')); }
+        catch (err) { throw new Error(`Invalid JSON for Minecraft ${versionId} metadata from ${url}: ${err instanceof Error ? err.message : String(err)}.`); }
+        if (!validateVersionMetadata(value, versionId)) {
+          throw new Error(`Invalid version metadata for Minecraft ${versionId} from ${url}: required fields or version ID are missing/incorrect.`);
+        }
+        return { meta: value, bytes };
+      } catch (err) {
+        if (err instanceof Error && /^(HTTP \d{3}|SHA-1 mismatch|Invalid JSON|Invalid version metadata)/.test(err.message)) throw err;
+        throw errorWithNetworkCategory(err, url);
+      } finally { clearTimeout(timeout); }
+    };
+
+    try {
+      const result = await fetchOnce(metadataUrl, expectedSha1);
+      atomicWriteFile(destPath, result.bytes);
+      atomicWriteFile(`${destPath}.cache.json`, JSON.stringify({ url: metadataUrl, sha1: expectedSha1, fetchedAt: Date.now() }, null, 2));
+      return result.meta;
+    } catch (firstError) {
+      if (!(firstError instanceof Error) || !firstError.message.startsWith('HTTP 404')) throw firstError;
+      // A 404 is a strong stale-manifest signal. Refresh even if the manifest's normal freshness window has not elapsed.
+      await this.syncOfficialVersionManifest(undefined, { force: true });
+      const refreshed = this.cachedDescriptors.find((entry) => entry.id === versionId);
+      if (!refreshed?.manifestUrl || !refreshed.sha1) {
+        throw new Error(`Mojang metadata HTTP 404 for Minecraft ${versionId}: ${metadataUrl} (HTTP 404). Official manifest refresh did not return a URL and SHA-1 for the exact version ID.${this.lastManifestError ? ` Manifest refresh diagnostic: ${this.lastManifestError}` : ''}`);
+      }
+      try {
+        const result = await fetchOnce(refreshed.manifestUrl, refreshed.sha1);
+        atomicWriteFile(destPath, result.bytes);
+        atomicWriteFile(`${destPath}.cache.json`, JSON.stringify({ url: refreshed.manifestUrl, sha1: refreshed.sha1, fetchedAt: Date.now() }, null, 2));
+        return result.meta;
+      } catch (retryError) {
+        if (retryError instanceof Error && retryError.message.startsWith('HTTP 404')) {
+          throw new Error(`Mojang metadata HTTP 404 for Minecraft ${versionId}: ${refreshed.manifestUrl} (HTTP 404) after refreshing the official version manifest.${this.lastManifestError ? ` Manifest refresh diagnostic: ${this.lastManifestError}` : ''}`);
+        }
+        throw retryError;
+      }
+    }
+  }
+
+  private readVerifiedCachedVersionMetadata(versionId: string, metaPath: string, descriptor?: MinecraftVersionDescriptor): MojangVersionMetadata | null {
+    if (!fs.existsSync(metaPath)) return null;
+    try {
+      const bytes = fs.readFileSync(metaPath);
+      let expectedSha1 = descriptor?.sha1;
+      if (!expectedSha1 && fs.existsSync(`${metaPath}.cache.json`)) {
+        const cacheInfo = JSON.parse(fs.readFileSync(`${metaPath}.cache.json`, 'utf8')) as { sha1?: string };
+        expectedSha1 = cacheInfo.sha1;
+      }
+      if (!expectedSha1 || sha1Hex(bytes).toLowerCase() !== expectedSha1.toLowerCase()) throw new Error('cached metadata SHA-1 mismatch or unavailable');
+      const parsed: unknown = JSON.parse(bytes.toString('utf8'));
+      if (!validateVersionMetadata(parsed, versionId)) throw new Error('cached metadata schema or ID is invalid');
+      return parsed;
+    } catch {
+      for (const file of [metaPath, `${metaPath}.cache.json`, `${metaPath}.part`]) {
+        try { fs.unlinkSync(file); } catch { /* absent */ }
+      }
+      return null;
+    }
   }
 
   /**
@@ -768,20 +942,25 @@ export class MinecraftLauncherService {
         throw new Error('Download cancelled by user.');
       }
 
+      let requestTimeout: NodeJS.Timeout | undefined;
       try {
+        const requestController = new AbortController();
+        requestTimeout = setTimeout(() => requestController.abort(), 45_000);
+        const requestSignal = AbortSignal.any([signal, requestController.signal]);
         const existingOffset = fs.existsSync(partPath) ? fs.statSync(partPath).size : 0;
         const headers: Record<string, string> = {};
         if (existingOffset > 0) {
           headers.Range = `bytes=${existingOffset}-`;
         }
 
-        const res = await this.fetchFn(url, { headers, signal });
+        const res = await this.fetchFn(url, { headers, signal: requestSignal });
         if (!res.ok && res.status !== 206) {
           throw new Error(`HTTP ${res.status} fetching ${url}`);
         }
 
         const isPartialContent = res.status === 206 && existingOffset > 0;
         const bodyBytes = Buffer.from(await res.arrayBuffer());
+        if (bodyBytes.length === 0) throw new Error(`Empty artifact response from ${url}.`);
         onChunkBytes?.(bodyBytes.length);
 
         const combined = isPartialContent
@@ -790,7 +969,7 @@ export class MinecraftLauncherService {
 
         fs.writeFileSync(partPath, combined);
 
-        if (verifyHashes && expectedSha1) {
+        if (expectedSha1 && (verifyHashes || /\/(?:assets|libraries|versions)\//i.test(destPath))) {
           const actualSha1 = sha1Hex(combined);
           if (actualSha1.toLowerCase() !== expectedSha1.toLowerCase()) {
             try {
@@ -811,13 +990,21 @@ export class MinecraftLauncherService {
           throw new Error('Download cancelled by user.');
         }
         lastError = err instanceof Error ? err : new Error(String(err));
+        if (/^HTTP (?:403|404)\b/.test(lastError.message)) {
+          try { fs.unlinkSync(partPath); } catch { /* absent */ }
+          break;
+        }
         if (attempt < 3) {
           await new Promise((r) => setTimeout(r, 250 * attempt));
         }
+      } finally {
+        if (requestTimeout) clearTimeout(requestTimeout);
       }
     }
 
-    throw lastError ?? new Error(`Failed downloading ${url}`);
+    const finalError = lastError ?? new Error(`Failed downloading ${url}`);
+    if (/^HTTP \d{3}\b|SHA-1 integrity mismatch|HTTP 403|HTTP 404/.test(finalError.message)) throw finalError;
+    throw errorWithNetworkCategory(finalError, url);
   }
 
   /**
@@ -849,8 +1036,18 @@ export class MinecraftLauncherService {
       );
     }
 
-    const versionDescriptor = getVersionDescriptor(versionId, this.cachedDescriptors);
-    if (!versionDescriptor || versionDescriptor.supportTier === 'unsupported') {
+    // Consult the official manifest for every install. If the network is unavailable, only a
+    // previously validated on-disk official manifest may serve as offline fallback; the embedded
+    // browse catalogue is never an install authority.
+    await this.syncOfficialVersionManifest(undefined, { force: true });
+    if (this.manifestSource === 'embedded_seed') {
+      throw new Error(`Cannot install Minecraft ${versionId}: no validated official Mojang manifest is available.${this.lastManifestError ? ` Manifest diagnostic: ${this.lastManifestError}` : ''}`);
+    }
+    let versionDescriptor = this.cachedDescriptors.find((entry) => entry.id === versionId);
+    if (!versionDescriptor) {
+      throw new Error(`Minecraft version "${versionId}" is not present in the official Mojang manifest.${this.lastManifestError ? ` Manifest diagnostic: ${this.lastManifestError}` : ''}`);
+    }
+    if (versionDescriptor.supportTier === 'unsupported') {
       throw new Error(`Minecraft version "${versionId}" is not a supported official version.`);
     }
 
@@ -928,36 +1125,25 @@ export class MinecraftLauncherService {
         fs.unlinkSync(receiptPath);
       }
 
-      // Stage 1: Fetch & verify version metadata JSON
+      // Stage 1: use only exact-ID official manifest entries, with the entry SHA-1 for metadata itself.
       emitProgress('downloading', `Fetching Mojang metadata for Minecraft ${versionId}...`, 3);
-      let manifestUrl = versionDescriptor.manifestUrl;
-      if (!manifestUrl) {
-        await this.syncOfficialVersionManifest(settings.gameDataDir);
-        manifestUrl =
-          getVersionDescriptor(versionId, this.cachedDescriptors)?.manifestUrl || '';
-      }
       const metaPath = path.join(versionDir, `${versionId}.json`);
-      if (!manifestUrl && !fs.existsSync(metaPath)) {
-        throw new Error(
-          `Official Mojang metadata URL for Minecraft ${versionId} is unavailable while offline. Connect to the internet and click Refresh Manifest.`
-        );
-      }
-
-      let metaJson: MojangVersionMetadata;
-      if (manifestUrl && (forceRepair || !fs.existsSync(metaPath))) {
-        const metaBuf = await this.downloadVerifiedFile({
-          url: manifestUrl,
-          destPath: metaPath,
-          expectedSha1: versionDescriptor.sha1,
-          verifyHashes: settings.verifyFileHashes,
-          signal: abortController.signal,
-          onChunkBytes: (n) => {
-            bytesDownloaded += n;
-          },
-        });
-        metaJson = JSON.parse(metaBuf.toString('utf8')) as MojangVersionMetadata;
+      let metaJson: MojangVersionMetadata | null = forceRepair
+        ? null
+        : this.readVerifiedCachedVersionMetadata(versionId, metaPath, versionDescriptor);
+      if (metaJson) {
+        bytesDownloaded += fs.statSync(metaPath).size;
       } else {
-        metaJson = JSON.parse(fs.readFileSync(metaPath, 'utf8')) as MojangVersionMetadata;
+        try {
+          metaJson = await this.fetchVersionMetadata(versionId, versionDescriptor, metaPath, abortController.signal);
+          bytesDownloaded += fs.statSync(metaPath).size;
+          versionDescriptor = this.cachedDescriptors.find((entry) => entry.id === versionId) || versionDescriptor;
+        } catch (err) {
+          throw err;
+        }
+      }
+      if (!validateVersionMetadata(metaJson, versionId)) {
+        throw new Error(`Invalid version metadata for Minecraft ${versionId}: required launch fields are absent.`);
       }
 
       // Stage 2: Resolve Java requirement & library/native graph
@@ -965,7 +1151,7 @@ export class MinecraftLauncherService {
         metaJson.javaVersion?.majorVersion || versionDescriptor.recommendedJavaMajor;
       const clientInfo = metaJson.downloads?.client;
       if (!clientInfo?.url || !clientInfo?.sha1) {
-        throw new Error(`Mojang metadata for ${versionId} is missing client.jar download metadata.`);
+        throw new Error(`Invalid version metadata for ${versionId}: client.jar URL or SHA-1 is missing.`);
       }
 
       interface PlannedDownload {
@@ -1034,37 +1220,50 @@ export class MinecraftLauncherService {
               size: natArt.size || 128_000,
               excludePrefixes: lib.extract?.exclude,
             });
+            verifiedLibraryRelPaths.push(natRel);
           }
         }
       }
 
       // Stage 3: Fetch & parse official Asset Index JSON
       let assetIndexId = metaJson.assetIndex?.id || metaJson.assets || 'legacy';
+      let verifiedAssetIndexPath: string | null = null;
       let mapToResources = false;
       let virtualAssets = false;
       if (metaJson.assetIndex?.url) {
         emitProgress('downloading', `Fetching asset index (${assetIndexId})...`, 8);
         const indexDest = path.join(assetsRoot, 'indexes', `${assetIndexId}.json`);
-        const indexBuf = await this.downloadVerifiedFile({
-          url: metaJson.assetIndex.url,
-          destPath: indexDest,
-          expectedSha1: metaJson.assetIndex.sha1,
-          verifyHashes: settings.verifyFileHashes,
-          signal: abortController.signal,
-          onChunkBytes: (n) => {
-            bytesDownloaded += n;
-          },
-        });
-        const indexJson = JSON.parse(indexBuf.toString('utf8')) as {
+        verifiedAssetIndexPath = indexDest;
+        let indexBuf: Buffer;
+        try {
+          indexBuf = await this.downloadVerifiedFile({
+            url: metaJson.assetIndex.url,
+            destPath: indexDest,
+            expectedSha1: metaJson.assetIndex.sha1,
+            verifyHashes: true,
+            signal: abortController.signal,
+            onChunkBytes: (n) => { bytesDownloaded += n; },
+          });
+        } catch (err) {
+          throw new Error(`Missing asset index ${assetIndexId} (${metaJson.assetIndex.url}): ${err instanceof Error ? err.message : String(err)}`);
+        }
+        let indexJson: {
           map_to_resources?: boolean;
           virtual?: boolean;
           objects?: Record<string, { hash: string; size: number }>;
         };
+        try { indexJson = JSON.parse(indexBuf.toString('utf8')); }
+        catch (err) { throw new Error(`Invalid JSON for asset index ${assetIndexId} (${metaJson.assetIndex.url}): ${err instanceof Error ? err.message : String(err)}`); }
+        if (!indexJson || typeof indexJson !== 'object' || !indexJson.objects || typeof indexJson.objects !== 'object') {
+          throw new Error(`Invalid version metadata: asset index ${assetIndexId} has no objects map.`);
+        }
         mapToResources = Boolean(indexJson.map_to_resources);
         virtualAssets = Boolean(indexJson.virtual);
 
         for (const [logicalName, obj] of Object.entries(indexJson.objects || {})) {
-          if (!obj?.hash || obj.hash.length < 2) continue;
+          if (!obj?.hash || !/^[a-f0-9]{40}$/i.test(obj.hash) || !Number.isFinite(obj.size) || obj.size < 0) {
+            throw new Error(`Invalid version metadata: asset index ${assetIndexId} contains an invalid hash/size for "${logicalName}".`);
+          }
           const prefix = obj.hash.slice(0, 2);
           planned.push({
             kind: 'asset',
@@ -1164,17 +1363,23 @@ export class MinecraftLauncherService {
           emitProgress('downloading', label);
 
           let countedChunkBytes = 0;
-          await this.downloadVerifiedFile({
-            url: item.url,
-            destPath: item.destPath,
-            expectedSha1: item.sha1,
-            verifyHashes: settings.verifyFileHashes,
-            signal: abortController.signal,
-            onChunkBytes: (n) => {
-              countedChunkBytes += n;
-              bytesDownloaded += n;
-            },
-          });
+          try {
+            await this.downloadVerifiedFile({
+              url: item.url,
+              destPath: item.destPath,
+              expectedSha1: item.sha1,
+              verifyHashes: true,
+              signal: abortController.signal,
+              onChunkBytes: (n) => {
+                countedChunkBytes += n;
+                bytesDownloaded += n;
+              },
+            });
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            const kindLabel = item.kind === 'asset' ? 'Missing asset' : item.kind === 'client_jar' ? 'Missing client JAR' : 'Missing required library';
+            throw new Error(`${kindLabel} (${item.destPath}): ${message}`);
+          }
 
           if (countedChunkBytes === 0) {
             // Cached & verified locally: advance progress smoothly
@@ -1227,7 +1432,6 @@ export class MinecraftLauncherService {
       const clientJarPath = path.join(versionDir, `${versionId}.jar`);
       const finalJarSha1 = sha1File(clientJarPath);
       if (
-        settings.verifyFileHashes &&
         clientInfo.sha1 &&
         finalJarSha1.toLowerCase() !== clientInfo.sha1.toLowerCase()
       ) {
@@ -1246,6 +1450,13 @@ export class MinecraftLauncherService {
         assetIndexId,
         clientJarSha1: finalJarSha1,
         verifiedLibraries: Array.from(new Set(verifiedLibraryRelPaths)),
+        verifiedAssets: planned.filter((item) => item.kind === 'asset').map((item) => path.relative(settings.gameDataDir, item.destPath)),
+        verifiedHashes: Object.fromEntries([
+          ...planned.filter((item) => item.sha1).map((item) => [path.relative(settings.gameDataDir, item.destPath), item.sha1!]),
+          ...(verifiedAssetIndexPath && metaJson.assetIndex?.sha1
+            ? [[path.relative(settings.gameDataDir, verifiedAssetIndexPath), metaJson.assetIndex.sha1] as [string, string]]
+            : []),
+        ]),
         nativesExtractedCount,
         installedAt: new Date().toISOString(),
       };
@@ -1265,6 +1476,7 @@ export class MinecraftLauncherService {
       const msg = err instanceof Error ? err.message : String(err);
       const wasCancelled = msg.toLowerCase().includes('cancelled');
       if (!wasCancelled) {
+        try { fs.unlinkSync(path.join(settings.gameDataDir, 'versions', versionId, 'vespera-install-receipt.json')); } catch { /* no prior receipt */ }
         this.failedInstallErrors.set(versionId, msg);
         emitProgress('failed', `Installation failed: ${msg}`, undefined, msg);
       }
@@ -1289,6 +1501,8 @@ export class MinecraftLauncherService {
 
     if (!fs.existsSync(metaPath)) {
       issues.push(`Missing Mojang version metadata (${versionId}.json).`);
+    } else if (!this.readVerifiedCachedVersionMetadata(versionId, metaPath, this.cachedDescriptors.find((entry) => entry.id === versionId))) {
+      issues.push(`Invalid or SHA-1-mismatched Mojang version metadata (${versionId}.json).`);
     }
     if (!fs.existsSync(jarPath)) {
       issues.push(`Missing Minecraft client JAR (${versionId}.jar).`);
@@ -1310,8 +1524,25 @@ export class MinecraftLauncherService {
       }
       for (const relLib of receipt.verifiedLibraries) {
         const libFull = path.join(settings.gameDataDir, 'libraries', relLib);
-        if (!fs.existsSync(libFull)) {
+        if (!fs.existsSync(libFull) || fs.statSync(libFull).size === 0) {
           issues.push(`Missing required library: ${relLib}`);
+        }
+      }
+      for (const relAsset of receipt.verifiedAssets || []) {
+        const assetFull = path.join(settings.gameDataDir, relAsset);
+        if (!fs.existsSync(assetFull) || fs.statSync(assetFull).size === 0) {
+          issues.push(`Missing required asset: ${relAsset}`);
+        }
+      }
+      for (const [relPath, expected] of Object.entries(receipt.verifiedHashes || {})) {
+        const fullPath = path.join(settings.gameDataDir, relPath);
+        if (!fs.existsSync(fullPath)) {
+          issues.push(`Missing verified artifact: ${relPath}`);
+        } else {
+          const actual = sha1File(fullPath);
+          if (actual.toLowerCase() !== expected.toLowerCase()) {
+            issues.push(`SHA-1 mismatch for installed artifact ${relPath} (expected ${expected}, got ${actual}).`);
+          }
         }
       }
     } catch {
@@ -1448,7 +1679,7 @@ export class MinecraftLauncherService {
         const irisLines = [
           `shaderPack=${activeShader && g.shaderQualityPreset !== 'off' ? activeShader.fileName : ''}`,
           `enableShaders=${Boolean(activeShader && g.shaderQualityPreset !== 'off')}`,
-          `maxShadowRenderDistance=${g.shaderQualityPreset === 'ultra' ? 16 : g.shaderQualityPreset === 'high' ? 12 : 8}`,
+          `maxShadowRenderDistance=${g.shaderQualityPreset === 'cinematic_ultra' ? 16 : g.shaderQualityPreset === 'balanced_pbr' ? 12 : 8}`,
         ];
         fs.writeFileSync(
           path.join(configDir, 'iris.properties'),
@@ -1462,13 +1693,13 @@ export class MinecraftLauncherService {
         process.cwd(),
         'release',
         'mods',
-        'vespera-client-1.2.0+mc1.21.4.jar'
+        'vespera-client-1.2.1+mc1.21.4.jar'
       );
       const legacyReleaseModJar = path.join(
         process.cwd(),
         'release',
         'mods',
-        'vespera-client-1.1.1+mc1.21.4.jar'
+        'vespera-client-1.2.0+mc1.21.4.jar'
       );
 
       // Clean stale Vespera custom JAR if profile version is NOT 1.21.4
@@ -1705,7 +1936,7 @@ export class MinecraftLauncherService {
       ...baseFlags,
       `-Djava.library.path=${nativesDir}`,
       `-Dminecraft.launcher.brand=VesperaClient`,
-      `-Dminecraft.launcher.version=1.2.0`,
+      `-Dminecraft.launcher.version=1.2.1`,
       ...(sessionMode === 'offline_account' ? ['-Dvespera.accountType=offline'] : []),
       ...(sessionMode === 'offline_singleplayer'
         ? ['-Dvespera.offlineSingleplayer=true']
@@ -1765,7 +1996,7 @@ export class MinecraftLauncherService {
         '--userType',
         userType,
         '--versionType',
-        profile.loader === 'vanilla' ? 'Vespera-Vanilla/1.2.0' : 'Vespera-Fabric/1.2.0',
+        profile.loader === 'vanilla' ? 'Vespera-Vanilla/1.2.1' : 'Vespera-Fabric/1.2.1',
         '--width',
         String(profile.graphics.resolutionWidth),
         '--height',

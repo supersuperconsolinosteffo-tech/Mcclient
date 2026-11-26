@@ -580,7 +580,7 @@ export class AuthService {
   }
 
   /**
-   * Primary Vespera v1.2.0 sign-in flow:
+   * Primary Vespera v1.2.1 sign-in flow:
    * Starts a temporary localhost loopback HTTP callback listener (`http://localhost:<port>`),
    * generates RFC 7636 PKCE (`S256`) + cryptographic `state`, opens the official Microsoft login
    * website in the OS default browser, validates callback & prevents replay, and completes

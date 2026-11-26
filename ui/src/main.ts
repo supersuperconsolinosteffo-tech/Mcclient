@@ -560,7 +560,7 @@ function bindGlobalAndStageEvents(root: HTMLElement, snap: AppStateSnapshot): vo
         renderApp();
         const { launchRes, snapshot } = await bridge.launchMinecraft();
         state.snapshot = snapshot;
-        state.launchPrep = launchRes.preparation;
+        state.launchPrep = launchRes.preparation ?? null;
         state.launchingGame = false;
 
         if (launchRes.launched) {

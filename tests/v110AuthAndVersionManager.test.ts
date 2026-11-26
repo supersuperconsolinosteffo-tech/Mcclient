@@ -389,7 +389,17 @@ describe('Part 8.1 — Microsoft Authentication Overhaul & Legitimate Offline Si
     fs.mkdirSync(verDir, { recursive: true });
     const dummyJar = Buffer.from('verified-client-jar-bytes');
     fs.writeFileSync(path.join(verDir, `${mcVer}.jar`), dummyJar);
-    fs.writeFileSync(path.join(verDir, `${mcVer}.json`), JSON.stringify({ id: mcVer, mainClass: 'net.minecraft.client.main.Main' }));
+    const dummyMetadata = Buffer.from(JSON.stringify({
+      id: mcVer,
+      mainClass: 'net.minecraft.client.main.Main',
+      downloads: { client: { url: 'https://mock.mojang.test/client.jar', sha1: sha1Hex(dummyJar) } },
+      assetIndex: { id: '19', url: 'https://mock.mojang.test/assets/19.json', sha1: 'a'.repeat(40) },
+      libraries: [],
+    }));
+    fs.writeFileSync(path.join(verDir, `${mcVer}.json`), dummyMetadata);
+    fs.writeFileSync(path.join(verDir, `${mcVer}.json.cache.json`), JSON.stringify({
+      url: 'https://mock.mojang.test/metadata.json', sha1: sha1Hex(dummyMetadata), fetchedAt: Date.now(),
+    }));
     fs.writeFileSync(
       path.join(verDir, 'vespera-install-receipt.json'),
       JSON.stringify({
@@ -402,6 +412,8 @@ describe('Part 8.1 — Microsoft Authentication Overhaul & Legitimate Offline Si
         assetIndexId: '19',
         clientJarSha1: sha1Hex(dummyJar),
         verifiedLibraries: [],
+        verifiedAssets: [],
+        verifiedHashes: {},
         nativesExtractedCount: 1,
         installedAt: new Date().toISOString(),
       })
@@ -570,6 +582,8 @@ describe('Part 8.2 & 8.3 — Dynamic Version Manager, Multi-Stage Installer, Res
 
     let corruptClientJarOnce = false;
     const rangeHeadersSeen: string[] = [];
+    const metadataRequestUrls: string[] = [];
+    let manifestRequestCount = 0;
 
     const mockMojangFetch: typeof fetch = async (input, init) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
@@ -577,6 +591,7 @@ describe('Part 8.2 & 8.3 — Dynamic Version Manager, Multi-Stage Installer, Res
       if (hdrs.Range) rangeHeadersSeen.push(hdrs.Range);
 
       if (url === 'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json') {
+        manifestRequestCount++;
         return new Response(
           JSON.stringify({
             latest: { release: '1.21.4', snapshot: '25w09b' },
@@ -584,7 +599,9 @@ describe('Part 8.2 & 8.3 — Dynamic Version Manager, Multi-Stage Installer, Res
               {
                 id: '1.20.4',
                 type: 'release',
-                url: 'https://mock.mojang.test/meta/1.20.4.json',
+                url: manifestRequestCount === 1
+                  ? 'https://mock.mojang.test/meta/stale-1.20.4.json'
+                  : 'https://mock.mojang.test/meta/1.20.4.json',
                 sha1: versionMetaSha1,
                 releaseTime: '2023-12-07T12:56:20+00:00',
               },
@@ -592,6 +609,10 @@ describe('Part 8.2 & 8.3 — Dynamic Version Manager, Multi-Stage Installer, Res
           }),
           { status: 200 }
         );
+      }
+      if (url.includes('/meta/')) metadataRequestUrls.push(url);
+      if (url === 'https://mock.mojang.test/meta/stale-1.20.4.json') {
+        return new Response('stale manifest URL', { status: 404 });
       }
       if (url === 'https://mock.mojang.test/meta/1.20.4.json') {
         return new Response(versionMetaBytes, { status: 200 });
@@ -617,7 +638,7 @@ describe('Part 8.2 & 8.3 — Dynamic Version Manager, Multi-Stage Installer, Res
         return new Response(libBytes, { status: 200 });
       }
       if (url === 'https://mock.mojang.test/libs/lwjgl-3.3.2-natives-windows.jar') {
-        return new Response(nativeZipBytes, { status: 200 });
+        return new Response(new Uint8Array(nativeZipBytes), { status: 200 });
       }
       return new Response('Not found', { status: 404 });
     };
@@ -667,6 +688,8 @@ describe('Part 8.2 & 8.3 — Dynamic Version Manager, Multi-Stage Installer, Res
     });
 
     expect(rangeHeadersSeen).toContain('bytes=12-');
+    expect(metadataRequestUrls).toEqual(['https://mock.mojang.test/meta/1.20.4.json']);
+    expect(manifestRequestCount).toBe(2); // initial sync + authoritative refresh immediately before install
     expect(receipt.versionId).toBe('1.20.4');
     expect(receipt.javaMajor).toBe(17);
     expect(receipt.nativesExtractedCount).toBe(1);
@@ -723,7 +746,7 @@ describe('Part 8.4 — End-to-End UX Flow, Legacy 1.8.9 Args, Mod Isolation & v1
 
     const coord = new VesperaStateCoordinator(dataDir);
     const migratedSnap = coord.getSnapshot();
-    expect(migratedSnap.version).toBe('1.2.0');
+    expect(migratedSnap.version).toBe('1.2.1');
     expect(migratedSnap.profiles[0].name).toBe('My Preserved v1.0.0 Profile');
 
     // Verify Accounts UI has ZERO manual Client ID input fields and renders Offline Availability section

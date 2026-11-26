@@ -38,9 +38,9 @@ export const CURATED_MOD_CATALOG: CuratedModEntry[] = [
     verifiedSha512Prefix: 'vespera-local-verified',
     versionByMc: {
       '1.21.4': {
-        versionNumber: '1.2.0+mc1.21.4',
-        fileName: 'vespera-client-1.2.0+mc1.21.4.jar',
-        downloadUrl: 'local://release/mods/vespera-client-1.2.0+mc1.21.4.jar',
+        versionNumber: '1.2.1+mc1.21.4',
+        fileName: 'vespera-client-1.2.1+mc1.21.4.jar',
+        downloadUrl: 'local://release/mods/vespera-client-1.2.1+mc1.21.4.jar',
       },
     },
   },

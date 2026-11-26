@@ -248,6 +248,13 @@ inline std::string dpapi_load_secret(const std::filesystem::path& path) {
     return out;
 }
 
+inline std::string winhttp_error_category(DWORD code) {
+    if (code == ERROR_WINHTTP_TIMEOUT) return "Network timeout";
+    if (code == ERROR_WINHTTP_NAME_NOT_RESOLVED) return "DNS failure";
+    if (code == ERROR_WINHTTP_CANNOT_CONNECT || code == ERROR_WINHTTP_CONNECTION_ERROR) return "Network connection failure";
+    return "Network failure";
+}
+
 struct HttpResponse {
     int statusCode = 0;
     std::string body;
@@ -281,20 +288,22 @@ inline HttpResponse winhttp_request(
         return res;
     }
 
-    HINTERNET hSession = WinHttpOpen(L"VesperaClient/1.2.0 (Windows NT 10.0; Win64; x64)",
+    HINTERNET hSession = WinHttpOpen(L"VesperaClient/1.2.1 (Windows NT 10.0; Win64; x64)",
                                      WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                      WINHTTP_NO_PROXY_NAME,
                                      WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) {
-        res.error = "WinHttpOpen failed";
+        DWORD code = GetLastError();
+        res.error = winhttp_error_category(code) + " (WinHTTP error " + std::to_string(code) + ") fetching " + urlUtf8;
         return res;
     }
     WinHttpSetTimeouts(hSession, 6000, 6000, 15000, 30000);
 
     HINTERNET hConnect = WinHttpConnect(hSession, hostBuf, uc.nPort, 0);
     if (!hConnect) {
+        DWORD code = GetLastError();
         WinHttpCloseHandle(hSession);
-        res.error = "WinHttpConnect failed";
+        res.error = winhttp_error_category(code) + " (WinHTTP error " + std::to_string(code) + ") fetching " + urlUtf8;
         return res;
     }
 
@@ -305,7 +314,8 @@ inline HttpResponse winhttp_request(
     if (!hRequest) {
         WinHttpCloseHandle(hConnect);
         WinHttpCloseHandle(hSession);
-        res.error = "WinHttpOpenRequest failed";
+        DWORD code = GetLastError();
+        res.error = winhttp_error_category(code) + " (WinHTTP error " + std::to_string(code) + ") fetching " + urlUtf8;
         return res;
     }
 
@@ -345,7 +355,8 @@ inline HttpResponse winhttp_request(
             }
         } while (avail > 0);
     } else {
-        res.error = "Network request failed (WinHTTP error " + std::to_string(GetLastError()) + ")";
+        DWORD code = GetLastError();
+        res.error = winhttp_error_category(code) + " (WinHTTP error " + std::to_string(code) + ") fetching " + urlUtf8;
     }
 
     WinHttpCloseHandle(hRequest);
@@ -450,13 +461,15 @@ inline bool winhttp_download_verified(
             return false;
         }
 
-        HINTERNET hSession = WinHttpOpen(L"VesperaClient/1.2.0 (Windows NT 10.0; Win64; x64)",
+        HINTERNET hSession = WinHttpOpen(L"VesperaClient/1.2.1 (Windows NT 10.0; Win64; x64)",
                                          WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                          WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         if (!hSession) {
-            outError = "WinHttpOpen failed.";
+            DWORD code = GetLastError();
+            outError = winhttp_error_category(code) + " (WinHTTP error " + std::to_string(code) + ") fetching " + urlUtf8;
             continue;
         }
+        WinHttpSetTimeouts(hSession, 6000, 6000, 15000, 30000);
         HINTERNET hConnect = WinHttpConnect(hSession, hostBuf, uc.nPort, 0);
         DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
         HINTERNET hRequest = hConnect
@@ -513,9 +526,17 @@ inline bool winhttp_download_verified(
                 }
             } else {
                 outError = "HTTP " + std::to_string(status) + " fetching " + urlUtf8;
+                if (status == 403 || status == 404) {
+                    WinHttpCloseHandle(hRequest);
+                    WinHttpCloseHandle(hConnect);
+                    WinHttpCloseHandle(hSession);
+                    std::filesystem::remove(partFile, ec);
+                    return false;
+                }
             }
         } else {
-            outError = "Network error fetching " + urlUtf8;
+            DWORD code = GetLastError();
+            outError = winhttp_error_category(code) + " (WinHTTP error " + std::to_string(code) + ") fetching " + urlUtf8;
         }
 
         WinHttpCloseHandle(hRequest);

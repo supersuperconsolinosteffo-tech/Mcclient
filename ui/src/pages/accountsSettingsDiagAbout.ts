@@ -116,7 +116,7 @@ export function renderFirstLaunchAccountModal(snap: AppStateSnapshot): string {
         <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap">
           <div>
             <div style="display:inline-flex;align-items:center;gap:8px;margin-bottom:6px">
-              <span class="badge badge-supported">Welcome to Vespera Client v1.2.0</span>
+              <span class="badge badge-supported">Welcome to Vespera Client v1.2.1</span>
               <span class="badge badge-cyan">No Forced Login</span>
             </div>
             <h2 style="font-size:22px;font-weight:800;margin:0;color:var(--text-primary)">
@@ -853,7 +853,7 @@ export function renderAboutPage(snap: AppStateSnapshot): string {
           </div>
         </div>
         <div class="card-desc">
-          Vespera separates its lightweight native Windows desktop launcher (<code>VesperaClient.exe</code>, Win32 + Edge WebView2 + WinHTTP + WinSock2 PKCE + DPAPI + CNG BCrypt) from its decoupled client-side Fabric integration mod (<code>vespera-client-1.2.0+mc1.21.4.jar</code>), keeping launcher RAM overhead minimal and background CPU utilization at 0.0% during gameplay.
+          Vespera separates its lightweight native Windows desktop launcher (<code>VesperaClient.exe</code>, Win32 + Edge WebView2 + WinHTTP + WinSock2 PKCE + DPAPI + CNG BCrypt) from its decoupled client-side Fabric integration mod (<code>vespera-client-1.2.1+mc1.21.4.jar</code>), keeping launcher RAM overhead minimal and background CPU utilization at 0.0% during gameplay.
         </div>
       </div>
 

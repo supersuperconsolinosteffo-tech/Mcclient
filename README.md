@@ -1,4 +1,4 @@
-# Vespera Client v1.2.0
+# Vespera Client v1.2.1
 
 **Precision Minecraft Java Edition Client & Native Windows 10/11 Launcher**  
 *Performance + Visual Fidelity + Dynamic Multi-Version Management + Offline Accounts + Seamless Microsoft Sign-In — Zero Electron Bloat*
@@ -9,35 +9,39 @@
 
 **Vespera Client** (`gg.vespera.client`) is a production-grade Minecraft Java Edition client ecosystem and native 64-bit Windows desktop launcher engineered as a modern, transparent, open-architecture alternative to Lunar Client and Badlion Client.
 
-### Highlights in v1.2.0 — Offline Accounts & Dual Authentication
-1. **Offline Accounts for Singleplayer, LAN & Offline Servers**:
+### Highlights in v1.2.1 — Mojang Metadata Recovery
+1. **Resilient Official Metadata Pipeline**:
+   - Refreshes the official Mojang version manifest when stale (and before installs from the embedded fallback), resolves metadata by exact version ID, verifies the manifest-provided metadata SHA-1, and retries metadata HTTP 404s once after forcing a manifest refresh.
+   - Caches manifests and version JSON atomically, invalidates corrupt or unverified metadata, and refuses to write a successful install receipt when required metadata, libraries, assets, or the client JAR is missing or invalid.
+   - Reports HTTP status, timeout/DNS, invalid JSON, SHA-1, missing library, and missing asset failures with actionable context. The embedded seed remains a browse-only offline fallback.
+2. **Offline Accounts for Singleplayer, LAN & Offline Servers**:
    - Create multiple local Minecraft usernames without Microsoft credentials; each receives Minecraft's deterministic `OfflinePlayer:<username>` UUID (MD5 v3) and is clearly labeled as an Offline Account.
    - Offline accounts launch with legacy authentication (`--accessToken 0 --userType legacy`) and retain multiplayer support for LAN and servers configured with `online-mode=false`. Servers requiring online authentication receive a clear in-launcher explanation.
-2. **One Accounts Hub for Offline and Microsoft Profiles**:
+3. **One Accounts Hub for Offline and Microsoft Profiles**:
    - Switch between account types without overwriting either profile, persist the selected account across launcher restarts, and manage accounts from the Accounts page or bottom-dock switcher.
    - First launch offers a username form with live UUID preview; usernames are validated against Minecraft's 3–16 character rules.
-3. **Clean, Player-First Microsoft Login Experience**:
+4. **Clean, Player-First Microsoft Login Experience**:
    - Presents distinct **Add Offline Account** and **Add Microsoft Account** paths, with a clear **Sign in with Microsoft** button—no manual Client ID inputs, no verification-code copying required for standard login, and no intimidating developer setup panels in the user interface.
    - Displays a real-time 6-stage authentication progress view (*Opening Microsoft login... $\rightarrow$ Waiting for authentication... $\rightarrow$ Verifying Microsoft account... $\rightarrow$ Connecting to Xbox services... $\rightarrow$ Checking Minecraft ownership... $\rightarrow$ Retrieving Minecraft profile...*) with instant cancellation and automatic refresh upon completion.
-4. **Native OAuth 2.0 Authorization Code + PKCE (`S256`) Desktop Architecture**:
+5. **Native OAuth 2.0 Authorization Code + PKCE (`S256`) Desktop Architecture**:
    - Opens Microsoft's official login page (`login.microsoftonline.com/consumers/oauth2/v2.0/authorize`) in the OS default browser and listens on a temporary local loopback callback (`http://localhost:<port>`), enforcing timing-safe CSRF `state` validation, PKCE `S256` code redemption, and authorization-code replay prevention.
    - Executes the complete **Microsoft OAuth $\rightarrow$ Xbox Live $\rightarrow$ XSTS $\rightarrow$ Minecraft Services $\rightarrow$ Java Edition Entitlement Verification $\rightarrow$ Minecraft Profile** chain with DPAPI / AES-256-GCM encrypted token storage, multi-account switching, silent session refresh, and clear human-readable error messages.
    - **External Registration Status**: No fabricated Client ID is included in the repository (`config/oauth.release.json` and `config/oauth.development.json` ship with `"clientId": ""`). Before live Microsoft authentication can complete end-to-end, a maintainer must supply a registered Microsoft Entra Public Client ID (`http://localhost` Mobile & desktop redirect URI) via `VESPERA_MSA_CLIENT_ID`, `config/oauth.local.json`, or `config/oauth.release.json` (see [`docs/OAUTH_DEVELOPER_SETUP.md`](docs/OAUTH_DEVELOPER_SETUP.md)). If unset, Vespera surfaces a friendly notice *only* when attempting sign-in.
-5. **Dynamic Official Minecraft Version Manager & Honest Mod Isolation**:
-   - Live sync with Mojang's official `version_manifest_v2.json` across **Releases**, **Snapshots**, **Old Beta**, and **Old Alpha**, with 12-stage SHA-1 verified downloading, HTTP `Range` `.part` resumption, native `.dll`/`.so` extraction, automatic Java 8/17/21 provisioning, and strict isolation of `vespera-client-1.2.0+mc1.21.4.jar` to Minecraft `1.21.4`.
+6. **Dynamic Official Minecraft Version Manager & Honest Mod Isolation**:
+   - Live sync with Mojang's official `version_manifest_v2.json` across **Releases**, **Snapshots**, **Old Beta**, and **Old Alpha**, with 12-stage SHA-1 verified downloading, HTTP `Range` `.part` resumption, native `.dll`/`.so` extraction, automatic Java 8/17/21 provisioning, and strict isolation of `vespera-client-1.2.1+mc1.21.4.jar` to Minecraft `1.21.4`.
 
 ---
 
-## v1.2.0 Windows 10/11 (x86_64) Release Deliverables
+## v1.2.1 Windows 10/11 (x86_64) Release Deliverables
 
 Build the release artifacts with `npm run build`. The build produces:
 
 | Deliverable | Path |
 | :--- | :--- |
-| **Windows Setup Installer** | `release/VesperaClient-1.2.0-win64-setup.exe` |
+| **Windows Setup Installer** | `release/VesperaClient-1.2.1-win64-setup.exe` |
 | **Native Desktop Launcher** | `release/bin/VesperaClient.exe` |
 | **Native Windows Uninstaller** | `release/bin/VesperaUninstall.exe` |
-| **Custom Fabric Client Mod** | `release/mods/vespera-client-1.2.0+mc1.21.4.jar` |
+| **Custom Fabric Client Mod** | `release/mods/vespera-client-1.2.1+mc1.21.4.jar` |
 | **Windows Application Icon** | `release/vespera.ico` |
 | **Release Checksums** | `release/SHA256SUMS.txt` (SHA-256 for all release binaries) |
 

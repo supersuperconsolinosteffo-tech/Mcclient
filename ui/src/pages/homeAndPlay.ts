@@ -534,9 +534,10 @@ export function renderPlayPage(
                 ? 'Live Mojang Piston Manifest (version_manifest_v2.json)'
                 : snap.manifestSource === 'local_cache'
                   ? 'Cached Mojang Manifest (version_manifest_v2.json)'
-                  : 'Embedded Official Mojang Seed (Click Refresh when online for all 850+ versions)'
+                  : 'Offline catalogue fallback — Vespera refreshes the official Mojang manifest before installation'
             )}</code>
           </div>
+          ${snap.manifestError ? `<div role="status" style="margin-top:6px;color:var(--accent-red);font-size:11.5px;max-width:650px">Manifest refresh failed: ${escapeHtml(snap.manifestError)}</div>` : ''}
         </div>
 
         <div style="display:flex;gap:6px;flex-wrap:wrap">

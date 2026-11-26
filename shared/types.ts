@@ -573,6 +573,7 @@ export interface AppStateSnapshot {
   latestReleaseId?: string;
   latestSnapshotId?: string;
   manifestSource?: 'live_mojang' | 'local_cache' | 'embedded_seed';
+  manifestError?: string | null;
   activeDownload?: VersionDownloadProgress | null;
   javaRuntimes: JavaRuntimeInfo[];
   profiles: ClientProfile[];

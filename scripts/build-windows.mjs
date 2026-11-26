@@ -44,7 +44,7 @@ if (!fs.existsSync(path.join(ROOT, 'native/resources/vespera.ico'))) {
 }
 console.log('[build-windows] Building fresh Vite UI bundle...');
 execFileSync('npm', ['run', 'build:ui'], { stdio: 'inherit' });
-const modJarPath = path.join(RELEASE_DIR, 'mods/vespera-client-1.2.0+mc1.21.4.jar');
+const modJarPath = path.join(RELEASE_DIR, 'mods/vespera-client-1.2.1+mc1.21.4.jar');
 if (!fs.existsSync(modJarPath)) {
   execFileSync('node', ['scripts/build-mod.mjs'], { stdio: 'inherit' });
 }
@@ -120,7 +120,7 @@ const defaultJsonStr = execFileSync(
      if (fs.existsSync('./docs/BENCHMARK_LATEST.json')) {
        snap.latestBenchmark = JSON.parse(fs.readFileSync('./docs/BENCHMARK_LATEST.json', 'utf8'));
      }
-     snap.recentLogs = ['[00:00:00] Vespera Client v1.2.0 Native Windows Engine Ready.'];
+     snap.recentLogs = ['[00:00:00] Vespera Client v1.2.1 Native Windows Engine Ready.'];
      c.shutdownCleanly();
      process.stdout.write(JSON.stringify(snap));`,
   ],
@@ -138,7 +138,7 @@ fs.writeFileSync(
   )
 );
 
-// 4. Embed vespera-client-1.2.0+mc1.21.4.jar
+// 4. Embed vespera-client-1.2.1+mc1.21.4.jar
 const modJarBuf = fs.readFileSync(modJarPath);
 fs.writeFileSync(
   path.join(OBJ_DIR, 'embedded_mod.h'),
@@ -230,8 +230,8 @@ execFileSync(
   { stdio: 'inherit' }
 );
 
-// 8. Generate setup_payload.h with SHA-256 checksums and compile VesperaClient-1.2.0-win64-setup.exe
-console.log('[build-windows] Packaging SHA-256 verified payload into VesperaClient-1.2.0-win64-setup.exe...');
+// 8. Generate setup_payload.h with SHA-256 checksums and compile VesperaClient-1.2.1-win64-setup.exe
+console.log('[build-windows] Packaging SHA-256 verified payload into VesperaClient-1.2.1-win64-setup.exe...');
 const launcherBytes = fs.readFileSync(launcherExePath);
 const uninstallBytes = fs.readFileSync(uninstallExePath);
 const iconBytes = fs.readFileSync(path.join(resDir, 'vespera.ico'));
@@ -271,12 +271,12 @@ const setupPayloadHeader = [
 
 fs.writeFileSync(path.join(OBJ_DIR, 'setup_payload.h'), setupPayloadHeader);
 
-for (const oldVer of ['1.0.0', '1.1.0', '1.1.1']) {
+for (const oldVer of ['1.0.0', '1.1.0', '1.1.1', '1.2.0']) {
   const oldSetup = path.join(RELEASE_DIR, `VesperaClient-${oldVer}-win64-setup.exe`);
   if (fs.existsSync(oldSetup)) fs.unlinkSync(oldSetup);
 }
 
-const setupExePath = path.join(RELEASE_DIR, 'VesperaClient-1.2.0-win64-setup.exe');
+const setupExePath = path.join(RELEASE_DIR, 'VesperaClient-1.2.1-win64-setup.exe');
 execFileSync(
   ZIG_PY,
   [
@@ -318,10 +318,10 @@ const modSha = crypto.createHash('sha256').update(modJarBuf).digest('hex');
 const iconSha = crypto.createHash('sha256').update(iconBytes).digest('hex');
 
 const checksumLines = [
-  `${setupSha}  VesperaClient-1.2.0-win64-setup.exe`,
+  `${setupSha}  VesperaClient-1.2.1-win64-setup.exe`,
   `${launcherSha}  bin/VesperaClient.exe`,
   `${uninstallSha}  bin/VesperaUninstall.exe`,
-  `${modSha}  mods/vespera-client-1.2.0+mc1.21.4.jar`,
+  `${modSha}  mods/vespera-client-1.2.1+mc1.21.4.jar`,
   `${iconSha}  vespera.ico`,
   '',
 ].join('\n');

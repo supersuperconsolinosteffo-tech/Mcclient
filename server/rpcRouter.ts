@@ -184,7 +184,8 @@ export async function dispatchRpcMethod(
     // --- Part 3 & 4: Dynamic Version Manager, Installer, Repair & Deletion ---
     case 'syncVersions': {
       await coordinator.launcherService.syncOfficialVersionManifest(
-        coordinator.getSnapshot().settings.gameDataDir
+        coordinator.getSnapshot().settings.gameDataDir,
+        { force: true }
       );
       return coordinator.getSnapshot();
     }

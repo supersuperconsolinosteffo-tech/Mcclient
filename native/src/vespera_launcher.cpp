@@ -198,6 +198,8 @@ public:
     json activeDownloadState = nullptr;
     std::string activeSessionMode = "online_authenticated";
     std::string manifestSource = "embedded_seed";
+    std::string manifestError;
+    int64_t manifestFetchedAtMs = 0;
     std::string latestReleaseId = "1.21.4";
     std::string latestSnapshotId = "25w09b";
 
@@ -326,7 +328,7 @@ public:
         if (state["profiles"].empty()) state["profiles"] = defaults["profiles"];
         if (state["versions"].empty()) state["versions"] = defaults["versions"];
         if (state["hudLayouts"].empty()) state["hudLayouts"] = defaults["hudLayouts"];
-        // Always refresh curatedCatalog to v1.2.0 definitions
+        // Always refresh curatedCatalog to v1.2.1 definitions
         state["curatedCatalog"] = defaults["curatedCatalog"];
         if (!state.contains("settings") || !state["settings"].is_object()) {
             state["settings"] = defaults["settings"];
@@ -345,7 +347,7 @@ public:
             bool vesperaOk = (p["loader"] == "fabric" && p.value("mcVersion", "") == "1.21.4");
             p["vesperaModCompatible"] = vesperaOk;
         }
-        state["version"] = "1.2.0";
+        state["version"] = "1.2.1";
         state["platformMode"] = "windows_native_webview2";
     }
 
@@ -358,10 +360,10 @@ public:
         }
         write_text_atomic(crashLockPath, "{\"active\":true}");
 
-        fs::path targetMod = modsPoolDir / "vespera-client-1.2.0+mc1.21.4.jar";
+        fs::path targetMod = modsPoolDir / "vespera-client-1.2.1+mc1.21.4.jar";
         if (!fs::exists(targetMod)) {
             write_file_atomic(targetMod, kEmbeddedModJarData, kEmbeddedModJarSize);
-            appendLog("[FirstLaunch] Provisioned verified vespera-client-1.2.0+mc1.21.4.jar to managed mods pool.");
+            appendLog("[FirstLaunch] Provisioned verified vespera-client-1.2.1+mc1.21.4.jar to managed mods pool.");
         }
 
         json defaults = json::parse(kDefaultSnapshotJson);
@@ -370,7 +372,7 @@ public:
                 state = json::parse(read_text_file(statePath));
                 sanitizeLoadedState(defaults);
                 saveState();
-                appendLog("[Core] Loaded and verified Vespera Client v1.2.0 Windows configuration.");
+                appendLog("[Core] Loaded and verified Vespera Client v1.2.1 Windows configuration.");
                 return;
             } catch (...) {
                 appendLog("[CrashRecovery] State file corrupted; restoring verified factory configuration.");
@@ -386,22 +388,197 @@ public:
         appendLog("[FirstLaunch] Initialized managed %APPDATA%\\VesperaClient workspace.");
     }
 
+    static bool isSha1Hex(const std::string& value) {
+        return value.size() == 40 && std::all_of(value.begin(), value.end(), [](unsigned char c) { return std::isxdigit(c) != 0; });
+    }
+
+    bool validateOfficialManifest(const json& raw, std::string& why) const {
+        if (!raw.is_object() || !raw.contains("versions") || !raw["versions"].is_array() || raw["versions"].empty()) {
+            why = "Invalid JSON: Mojang manifest has no versions array."; return false;
+        }
+        std::set<std::string> ids;
+        for (const auto& entry : raw["versions"]) {
+            if (!entry.is_object()) { why = "Invalid JSON: non-object version entry."; return false; }
+            const std::string id = entry.value("id", "");
+            const std::string url = entry.value("url", "");
+            const std::string sha1 = entry.value("sha1", "");
+            if (id.empty() || !ids.insert(id).second || url.rfind("https://", 0) != 0 || !isSha1Hex(sha1) || entry.value("releaseTime", "").empty()) {
+                why = "Invalid JSON: manifest entry must contain a unique version ID, HTTPS metadata URL, release time, and 40-character SHA-1."; return false;
+            }
+        }
+        return true;
+    }
+
+    bool validateVersionMetadata(const json& meta, const std::string& expectedId, std::string& why) const {
+        if (!meta.is_object() || meta.value("id", "") != expectedId || !meta.contains("mainClass") ||
+            !meta["mainClass"].is_string() || meta["mainClass"].get<std::string>().empty() ||
+            !meta.contains("downloads") || !meta["downloads"].is_object() || !meta["downloads"].contains("client") ||
+            !meta["downloads"]["client"].is_object() || !meta.contains("libraries") || !meta["libraries"].is_array() ||
+            !meta.contains("assetIndex") || !meta["assetIndex"].is_object()) {
+            why = "Invalid version metadata for " + expectedId + ": exact version ID, mainClass, or client download record is missing."; return false;
+        }
+        const auto& client = meta["downloads"]["client"];
+        if (client.value("url", "").rfind("https://", 0) != 0 || !isSha1Hex(client.value("sha1", ""))) {
+            why = "Invalid version metadata for " + expectedId + ": client JAR URL or SHA-1 is invalid."; return false;
+        }
+        if (meta.contains("libraries") && !meta["libraries"].is_array()) {
+            why = "Invalid version metadata for " + expectedId + ": libraries is not an array."; return false;
+        }
+        if (meta.contains("assetIndex")) {
+            const auto& idx = meta["assetIndex"];
+            if (!idx.is_object() || idx.value("id", "").empty() || idx.value("url", "").rfind("https://", 0) != 0 || !isSha1Hex(idx.value("sha1", ""))) {
+                why = "Invalid version metadata for " + expectedId + ": asset index URL or SHA-1 is invalid."; return false;
+            }
+        }
+        return true;
+    }
+
+    int64_t nowEpochMs() const {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    bool manifestIsFresh() const {
+        const int64_t age = nowEpochMs() - manifestFetchedAtMs;
+        return manifestSource != "embedded_seed" && manifestFetchedAtMs > 0 && age >= 0 && age < 6LL * 60 * 60 * 1000;
+    }
+
     void loadCachedManifestIfPresent() {
-        fs::path mfPath = cacheDir / "version_manifest_v2.json";
-        if (!fs::exists(mfPath)) return;
+        const fs::path manifestPath = cacheDir / "version_manifest_v2.json";
+        if (!fs::exists(manifestPath)) return;
         try {
-            json raw = json::parse(read_text_file(mfPath));
-            applyRawMojangManifest(raw, "local_cache");
+            json raw = json::parse(read_text_file(manifestPath), nullptr, false);
+            std::string why;
+            if (!raw.is_discarded() && validateOfficialManifest(raw, why)) {
+                applyRawMojangManifest(raw, "local_cache");
+                const fs::path infoPath = cacheDir / "version_manifest_v2.info.json";
+                if (fs::exists(infoPath)) {
+                    json info = json::parse(read_text_file(infoPath), nullptr, false);
+                    if (info.is_object()) manifestFetchedAtMs = info.value("fetchedAt", int64_t(0));
+                }
+                return;
+            }
         } catch (...) {}
+        std::error_code ec;
+        fs::remove(manifestPath, ec);
+        fs::remove(cacheDir / "version_manifest_v2.info.json", ec);
+        manifestFetchedAtMs = 0;
+        appendLog("[VersionManager] Discarded corrupted/incomplete Mojang manifest cache; retaining offline catalogue fallback.");
+    }
+
+    bool refreshOfficialManifest(bool force) {
+        if (!force && manifestIsFresh()) return true;
+        const std::string url = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
+        HttpResponse response = winhttp_request("GET", url);
+        if (response.statusCode != 200) {
+            manifestError = response.statusCode > 0
+                ? "HTTP " + std::to_string(response.statusCode) + " fetching official Mojang version manifest " + url
+                : (response.error.empty() ? "Network failure fetching official Mojang version manifest " + url : response.error);
+            return false;
+        }
+        json raw = json::parse(response.body, nullptr, false);
+        std::string why;
+        if (raw.is_discarded() || !validateOfficialManifest(raw, why)) {
+            manifestError = raw.is_discarded() ? "Invalid JSON from official Mojang version manifest " + url : why + " URL: " + url;
+            return false;
+        }
+        try {
+            if (!write_text_atomic(cacheDir / "version_manifest_v2.json", response.body)) throw std::runtime_error("manifest cache write failed");
+            manifestFetchedAtMs = nowEpochMs();
+            if (!write_text_atomic(cacheDir / "version_manifest_v2.info.json", json({{"fetchedAt", manifestFetchedAtMs}, {"url", url}}).dump(2))) throw std::runtime_error("manifest cache metadata write failed");
+            applyRawMojangManifest(raw, "live_mojang");
+            manifestError.clear();
+            return true;
+        } catch (const std::exception& ex) {
+            manifestError = std::string("Could not atomically cache official Mojang manifest: ") + ex.what();
+            manifestFetchedAtMs = 0;
+            return false;
+        }
+    }
+
+    json* findManifestEntry(const std::string& versionId) {
+        if (manifestSource == "embedded_seed") return nullptr;
+        if (!state.contains("versions") || !state["versions"].is_array()) return nullptr;
+        for (auto& entry : state["versions"]) if (entry.value("id", "") == versionId) return &entry;
+        return nullptr;
+    }
+
+    bool loadVerifiedCachedMetadata(const std::string& versionId, const fs::path& metaPath,
+                                    const std::string& manifestSha1, json& outMeta, std::string& why) {
+        std::error_code ec;
+        if (!fs::exists(metaPath, ec)) return false;
+        std::string expectedSha1 = manifestSha1;
+        fs::path sidecar = metaPath; sidecar += ".cache.json";
+        if (expectedSha1.empty() && fs::exists(sidecar, ec)) {
+            json info = json::parse(read_text_file(sidecar), nullptr, false);
+            if (info.is_object()) expectedSha1 = info.value("sha1", "");
+        }
+        const std::string actualSha1 = bcrypt_hash_file(metaPath, BCRYPT_SHA1_ALGORITHM);
+        if (!isSha1Hex(expectedSha1) || _stricmp(actualSha1.c_str(), expectedSha1.c_str()) != 0) {
+            why = "SHA-1 mismatch or unavailable for cached version metadata " + versionId + ".";
+            fs::remove(metaPath, ec); fs::remove(sidecar, ec); return false;
+        }
+        outMeta = json::parse(read_text_file(metaPath), nullptr, false);
+        if (outMeta.is_discarded() || !validateVersionMetadata(outMeta, versionId, why)) {
+            if (why.empty()) why = "Invalid JSON in cached version metadata " + versionId + ".";
+            fs::remove(metaPath, ec); fs::remove(sidecar, ec); return false;
+        }
+        return true;
+    }
+
+    bool downloadVersionMetadata(const std::string& versionId, const fs::path& metaPath,
+                                 std::string& metadataUrl, std::string& expectedSha1,
+                                 std::string& outError) {
+        json* entry = findManifestEntry(versionId);
+        if (!entry) {
+            outError = "Version " + versionId + " is absent from the official Mojang manifest." + (manifestError.empty() ? "" : " Manifest diagnostic: " + manifestError);
+            return false;
+        }
+        metadataUrl = entry->value("manifestUrl", "");
+        expectedSha1 = entry->value("sha1", "");
+        if (metadataUrl.empty() || !isSha1Hex(expectedSha1)) {
+            outError = "Invalid official manifest entry for " + versionId + ": metadata URL and SHA-1 are required.";
+            return false;
+        }
+        auto downloadAt = [&](const std::string& url, const std::string& hash) {
+            if (!winhttp_download_verified(url, metaPath, hash, true, &cancelDownloadFlag, [](size_t) {}, outError)) return false;
+            json meta = json::parse(read_text_file(metaPath), nullptr, false);
+            std::string why;
+            if (meta.is_discarded() || !validateVersionMetadata(meta, versionId, why)) {
+                outError = meta.is_discarded() ? "Invalid JSON for Minecraft " + versionId + " metadata from " + url : why + " URL: " + url;
+                std::error_code ec; fs::remove(metaPath, ec); return false;
+            }
+            if (!write_text_atomic(fs::path(metaPath.string() + ".cache.json"), json({{"url", url}, {"sha1", hash}, {"fetchedAt", nowEpochMs()}}).dump(2))) {
+                outError = "Could not atomically cache verified metadata for Minecraft " + versionId + ".";
+                std::error_code ec; fs::remove(metaPath, ec);
+                return false;
+            }
+            return true;
+        };
+        if (downloadAt(metadataUrl, expectedSha1)) return true;
+        if (outError.rfind("HTTP 404", 0) != 0) return false;
+        const std::string oldUrl = metadataUrl;
+        refreshOfficialManifest(true);
+        entry = findManifestEntry(versionId); // exact ID from freshly fetched official manifest
+        if (!entry) {
+            outError = "Mojang metadata HTTP 404 for Minecraft " + versionId + ": " + oldUrl + " (HTTP 404) after official manifest refresh." + (manifestError.empty() ? "" : " " + manifestError);
+            return false;
+        }
+        metadataUrl = entry->value("manifestUrl", "");
+        expectedSha1 = entry->value("sha1", "");
+        if (metadataUrl.empty() || !isSha1Hex(expectedSha1)) {
+            outError = "Mojang metadata HTTP 404 for Minecraft " + versionId + ": refreshed entry lacks URL or SHA-1.";
+            return false;
+        }
+        if (downloadAt(metadataUrl, expectedSha1)) return true;
+        if (outError.rfind("HTTP 404", 0) == 0) outError = "Mojang metadata HTTP 404 for Minecraft " + versionId + ": " + metadataUrl + " (HTTP 404) after manifest refresh.";
+        return false;
     }
 
     void applyRawMojangManifest(const json& raw, const std::string& src) {
-        if (!raw.is_object() || !raw.contains("versions") || !raw["versions"].is_array()) return;
+        std::string why;
+        if (!validateOfficialManifest(raw, why)) return;
         json arr = json::array();
-        for (const auto& e : raw["versions"]) {
-            if (!e.is_object() || e.value("id", "").empty() || e.value("url", "").empty()) continue;
-            arr.push_back(classify_mojang_entry_cpp(e));
-        }
+        for (const auto& e : raw["versions"]) arr.push_back(classify_mojang_entry_cpp(e));
         if (!arr.empty()) {
             state["versions"] = arr;
             manifestSource = src;
@@ -455,7 +632,21 @@ public:
         fs::path jar = vDir / (verId + ".jar");
         fs::path partJar = vDir / (verId + ".jar.part");
         fs::path meta = vDir / (verId + ".json");
-        if (fs::exists(receipt, ec) && fs::exists(jar, ec) && fs::file_size(jar, ec) > 0) return "ready";
+        if (fs::exists(receipt, ec) && fs::exists(jar, ec) && fs::file_size(jar, ec) > 0 && fs::exists(meta, ec)) {
+            json record = json::parse(read_text_file(receipt), nullptr, false);
+            if (record.is_object() && record.value("versionId", "") == verId && record.contains("verifiedHashes") && record["verifiedHashes"].is_object()) {
+                bool complete = true;
+                for (auto it = record["verifiedHashes"].begin(); it != record["verifiedHashes"].end(); ++it) {
+                    fs::path artifact = getGameRootDir() / fs::u8path(it.key());
+                    if (!fs::exists(artifact, ec) || fs::file_size(artifact, ec) == 0 ||
+                        _stricmp(bcrypt_hash_file(artifact, BCRYPT_SHA1_ALGORITHM).c_str(), it.value().get<std::string>().c_str()) != 0) {
+                        complete = false; break;
+                    }
+                }
+                if (complete && record.contains("verifiedAssets") && record["verifiedAssets"].is_array() &&
+                    record.contains("verifiedLibraryFiles") && record["verifiedLibraryFiles"].is_array()) return "ready";
+            }
+        }
         if (fs::exists(partJar, ec) || fs::exists(jar, ec)) return "partially_downloaded";
         if (fs::exists(meta, ec)) return "metadata_cached";
         return "not_installed";
@@ -676,7 +867,7 @@ public:
             publicAccs.push_back(acc);
             if (acc.value("active", false)) activeAccId = acc.value("id", "");
         }
-        state["version"] = "1.2.0";
+        state["version"] = "1.2.1";
         state["accounts"] = publicAccs;
         state["activeAccountId"] = activeAccId.empty() ? json(nullptr) : json(activeAccId);
         state["oauthConfig"] = {
@@ -692,6 +883,7 @@ public:
         state["latestReleaseId"] = latestReleaseId;
         state["latestSnapshotId"] = latestSnapshotId;
         state["manifestSource"] = manifestSource;
+        state["manifestError"] = manifestError.empty() ? json(nullptr) : json(manifestError);
         state["activeDownload"] = activeDownloadState;
         state["recentLogs"] = logs;
 
@@ -835,8 +1027,8 @@ public:
             }
 
             // Provision custom 1.21.4 mod ONLY on Fabric 1.21.4 when enabled
-            fs::path srcMod = modsPoolDir / "vespera-client-1.2.0+mc1.21.4.jar";
-            fs::path dstMod = instDir / "mods" / "vespera-client-1.2.0+mc1.21.4.jar";
+            fs::path srcMod = modsPoolDir / "vespera-client-1.2.1+mc1.21.4.jar";
+            fs::path dstMod = instDir / "mods" / "vespera-client-1.2.1+mc1.21.4.jar";
             if (mcVer == "1.21.4" && enabledSet.count("vespera-client") > 0 && fs::exists(srcMod)) {
                 if (!fs::exists(dstMod)) {
                     fs::copy_file(srcMod, dstMod, fs::copy_options::overwrite_existing, ec);
@@ -933,9 +1125,7 @@ public:
         fs::create_directories(assetsRoot / "objects", ec);
         fs::create_directories(nativesDir, ec);
 
-        if (forceRepair && fs::exists(receiptPath, ec)) {
-            fs::remove(receiptPath, ec);
-        }
+        if (fs::exists(receiptPath, ec)) fs::remove(receiptPath, ec);
 
         auto startTime = std::chrono::steady_clock::now();
         size_t bytesDownloaded = 0;
@@ -968,48 +1158,48 @@ public:
             };
         };
 
-        updateDlState("downloading", "Fetching Mojang metadata for Minecraft " + verId + "...", 3);
-
-        std::string manifestUrl;
-        std::string expectedMetaSha1;
-        for (const auto& v : state["versions"]) {
-            if (v.value("id", "") == verId) {
-                manifestUrl = v.value("manifestUrl", "");
-                expectedMetaSha1 = v.value("sha1", "");
-                break;
-            }
-        }
-        if (manifestUrl.empty()) {
-            HttpResponse mr = winhttp_request("GET", "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json");
-            if (mr.statusCode == 200) {
-                write_text_atomic(cacheDir / "version_manifest_v2.json", mr.body);
-                applyRawMojangManifest(json::parse(mr.body, nullptr, false), "live_mojang");
-                for (const auto& v : state["versions"]) {
-                    if (v.value("id", "") == verId) {
-                        manifestUrl = v.value("manifestUrl", "");
-                        expectedMetaSha1 = v.value("sha1", "");
-                        break;
-                    }
-                }
-            }
-        }
-
-        fs::path metaPath = vDir / (verId + ".json");
-        std::string dlErr;
-        if (!manifestUrl.empty() && (forceRepair || !fs::exists(metaPath, ec))) {
-            if (!winhttp_download_verified(manifestUrl, metaPath, expectedMetaSha1, verifyHashes, &cancelDownloadFlag,
-                                           [&](size_t n) { bytesDownloaded += n; }, dlErr)) {
-                updateDlState("failed", dlErr, 0, dlErr);
-                throw std::runtime_error(dlErr);
-            }
-        }
-        if (!fs::exists(metaPath, ec)) {
-            std::string err = "Version metadata unavailable offline for " + verId;
+        updateDlState("downloading", "Refreshing/validating official Mojang metadata for Minecraft " + verId + "...", 3);
+        refreshOfficialManifest(true); // online install must consult the authoritative manifest; cached data is offline fallback only
+        json* manifestEntry = findManifestEntry(verId);
+        std::string manifestUrl = manifestEntry ? manifestEntry->value("manifestUrl", "") : "";
+        std::string expectedMetaSha1 = manifestEntry ? manifestEntry->value("sha1", "") : "";
+        if (manifestSource == "live_mojang" && !manifestEntry) {
+            std::string err = "Minecraft " + verId + " is not present in the current official Mojang version manifest.";
             updateDlState("failed", err, 0, err);
             throw std::runtime_error(err);
         }
+        fs::path metaPath = vDir / (verId + ".json");
+        std::string dlErr;
+        json meta;
+        bool haveVerifiedMeta = !forceRepair && loadVerifiedCachedMetadata(verId, metaPath, expectedMetaSha1, meta, dlErr);
+        if (!haveVerifiedMeta) {
+            if (manifestUrl.empty() || !isSha1Hex(expectedMetaSha1)) {
+                std::string err = "Cannot install Minecraft " + verId + ": official manifest did not provide a trusted metadata URL and SHA-1." +
+                    (manifestError.empty() ? "" : " Manifest diagnostic: " + manifestError);
+                updateDlState("failed", err, 0, err);
+                throw std::runtime_error(err);
+            }
+            if (!downloadVersionMetadata(verId, metaPath, manifestUrl, expectedMetaSha1, dlErr)) {
+                updateDlState("failed", dlErr, 0, dlErr);
+                std::error_code rmEc; fs::remove(receiptPath, rmEc);
+                throw std::runtime_error(dlErr);
+            }
+            meta = json::parse(read_text_file(metaPath), nullptr, false);
+        }
+        if (expectedMetaSha1.empty()) {
+            fs::path metaSidecar = metaPath; metaSidecar += ".cache.json";
+            json cachedInfo = fs::exists(metaSidecar, ec) ? json::parse(read_text_file(metaSidecar), nullptr, false) : json(nullptr);
+            if (cachedInfo.is_object()) expectedMetaSha1 = cachedInfo.value("sha1", "");
+        }
+        std::string metadataWhy;
+        if (meta.is_discarded() || !validateVersionMetadata(meta, verId, metadataWhy)) {
+            std::string err = meta.is_discarded() ? "Invalid JSON for Minecraft " + verId + " version metadata." : metadataWhy;
+            updateDlState("failed", err, 0, err);
+            std::error_code rmEc; fs::remove(receiptPath, rmEc);
+            throw std::runtime_error(err);
+        }
+        if (fs::exists(metaPath, ec)) bytesDownloaded += static_cast<size_t>(fs::file_size(metaPath, ec));
 
-        json meta = json::parse(read_text_file(metaPath));
         int javaMajor = meta.contains("javaVersion") ? meta["javaVersion"].value("majorVersion", 21) : infer_java_major_cpp(verId, "release", "");
 
         struct ItemPlan {
@@ -1021,6 +1211,10 @@ public:
         };
         std::vector<ItemPlan> plan;
         json verifiedLibs = json::array();
+        json verifiedAssets = json::array();
+        json verifiedHashes = json::object();
+        json verifiedLibraryFiles = json::array();
+        fs::path assetIndexPath;
         std::vector<fs::path> nativeJars;
 
         std::string clientUrl = meta["downloads"]["client"].value("url", "");
@@ -1038,6 +1232,7 @@ public:
                     bool isNat = (name.find(":natives-windows") != std::string::npos);
                     fs::path d = libRoot / fs::u8path(rel);
                     plan.push_back({isNat ? "native_jar" : "library", art.value("url", ""), d, art.value("sha1", ""), art.value("size", 64000ULL)});
+                    verifiedLibraryFiles.push_back(d.lexically_relative(gameRoot).generic_string());
                     if (isNat) nativeJars.push_back(d);
                     else verifiedLibs.push_back(rel);
                 }
@@ -1051,6 +1246,7 @@ public:
                         std::string rel = nat.value("path", maven_coord_to_rel_path(name + ":" + key));
                         fs::path d = libRoot / fs::u8path(rel);
                         plan.push_back({"native_jar", nat.value("url", ""), d, nat.value("sha1", ""), nat.value("size", 128000ULL)});
+                        verifiedLibraryFiles.push_back(d.lexically_relative(gameRoot).generic_string());
                         nativeJars.push_back(d);
                     }
                 }
@@ -1060,25 +1256,33 @@ public:
         std::string assetIndexId = meta.contains("assetIndex") ? meta["assetIndex"].value("id", "legacy") : meta.value("assets", "legacy");
         if (meta.contains("assetIndex") && meta["assetIndex"].contains("url")) {
             fs::path idxPath = assetsRoot / "indexes" / (assetIndexId + ".json");
+            assetIndexPath = idxPath;
             if (!winhttp_download_verified(meta["assetIndex"].value("url", ""), idxPath,
-                                           meta["assetIndex"].value("sha1", ""), verifyHashes, &cancelDownloadFlag,
+                                           meta["assetIndex"].value("sha1", ""), true, &cancelDownloadFlag,
                                            [&](size_t n) { bytesDownloaded += n; }, dlErr)) {
+                dlErr = "Missing asset index " + assetIndexId + ": " + dlErr;
                 updateDlState("failed", dlErr, 0, dlErr);
                 throw std::runtime_error(dlErr);
             }
             json idxJson = json::parse(read_text_file(idxPath), nullptr, false);
-            if (idxJson.is_object() && idxJson.contains("objects") && idxJson["objects"].is_object()) {
+            if (idxJson.is_discarded() || !idxJson.is_object() || !idxJson.contains("objects") || !idxJson["objects"].is_object()) {
+                std::string err = "Invalid JSON or schema for asset index " + assetIndexId + " from " + meta["assetIndex"].value("url", "");
+                updateDlState("failed", err, 0, err);
+                throw std::runtime_error(err);
+            }
+            {
                 for (auto& [logicalName, obj] : idxJson["objects"].items()) {
                     std::string h = obj.value("hash", "");
-                    if (h.size() < 2) continue;
+                    if (!isSha1Hex(h)) {
+                        std::string err = "Invalid asset index " + assetIndexId + ": malformed SHA-1 for asset " + logicalName;
+                        updateDlState("failed", err, 0, err);
+                        throw std::runtime_error(err);
+                    }
                     std::string pfx = h.substr(0, 2);
-                    plan.push_back({
-                        "asset",
-                        "https://resources.download.minecraft.net/" + pfx + "/" + h,
-                        assetsRoot / "objects" / pfx / h,
-                        h,
-                        obj.value("size", 4096ULL)
-                    });
+                    fs::path assetPath = assetsRoot / "objects" / pfx / h;
+                    plan.push_back({"asset", "https://resources.download.minecraft.net/" + pfx + "/" + h,
+                                    assetPath, h, obj.value("size", 4096ULL)});
+                    verifiedAssets.push_back(assetPath.lexically_relative(gameRoot).generic_string());
                 }
             }
         }
@@ -1096,7 +1300,14 @@ public:
                 throw std::runtime_error(dlErr);
             }
             json fabJson = json::parse(read_text_file(fabPath), nullptr, false);
-            if (fabJson.is_object()) {
+            if (fabJson.is_discarded() || !fabJson.is_object() || !fabJson.contains("mainClass") ||
+                !fabJson["mainClass"].is_string() || fabJson["mainClass"].get<std::string>().empty() ||
+                !fabJson.contains("libraries") || !fabJson["libraries"].is_array()) {
+                std::string err = "Invalid Fabric profile metadata from " + fabUrl + " for Minecraft " + verId;
+                updateDlState("failed", err, 0, err);
+                throw std::runtime_error(err);
+            }
+            {
                 mainClass = fabJson.value("mainClass", "net.fabricmc.loader.impl.launch.knot.Client");
                 if (fabJson.contains("libraries") && fabJson["libraries"].is_array()) {
                     for (const auto& fl : fabJson["libraries"]) {
@@ -1105,13 +1316,23 @@ public:
                         std::string baseRepo = fl.value("url", "https://maven.fabricmc.net/");
                         if (!baseRepo.empty() && baseRepo.back() != '/') baseRepo.push_back('/');
                         std::string rel = maven_coord_to_rel_path(fn);
-                        plan.push_back({"fabric_lib", baseRepo + rel, libRoot / fs::u8path(rel), fl.value("sha1", ""), 96000ULL});
+                        fs::path fabricLib = libRoot / fs::u8path(rel);
+                        plan.push_back({"fabric_lib", baseRepo + rel, fabricLib, fl.value("sha1", ""), 96000ULL});
+                        verifiedLibraryFiles.push_back(fabricLib.lexically_relative(gameRoot).generic_string());
                         verifiedLibs.push_back(rel);
                     }
                 }
             }
         }
 
+        for (const auto& item : plan) {
+            if (item.url.rfind("https://", 0) != 0 || !isSha1Hex(item.sha1)) {
+                std::string label = item.kind == "asset" ? "Invalid asset metadata" : (item.kind == "client_jar" ? "Invalid client metadata" : "Invalid library metadata");
+                std::string err = label + " for Minecraft " + verId + ": missing HTTPS URL or valid SHA-1 for " + item.dest.string();
+                updateDlState("failed", err, 0, err);
+                throw std::runtime_error(err);
+            }
+        }
         totalFiles = static_cast<int>(plan.size());
         totalBytes = bytesDownloaded + 1;
         for (const auto& it : plan) totalBytes += std::max<size_t>(1, it.size);
@@ -1124,11 +1345,13 @@ public:
             std::string stageMsg = "Downloading & verifying " + it.kind + " (" + std::to_string(completedFiles + 1) + "/" + std::to_string(totalFiles) + ")...";
             updateDlState("downloading", stageMsg, -1);
             size_t chunkBytes = 0;
-            if (!winhttp_download_verified(it.url, it.dest, it.sha1, verifyHashes, &cancelDownloadFlag,
+            if (!winhttp_download_verified(it.url, it.dest, it.sha1, true, &cancelDownloadFlag,
                                            [&](size_t n) { chunkBytes += n; bytesDownloaded += n; }, dlErr)) {
                 if (cancelDownloadFlag.load()) {
                     updateDlState("partially_downloaded", "Download cancelled — partial progress saved.", -1);
                 } else {
+                    std::string label = it.kind == "asset" ? "Missing asset" : (it.kind == "client_jar" ? "Missing client JAR" : "Missing required library");
+                    dlErr = label + " (" + it.dest.string() + "): " + dlErr;
                     updateDlState("failed", dlErr, -1, dlErr);
                 }
                 throw std::runtime_error(dlErr);
@@ -1155,7 +1378,31 @@ public:
         }
         fs::remove_all(nativesDir / "META-INF", ec);
 
+        for (const auto& item : plan) {
+            if (item.url.empty() || !fs::exists(item.dest, ec) || fs::file_size(item.dest, ec) == 0) {
+                std::string label = item.kind == "asset" ? "Missing asset" : (item.kind == "client_jar" ? "Missing client JAR" : "Missing required library");
+                std::string err = label + " (" + item.dest.string() + "): required artifact was not downloaded.";
+                updateDlState("failed", err, -1, err);
+                throw std::runtime_error(err);
+            }
+            if (!item.sha1.empty()) {
+                std::string got = bcrypt_hash_file(item.dest, BCRYPT_SHA1_ALGORITHM);
+                if (_stricmp(got.c_str(), item.sha1.c_str()) != 0) {
+                    std::string err = "SHA-1 mismatch for " + item.dest.string() + " (expected " + item.sha1 + ", got " + got + ").";
+                    updateDlState("failed", err, -1, err);
+                    throw std::runtime_error(err);
+                }
+                verifiedHashes[item.dest.lexically_relative(gameRoot).generic_string()] = item.sha1;
+            }
+        }
+        if (!assetIndexPath.empty()) verifiedHashes[assetIndexPath.lexically_relative(gameRoot).generic_string()] = meta["assetIndex"].value("sha1", "");
+        verifiedHashes[metaPath.lexically_relative(gameRoot).generic_string()] = expectedMetaSha1;
         std::string finalJarSha1 = bcrypt_hash_file(vDir / (verId + ".jar"), BCRYPT_SHA1_ALGORITHM);
+        if (_stricmp(finalJarSha1.c_str(), clientSha1.c_str()) != 0) {
+            std::string err = "SHA-1 mismatch for Minecraft " + verId + " client JAR (expected " + clientSha1 + ", got " + finalJarSha1 + ").";
+            updateDlState("failed", err, -1, err);
+            throw std::runtime_error(err);
+        }
         json receipt = {
             {"schemaVersion", 1},
             {"versionId", verId},
@@ -1166,6 +1413,9 @@ public:
             {"assetIndexId", assetIndexId},
             {"clientJarSha1", finalJarSha1},
             {"verifiedLibraries", verifiedLibs},
+            {"verifiedLibraryFiles", verifiedLibraryFiles},
+            {"verifiedAssets", verifiedAssets},
+            {"verifiedHashes", verifiedHashes},
             {"nativesExtractedCount", extractedNatives},
             {"installedAt", iso_timestamp_now()}
         };
@@ -1315,13 +1565,14 @@ public:
         for (const auto& a : gameArgs) preview << a.get<std::string>() << " ";
 
         return {
-            {"ready", hasAuth && fs::exists(receiptPath)},
+            {"ready", hasAuth && getVersionInstallStatusOnDisk(mcVer) == "ready"},
             {"profileId", prof["id"]},
             {"mcVersion", mcVer},
             {"loader", loader},
             {"vesperaModActive", loader == "fabric" && mcVer == "1.21.4"},
             {"sessionMode", mode},
             {"javaExecutable", wide_to_utf8(javaw.wstring())},
+            {"javaMajor", javaMajor},
             {"jvmArguments", jvmArgs},
             {"gameArguments", gameArgs},
             {"mainClass", mainClass},
@@ -1446,7 +1697,7 @@ public:
     }
 
     /**
-     * Primary Vespera v1.2.0 Windows Sign-In: OAuth 2.0 Authorization Code + PKCE (`S256`)
+     * Primary Vespera v1.2.1 Windows Sign-In: OAuth 2.0 Authorization Code + PKCE (`S256`)
      * via default system browser (`ShellExecuteW`) + temporary loopback listener (`http://localhost:<port>`).
      */
     json startBrowserPkceAuthNative() {
@@ -2443,11 +2694,7 @@ public:
             return state;
         }
         if (method == "syncVersions") {
-            HttpResponse r = winhttp_request("GET", "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json");
-            if (r.statusCode == 200) {
-                write_text_atomic(cacheDir / "version_manifest_v2.json", r.body);
-                applyRawMojangManifest(json::parse(r.body, nullptr, false), "live_mojang");
-            }
+            refreshOfficialManifest(true);
             refreshTelemetry();
             return state;
         }
@@ -2582,7 +2829,7 @@ public:
             }
 
             json prep = buildLaunchPreparation(prof, mode);
-            int javaMajor = infer_java_major_cpp(mcVer, "release", "");
+            int javaMajor = prep.value("javaMajor", infer_java_major_cpp(mcVer, "release", ""));
             fs::path javaw = fs::u8path(prep.value("javaExecutable", ""));
             if (!fs::exists(javaw)) {
                 if (!provisionAdoptiumJavaIfNeeded(javaMajor)) {
@@ -2667,7 +2914,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
     VesperaNativeEngine engine;
 
     webview::webview w(false, nullptr);
-    w.set_title("Vespera Client v1.2.0 — Precision Minecraft Java Edition Client");
+    w.set_title("Vespera Client v1.2.1 — Precision Minecraft Java Edition Client");
     w.set_size(1340, 860, WEBVIEW_HINT_NONE);
 
     w.bind("vesperaNativeInvoke", [&engine](const std::string& reqArrayJson) -> std::string {
