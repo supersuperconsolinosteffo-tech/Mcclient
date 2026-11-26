@@ -1,4 +1,5 @@
 #include "launch_command.hpp"
+#include "launch_diagnostics.hpp"
 #include <cassert>
 #include <string>
 #include <vector>
@@ -19,5 +20,13 @@ int main() {
                       L"\"-Dgreeting=hello world\" "
                       L"\"arg with \\\"quote\\\"\" "
                       L"\"trailing\\\\\"");
+
+    const std::string crashText = "[INFO] Starting client\njava.lang.RuntimeException: startup failed\nCaused by: java.lang.UnsatisfiedLinkError: missing native";
+    assert(vespera::first_meaningful_exception(crashText) == "java.lang.RuntimeException: startup failed");
+    assert(vespera::first_meaningful_exception("normal startup output\nWindow created").empty());
+    assert(vespera::first_meaningful_exception("Could not find or load main class net.fabricmc.loader.impl.launch.knot.Client") ==
+           "Could not find or load main class net.fabricmc.loader.impl.launch.knot.Client");
+    assert(vespera::first_meaningful_exception("Mixin apply failed for mod example") ==
+           "Mixin apply failed for mod example");
     return 0;
 }

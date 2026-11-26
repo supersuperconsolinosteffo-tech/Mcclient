@@ -63,8 +63,8 @@ The source changes now address the confirmed observability/lifecycle gaps withou
 
 - Launch arguments are built with Windows CRT-compatible quoting for the executable and every argument. The secret token is substituted only into the live process command; the saved command line keeps the metadata placeholder.
 - Before launch, the selected Java executable is inspected for its PE machine architecture and probed using `-version` with a ten-second bound. The reported major must match the metadata major (therefore Java 8/17/21 are selected/checked from the version metadata rather than hard-coded to one game version); this x64 client rejects non-x64 Java because its native libraries are x64.
-- The game starts with stdout and stderr redirected to a combined pipe drained by a background reader thread, capped at 4 MiB and token-redacted before saving. The WebView thread does not wait for game output.
-- Each successful process creation writes `%APPDATA%\VesperaClient\logs\launches\launch-<timestamp>-<pid>.json` and a sibling `.stdout-stderr.log`. The JSON records the version/loader, Java path, expected and reported major, PE architecture, version output, working directory, redacted full command line, PID, process creation result, output-log path, `latest.log` path, crash-report directory and (after observed exit) the actual process exit code/time. The rolling `launcher.log` also gets process-spawn and exit-code events.
+- The game starts with stdout and stderr redirected to separate pipes, each drained by a background reader thread, capped at 4 MiB and token-redacted before saving. The WebView thread does not wait for game output.
+- Each successful process creation writes `%APPDATA%\VesperaClient\logs\launches\launch-<timestamp>-<pid>.json` and sibling `.stdout.log` / `.stderr.log` files. The JSON records version/loader version, Java path and reported major, PE architecture, working directory, redacted full command and classpath, PID, native directory/DLL list, whether `latest.log` and actual crash-report files exist, stdout/stderr paths, and (after observed exit) the actual exit code/time plus a heuristic first-exception candidate. The rolling `launcher.log` also gets process-spawn and exit-code events.
 - `CreateProcessW` now names the Java executable explicitly and returns/logs its Win32 error on failure. A process-handle query failure is logged as an unknown state and does not get misreported as a process exit.
 - After the launch RPC returns, the UI continues refreshing native snapshots while the Java process is monitored. A detected exit is surfaced as a status toast. Success messaging now explicitly says only that Java started; it does not claim Minecraft reached its menu.
 
@@ -73,8 +73,27 @@ The source changes now address the confirmed observability/lifecycle gaps withou
 - “Running” currently means that the Java process handle remains active. The launcher has no authoritative signal that Minecraft has reached the visible main menu. The user must visually confirm that acceptance criterion.
 - Process liveness and exit reporting are refreshed when native snapshots are requested. The UI now polls continuously after Play, but if the launcher itself is closed before the game, it will not write the final exit code.
 - `latest.log` and crash-report paths are recorded, not copied into the launch bundle. They are written by Minecraft when available.
-- The saved output combines stdout and stderr. No stdout/stderr ordering distinction is available in this implementation.
+- stdout and stderr are saved separately; their cross-stream ordering cannot be reconstructed. The first-exception field is a heuristic pointer only, not a root-cause verdict.
 - Java compatibility has been validated by source/build and a parser check for Java 8/17/21 text forms, not by running Windows Java here.
+
+## Follow-up: reported instant exit (logs not present in this checkout)
+
+The user reports that v1.2.5 now shows the process-exited toast without a game window. I searched the repository workspace for `latest.log`, crash reports, `launch-*.json`, and `*.stdout-stderr.log`; none are present. The Windows `%APPDATA%` directory is not mounted into this Linux build workspace, so I cannot inspect the user's actual runtime, command, exit code, Minecraft log, or first exception. **No root cause is established, and no speculative command/classpath/native/graphics fix has been applied.**
+
+For the next Windows run, this revision records separate Java stdout/stderr, the exact redacted classpath and command, metadata-selected Java details, native path and extracted DLL list, actual existence (rather than invented paths) of `latest.log` and crash report files, the process exit code in decimal and hex, and a heuristic exception candidate. It does not claim that an exception candidate is the root cause.
+
+A source-only command audit also confirms that native `buildLaunchPreparation()` hand-assembles a limited game-argument list instead of applying the Mojang metadata `arguments.jvm` / `arguments.game` rule sets. The Node preview service includes `--versionType`; the native Windows path currently does not. The Fabric main class and library list are taken from the installation receipt when present, and the classpath is verified libraries followed by the client JAR with Windows `;` separators. This is a confirmed difference, **not evidence that it caused the observed exit**; I have not changed these arguments without the actual crash output.
+
+Please provide these exact files from the failing Fabric 1.21.4 / Loader 0.16.10 run:
+
+- `%APPDATA%\VesperaClient\logs\launches\launch-<timestamp>-<pid>.json`
+- The matching `.stdout-stderr.log` sibling from the initial 1.2.5 build, or `.stdout.log` and `.stderr.log` if rerun using the updated diagnostic build
+- `%APPDATA%\VesperaClient\logs\launcher.log` (especially `[NativeZip]` lines)
+- The Fabric instance's `logs\latest.log` if it exists; otherwise confirm the diagnostic JSON says `latestLogExists: false`
+- Any actual file under that instance's `crash-reports` directory; otherwise confirm `crashReportFiles` is empty
+- `%APPDATA%\VesperaClient\versions\1.21.4\vespera-install-receipt-fabric.json`
+
+The command line is token-redacted, but review all files before sharing and remove any account secrets. With those artifacts, the first failing stage and whether the cause is JVM, arguments/classpath, Fabric, natives, graphics, or another component can be determined.
 
 ## Reproducible Windows diagnostic and acceptance procedure
 
@@ -83,7 +102,7 @@ These steps use the existing installation/data directory and do not ask you to d
 1. From this branch, run `npm ci` (if dependencies are absent) and `npm run build:windows`. Copy the generated `release/bin/VesperaClient.exe` to a distinct filename such as `VesperaClient-launch-diagnostic.exe`; run it side-by-side rather than uninstalling the existing client. The older `release/VesperaClient-1.2.4-win64-setup.exe` is historical and does not contain this patch.
 2. In the diagnostic launcher, select **Minecraft 1.21.4 / Vanilla**, click Play once, and record whether a window appears and whether the visible main menu is reached. Do not mark process creation as a pass for this criterion.
 3. If the menu appears, close Minecraft through its normal in-game Quit control. Wait for the launcher to report process exit. Repeat the same procedure with **Fabric Loader 0.16.10** selected.
-4. For each run, preserve the matching `%APPDATA%\VesperaClient\logs\launches\launch-*.json`, sibling `*.stdout-stderr.log`, `%APPDATA%\VesperaClient\logs\launcher.log`, and the `latest.log` / crash report paths named in the JSON. These contain the Java executable/version/architecture, redacted arguments, cwd, PID, output and observed exit code. Do not post account tokens or unredacted command lines.
+4. For each run, preserve the matching `%APPDATA%\VesperaClient\logs\launches\launch-*.json`, sibling `*.stdout.log` and `*.stderr.log`, `%APPDATA%\VesperaClient\logs\launcher.log`, and any `latest.log` / crash-report files that actually exist. The JSON explicitly records when those Minecraft files are absent. Also include the installation receipt `versions\1.21.4\vespera-install-receipt-fabric.json` and native extraction lines from `launcher.log`. Do not post account tokens or unredacted command lines.
 5. To independently check an active process in PowerShell while testing, run `Get-Process -Id <PID> -ErrorAction SilentlyContinue | Select-Object Id,ProcessName,StartTime`; after normal Quit it should return no process, while the launch JSON and launcher log should record the actual exit code. Compare that result against the UI status.
 
 Record per mode: `main menu reached (yes/no)`, `normal close detected (yes/no)`, PID, Java major/architecture, process exit code, diagnostic JSON path, output log path, Minecraft latest.log/crash-report result, and any observed stage/error. Do not include tokens in the report.
