@@ -246,7 +246,11 @@ export function renderProfilesPage(snap: AppStateSnapshot, exportedJsonPreview: 
             <select class="select" id="new-prof-version">
               ${snap.versions
                 .filter((v) => v.supportTier !== 'unsupported')
-                .map((v) => `<option value="${escapeHtml(v.id)}">Minecraft ${escapeHtml(v.id)} (${escapeHtml(v.supportTier)})</option>`)
+                .slice(0, 150)
+                .map(
+                  (v) =>
+                    `<option value="${escapeHtml(v.id)}">Minecraft ${escapeHtml(v.id)} (${escapeHtml(v.compatibilityLabel || v.type)})</option>`
+                )
                 .join('')}
             </select>
           </div>

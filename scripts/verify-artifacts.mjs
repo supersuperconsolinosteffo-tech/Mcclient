@@ -54,16 +54,16 @@ function verifyPe64GuiExecutable(filePath, label) {
   );
 }
 
-console.log('=== Verifying Vespera Client Final Release Artifacts ===');
+console.log('=== Verifying Vespera Client v1.1.0 Final Release Artifacts ===');
 
-const setupExe = path.join(ROOT, 'release/VesperaClient-1.0.0-win64-setup.exe');
+const setupExe = path.join(ROOT, 'release/VesperaClient-1.1.0-win64-setup.exe');
 const launcherExe = path.join(ROOT, 'release/bin/VesperaClient.exe');
 const uninstallExe = path.join(ROOT, 'release/bin/VesperaUninstall.exe');
-const modJar = path.join(ROOT, 'release/mods/vespera-client-1.0.0+mc1.21.4.jar');
+const modJar = path.join(ROOT, 'release/mods/vespera-client-1.1.0+mc1.21.4.jar');
 const iconIco = path.join(ROOT, 'release/vespera.ico');
 const sumsFile = path.join(ROOT, 'release/SHA256SUMS.txt');
 
-verifyPe64GuiExecutable(setupExe, 'Windows 64-bit Setup Installer (VesperaClient-1.0.0-win64-setup.exe)');
+verifyPe64GuiExecutable(setupExe, 'Windows 64-bit Setup Installer (VesperaClient-1.1.0-win64-setup.exe)');
 verifyPe64GuiExecutable(launcherExe, 'Windows 64-bit Desktop Launcher (VesperaClient.exe)');
 verifyPe64GuiExecutable(uninstallExe, 'Windows 64-bit Uninstaller (VesperaUninstall.exe)');
 
@@ -87,6 +87,18 @@ const cppSource = fs.readFileSync(path.join(ROOT, 'native/src/vespera_launcher.c
 assert(
   cppSource.includes('state["diagnostics"] = findings;') && !cppSource.includes('"overallHealth"'),
   'Native C++ launcher emits DiagnosticFinding[] array contract for state["diagnostics"]'
+);
+
+// Verify zero manual Client ID input in Accounts UI & zero committed OAuth secrets
+const accountsUiSrc = fs.readFileSync(path.join(ROOT, 'ui/src/pages/accountsSettingsDiagAbout.ts'), 'utf8');
+assert(
+  !accountsUiSrc.includes('msa-client-id-input'),
+  'Accounts UI removes manual end-user Microsoft Client ID input field'
+);
+const oauthReleaseCfg = JSON.parse(fs.readFileSync(path.join(ROOT, 'config/oauth.release.json'), 'utf8'));
+assert(
+  !('clientSecret' in oauthReleaseCfg) && oauthReleaseCfg.clientId !== '00000000-0000-0000-0000-000000000000',
+  'Release OAuth config embeds zero client secrets and zero fake placeholder Client IDs'
 );
 
 // Verify SHA256SUMS.txt

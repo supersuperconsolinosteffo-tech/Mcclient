@@ -21,4 +21,5 @@ mod/build/
 # Secrets & local overrides
 .env
 .env.local
+config/oauth.local.json
 *.dpapi

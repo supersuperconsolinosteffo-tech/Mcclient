@@ -345,8 +345,19 @@ function normalizeProfile(raw: unknown, fallback: ClientProfile): ClientProfile 
     archetype: (typeof raw.archetype === 'string' ? raw.archetype : fallback.archetype) as ClientProfile['archetype'],
     description: asString(raw.description, fallback.description),
     mcVersion: asNonEmptyString(raw.mcVersion, fallback.mcVersion),
-    loader: raw.loader === 'legacy_fabric' ? 'legacy_fabric' : 'fabric',
+    loader:
+      raw.loader === 'vanilla'
+        ? 'vanilla'
+        : raw.loader === 'legacy_fabric'
+          ? 'legacy_fabric'
+          : 'fabric',
     loaderVersion: asNonEmptyString(raw.loaderVersion, fallback.loaderVersion),
+    vesperaModCompatible:
+      typeof raw.vesperaModCompatible === 'boolean'
+        ? raw.vesperaModCompatible
+        : raw.mcVersion === '1.21.4',
+    customJavaPath: typeof raw.customJavaPath === 'string' ? raw.customJavaPath : undefined,
+    customGameDir: typeof raw.customGameDir === 'string' ? raw.customGameDir : undefined,
     performance: {
       ...fallback.performance,
       ...presetPerf,
@@ -465,6 +476,9 @@ export function validateAndNormalizeSnapshot(raw: unknown): AppStateSnapshot {
       ? setRaw.language
       : defaultSettings.language) as LauncherSettings['language'],
     customJvmExtraArgs: asString(setRaw.customJvmExtraArgs, ''),
+    customJavaExecutablePath: asString(setRaw.customJavaExecutablePath, ''),
+    showSnapshotsInVersionList: asBoolean(setRaw.showSnapshotsInVersionList, false),
+    showHistoricalInVersionList: asBoolean(setRaw.showHistoricalInVersionList, false),
     microsoftAzureClientId: asString(setRaw.microsoftAzureClientId, ''),
     crashRecoveryEnabled: asBoolean(setRaw.crashRecoveryEnabled, true),
     firstLaunchCompleted: asBoolean(setRaw.firstLaunchCompleted, false),
@@ -530,11 +544,31 @@ export function validateAndNormalizeSnapshot(raw: unknown): AppStateSnapshot {
       : defaultHudLayouts;
 
   return {
-    version: asNonEmptyString(raw.version, '1.0.0'),
+    version: asNonEmptyString(raw.version, '1.1.0'),
     platformMode:
       raw.platformMode === 'windows_native_webview2'
         ? 'windows_native_webview2'
         : 'node_preview_bridge',
+    oauthConfig: isRecord(raw.oauthConfig)
+      ? {
+          configured: asBoolean(raw.oauthConfig.configured, false),
+          source: (typeof raw.oauthConfig.source === 'string'
+            ? raw.oauthConfig.source
+            : 'unconfigured') as NonNullable<AppStateSnapshot['oauthConfig']>['source'],
+          supportsPkceLoopback: asBoolean(raw.oauthConfig.supportsPkceLoopback, true),
+          supportsDeviceCodeFallback: asBoolean(raw.oauthConfig.supportsDeviceCodeFallback, true),
+          developerSetupDocPath: asNonEmptyString(
+            raw.oauthConfig.developerSetupDocPath,
+            'docs/OAUTH_DEVELOPER_SETUP.md'
+          ),
+        }
+      : undefined,
+    authFlow: isRecord(raw.authFlow)
+      ? (raw.authFlow as unknown as AppStateSnapshot['authFlow'])
+      : undefined,
+    offlineAvailability: isRecord(raw.offlineAvailability)
+      ? (raw.offlineAvailability as unknown as AppStateSnapshot['offlineAvailability'])
+      : undefined,
     accounts: Array.isArray(raw.accounts)
       ? (raw.accounts.filter(isRecord) as unknown as AppStateSnapshot['accounts'])
       : [],
@@ -543,6 +577,17 @@ export function validateAndNormalizeSnapshot(raw: unknown): AppStateSnapshot {
       Array.isArray(raw.versions) && raw.versions.length > 0
         ? (raw.versions.filter(isRecord) as unknown as AppStateSnapshot['versions'])
         : MINECRAFT_VERSION_CATALOG,
+    latestReleaseId: typeof raw.latestReleaseId === 'string' ? raw.latestReleaseId : '1.21.4',
+    latestSnapshotId: typeof raw.latestSnapshotId === 'string' ? raw.latestSnapshotId : undefined,
+    manifestSource:
+      raw.manifestSource === 'live_mojang' ||
+      raw.manifestSource === 'local_cache' ||
+      raw.manifestSource === 'embedded_seed'
+        ? raw.manifestSource
+        : 'embedded_seed',
+    activeDownload: isRecord(raw.activeDownload)
+      ? (raw.activeDownload as unknown as AppStateSnapshot['activeDownload'])
+      : null,
     javaRuntimes: Array.isArray(raw.javaRuntimes)
       ? (raw.javaRuntimes.filter(isRecord) as unknown as AppStateSnapshot['javaRuntimes'])
       : [],

@@ -21,6 +21,7 @@ import {
   bindHomeAndPlayEvents,
   renderHomePage,
   renderPlayPage,
+  type PlayPageFilterState,
 } from './pages/homeAndPlay';
 import {
   bindModsPageEvents,
@@ -50,6 +51,8 @@ interface UiSessionState {
   exportedProfileJson: string;
   authChallenge: DeviceCodeAuthChallenge | null;
   launchPrep: LaunchPreparationReport | null;
+  playFilterState: PlayPageFilterState;
+  installingVersionId: string | null;
   runningBenchmarks: boolean;
   launchingGame: boolean;
 }
@@ -67,6 +70,16 @@ const state: UiSessionState = {
   exportedProfileJson: '',
   authChallenge: null,
   launchPrep: null,
+  playFilterState: {
+    searchQuery: '',
+    showReleases: true,
+    showSnapshots: false,
+    showHistorical: false,
+    installedOnly: false,
+    showNewProfileDrawer: false,
+    fabricLoadersForActive: [],
+  },
+  installingVersionId: null,
   runningBenchmarks: false,
   launchingGame: false,
 };
@@ -79,7 +92,11 @@ const NAV_GROUPS: Array<{
     section: 'Client Core',
     items: [
       { id: 'home', label: 'Home' },
-      { id: 'play', label: 'Play & Versions', badge: (s) => `${s.versions.filter((v) => v.supportTier === 'supported').length}` },
+      {
+        id: 'play',
+        label: 'Play & Versions',
+        badge: (s) => `${s.versions.filter((v) => v.supportTier !== 'unsupported').length}`,
+      },
       { id: 'mods', label: 'Mods & HUD Editor', badge: (s) => `${s.installedMods.length}` },
       { id: 'profiles', label: 'Profiles', badge: (s) => `${s.profiles.length}` },
     ],
@@ -134,7 +151,12 @@ function renderStageContent(snap: AppStateSnapshot): string {
     case 'home':
       return renderHomePage(snap);
     case 'play':
-      return renderPlayPage(snap, state.launchPrep);
+      return renderPlayPage(
+        snap,
+        state.launchPrep,
+        state.playFilterState,
+        state.installingVersionId
+      );
     case 'mods':
       return renderModsPage(
         snap,
@@ -304,12 +326,14 @@ function renderApp(): void {
         </div>
 
         <div>
-          <div style="font-size:10.5px;color:var(--text-muted);font-family:var(--font-mono)">MINECRAFT ACCOUNT</div>
+          <div style="font-size:10.5px;color:var(--text-muted);font-family:var(--font-mono)">MINECRAFT SESSION</div>
           <button class="btn" id="dock-account-btn" style="margin-top:2px">
             ${
-              activeAcc
-                ? `● ${escapeHtml(activeAcc.username)} (Verified MSA)`
-                : '○ Sign In (Microsoft OAuth)'
+              snap.offlineAvailability?.activeSessionMode === 'offline_singleplayer'
+                ? `◐ ${escapeHtml(snap.offlineAvailability.verifiedUsername || 'Verified')} (Offline SP)`
+                : activeAcc && activeAcc.sessionStatus !== 'signed_out'
+                  ? `● ${escapeHtml(activeAcc.username)} (Verified MSA)`
+                  : '○ Sign in with Microsoft'
             }
           </button>
         </div>
@@ -317,13 +341,30 @@ function renderApp(): void {
 
       <div style="display:flex;align-items:center;gap:14px">
         <div style="text-align:right;font-size:11.5px;color:var(--text-secondary)">
-          <div><strong>Fabric ${escapeHtml(activeProfile.loaderVersion)}</strong> · ${activeProfile.enabledModIds.length} Verified Mods</div>
+          <div>
+            <strong>${
+              activeProfile.loader === 'vanilla'
+                ? 'Official Vanilla'
+                : `Fabric ${escapeHtml(activeProfile.loaderVersion)}`
+            }</strong>
+            ${
+              activeProfile.loader === 'vanilla'
+                ? ' · Unmodified'
+                : ` · ${activeProfile.enabledModIds.length} Mods`
+            }
+          </div>
           <div style="font-family:var(--font-mono);font-size:10.5px;color:var(--text-muted)">
             Heap ${activeProfile.performance.allocatedRamMb} MB · ${escapeHtml(activeProfile.graphics.resolutionWidth)}×${escapeHtml(activeProfile.graphics.resolutionHeight)}
           </div>
         </div>
-        <button class="btn btn-primary btn-launch" data-action="launch-now" ${state.launchingGame ? 'disabled' : ''}>
-          ${state.launchingGame ? 'PREPARING…' : `▶ PLAY ${escapeHtml(activeProfile.mcVersion)}`}
+        <button class="btn btn-primary btn-launch" data-action="launch-now" ${state.launchingGame || Boolean(snap.activeDownload?.active) ? 'disabled' : ''}>
+          ${
+            state.launchingGame
+              ? 'PREPARING…'
+              : snap.offlineAvailability?.activeSessionMode === 'offline_singleplayer'
+                ? `▶ PLAY OFFLINE (${escapeHtml(activeProfile.mcVersion)})`
+                : `▶ PLAY ${escapeHtml(activeProfile.mcVersion)}`
+          }
         </button>
       </div>
     </footer>
@@ -333,6 +374,15 @@ function renderApp(): void {
 }
 
 function bindGlobalAndStageEvents(root: HTMLElement, snap: AppStateSnapshot): void {
+  const refreshActiveFabricLoaders = async (mcVer: string) => {
+    try {
+      const res = await bridge.getFabricLoaders(mcVer);
+      state.playFilterState.fabricLoadersForActive = res.loaders;
+    } catch {
+      state.playFilterState.fabricLoadersForActive = [];
+    }
+  };
+
   const navigateTo = async (page: PageId) => {
     state.currentPage = page;
     renderApp();
@@ -340,9 +390,16 @@ function bindGlobalAndStageEvents(root: HTMLElement, snap: AppStateSnapshot): vo
       await refreshModSearch();
       renderApp();
     }
-    if (page === 'play' && !state.launchPrep) {
+    if (page === 'play') {
       try {
-        state.launchPrep = await bridge.prepareLaunch();
+        const activeProf =
+          snap.profiles.find((p) => p.id === snap.activeProfileId) ?? snap.profiles[0];
+        await Promise.all([
+          bridge.prepareLaunch().then((p) => {
+            state.launchPrep = p;
+          }),
+          refreshActiveFabricLoaders(activeProf.mcVersion),
+        ]);
         renderApp();
       } catch (err) {
         showToast(err instanceof Error ? err.message : String(err), 'error');
@@ -425,42 +482,178 @@ function bindGlobalAndStageEvents(root: HTMLElement, snap: AppStateSnapshot): vo
   const stage = root.querySelector<HTMLElement>('#main-stage');
   if (!stage) return;
 
-  bindHomeAndPlayEvents(
-    stage,
-    navigateTo,
-    async (mode) => {
+  bindHomeAndPlayEvents(stage, {
+    onNavigate: navigateTo,
+    onQuickPerfMode: async (mode) => {
       state.snapshot = await bridge.applyPerformanceMode(mode);
       showToast(`Applied ${mode.replace('_', ' ')} performance configuration.`, 'success');
       renderApp();
     },
-    async (mcVersion) => {
+    onSelectProfile: async (profileId) => {
+      try {
+        state.snapshot = await bridge.selectProfile(profileId);
+        const activeProf =
+          state.snapshot.profiles.find((p) => p.id === state.snapshot!.activeProfileId) ??
+          state.snapshot.profiles[0];
+        state.launchPrep = await bridge.prepareLaunch();
+        await refreshActiveFabricLoaders(activeProf.mcVersion);
+        renderApp();
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : String(err), 'error');
+      }
+    },
+    onSelectVersionForActive: async (mcVersion) => {
+      try {
+        state.snapshot = await bridge.updateProfileTarget({ mcVersion });
+        state.launchPrep = await bridge.prepareLaunch();
+        await refreshActiveFabricLoaders(mcVersion);
+        showToast(`Selected Minecraft ${mcVersion} for active profile.`, 'success');
+        renderApp();
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : String(err), 'error');
+      }
+    },
+    onCreateVersionInstance: async ({ name, mcVersion, loader, customJavaPath }) => {
       try {
         state.snapshot = await bridge.createProfile({
-          name: `Vespera ${mcVersion}`,
+          name: name || `Minecraft ${mcVersion}`,
           archetype: mcVersion === '1.8.9' ? 'pvp' : 'vanilla_plus',
           mcVersion,
+          loader,
+          customJavaPath,
         });
+        state.playFilterState.showNewProfileDrawer = false;
+        state.launchPrep = await bridge.prepareLaunch();
+        await refreshActiveFabricLoaders(mcVersion);
         showToast(`Created isolated Minecraft ${mcVersion} profile.`, 'success');
         renderApp();
       } catch (err) {
         showToast(err instanceof Error ? err.message : String(err), 'error');
       }
     },
-    async () => {
-      const res = await bridge.syncVersions();
-      showToast(
-        res.liveManifestFetched
-          ? `Synced ${res.versions.length} versions from official Mojang manifest.`
-          : 'Mojang Piston manifest offline in current network; verified local catalog active.',
-        'info'
-      );
+    onUpdateActiveInstallation: async (patch) => {
+      try {
+        state.snapshot = await bridge.updateProfileTarget(patch);
+        state.launchPrep = await bridge.prepareLaunch();
+        showToast('Updated installation configuration.', 'success');
+        renderApp();
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : String(err), 'error');
+      }
     },
-    async () => {
-      state.launchPrep = await bridge.prepareLaunch();
-      showToast('Generated and verified full Fabric KnotClient launch command.', 'success');
+    onInstallVersion: async (versionId, forceRepair) => {
+      const activeProf =
+        snap.profiles.find((p) => p.id === snap.activeProfileId) ?? snap.profiles[0];
+      const targetVer = versionId || activeProf.mcVersion;
+      state.installingVersionId = targetVer;
       renderApp();
-    }
-  );
+
+      const progressTimer = setInterval(async () => {
+        try {
+          state.snapshot = await bridge.getSnapshot();
+          renderApp();
+        } catch {
+          // Ignore transient poll error
+        }
+      }, 450);
+
+      try {
+        const res = await bridge.installVersion({
+          versionId: targetVer,
+          loader: targetVer === activeProf.mcVersion ? activeProf.loader : undefined,
+          loaderVersion:
+            targetVer === activeProf.mcVersion ? activeProf.loaderVersion : undefined,
+          forceRepair,
+        });
+        state.snapshot = res.snapshot;
+        state.launchPrep = await bridge.prepareLaunch();
+        showToast(`Minecraft ${targetVer} verified and ready to launch!`, 'success');
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : String(err), 'error');
+        try {
+          state.snapshot = await bridge.getSnapshot();
+        } catch {
+          // Ignore
+        }
+      } finally {
+        clearInterval(progressTimer);
+        state.installingVersionId = null;
+        renderApp();
+      }
+    },
+    onCancelDownload: async () => {
+      try {
+        state.snapshot = await bridge.cancelVersionDownload();
+        state.installingVersionId = null;
+        showToast('Cancelled active download — partial files preserved for resume.', 'info');
+        renderApp();
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : String(err), 'error');
+      }
+    },
+    onDeleteVersion: async (versionId) => {
+      try {
+        state.snapshot = await bridge.deleteVersion(versionId);
+        state.launchPrep = await bridge.prepareLaunch();
+        showToast(
+          `Deleted local version files for Minecraft ${versionId} (profiles & worlds preserved).`,
+          'info'
+        );
+        renderApp();
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : String(err), 'error');
+      }
+    },
+    onSyncManifest: async () => {
+      try {
+        state.snapshot = await bridge.syncVersions();
+        showToast(
+          state.snapshot.manifestSource === 'live_mojang'
+            ? `Synced ${state.snapshot.versions.length} versions from official Mojang manifest!`
+            : `Loaded ${state.snapshot.versions.length} verified versions (${state.snapshot.manifestSource}).`,
+          'info'
+        );
+        renderApp();
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : String(err), 'error');
+      }
+    },
+    onInspectLaunch: async () => {
+      state.launchPrep = await bridge.prepareLaunch();
+      showToast('Synthesized and verified pre-flight JVM command.', 'success');
+      renderApp();
+    },
+    onFilterChange: (patch) => {
+      const searchInputActive = document.activeElement?.id === 'play-version-search';
+      const caretPos = searchInputActive
+        ? (document.activeElement as HTMLInputElement).selectionStart
+        : null;
+      state.playFilterState = { ...state.playFilterState, ...patch };
+      renderApp();
+      if (searchInputActive) {
+        const nextInput = document.getElementById('play-version-search') as HTMLInputElement | null;
+        if (nextInput) {
+          nextInput.focus();
+          if (caretPos !== null) nextInput.setSelectionRange(caretPos, caretPos);
+        }
+      }
+    },
+    onToggleSessionMode: async (mode) => {
+      try {
+        state.snapshot = await bridge.setSessionMode(mode);
+        state.launchPrep = await bridge.prepareLaunch(mode);
+        showToast(
+          mode === 'offline_singleplayer'
+            ? 'Switched to Offline Singleplayer mode (multiplayer disabled).'
+            : 'Restored Online Authenticated session mode.',
+          'success'
+        );
+        renderApp();
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : String(err), 'error');
+      }
+    },
+  });
 
   bindModsPageEvents(stage, snap, state.selectedHudElement, {
     onSubTab: async (tab) => {
@@ -599,9 +792,40 @@ function bindGlobalAndStageEvents(root: HTMLElement, snap: AppStateSnapshot): vo
   );
 
   bindAccountsSettingsDiagEvents(stage, {
-    onStartMsaAuth: async (clientId) => {
+    onStartPkceAuth: async () => {
       try {
-        state.authChallenge = await bridge.startDeviceAuth(clientId);
+        const { flow, snapshot } = await bridge.startPkceAuth();
+        state.snapshot = snapshot;
+        state.authChallenge = null;
+        showToast(flow.message, 'info');
+        renderApp();
+
+        // Automatically poll snapshot while user completes PKCE sign-in in system browser
+        const pkcePoll = setInterval(async () => {
+          try {
+            const nextSnap = await bridge.getSnapshot();
+            state.snapshot = nextSnap;
+            if (nextSnap.authFlow?.mode !== 'pkce_browser') {
+              clearInterval(pkcePoll);
+              if (nextSnap.authFlow?.mode === 'completed') {
+                showToast(nextSnap.authFlow.message, 'success');
+              } else if (nextSnap.authFlow?.mode === 'error') {
+                showToast(nextSnap.authFlow.message, 'error');
+              }
+              renderApp();
+            }
+          } catch {
+            clearInterval(pkcePoll);
+          }
+        }, 1200);
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : String(err), 'error');
+      }
+    },
+    onStartDeviceAuth: async () => {
+      try {
+        state.authChallenge = await bridge.startDeviceAuth();
+        state.snapshot = await bridge.getSnapshot();
         renderApp();
       } catch (err) {
         showToast(err instanceof Error ? err.message : String(err), 'error');
@@ -609,10 +833,43 @@ function bindGlobalAndStageEvents(root: HTMLElement, snap: AppStateSnapshot): vo
     },
     onPollMsaAuth: async () => {
       try {
-        const { authStatus, snapshot } = await bridge.pollDeviceAuth();
+        const { authStatus, snapshot } = await bridge.pollDeviceAuth(
+          state.authChallenge?.deviceCode
+        );
         state.snapshot = snapshot;
-        showToast(authStatus.message, authStatus.status === 'authenticated' ? 'success' : 'info');
-        if (authStatus.status === 'authenticated') state.authChallenge = null;
+        const done =
+          authStatus.status === 'completed' || authStatus.status === 'authenticated';
+        showToast(authStatus.message, done ? 'success' : 'info');
+        if (done || authStatus.status === 'cancelled' || authStatus.status === 'expired') {
+          state.authChallenge = null;
+        }
+        renderApp();
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : String(err), 'error');
+      }
+    },
+    onCancelAuthFlow: async () => {
+      state.authChallenge = null;
+      state.snapshot = await bridge.cancelAuthFlow();
+      showToast('Cancelled Microsoft sign-in flow.', 'info');
+      renderApp();
+    },
+    onRefreshPkceState: async () => {
+      state.snapshot = await bridge.getSnapshot();
+      renderApp();
+    },
+    onCopyDeviceCode: async (code) => {
+      try {
+        await navigator.clipboard.writeText(code);
+        showToast(`Copied device code ${code} to clipboard.`, 'success');
+      } catch {
+        showToast(`Verification code: ${code}`, 'info');
+      }
+    },
+    onRefreshAccount: async (id) => {
+      try {
+        state.snapshot = await bridge.refreshAccountSession(id);
+        showToast('Validated & refreshed Microsoft / Minecraft session.', 'success');
         renderApp();
       } catch (err) {
         showToast(err instanceof Error ? err.message : String(err), 'error');
@@ -623,10 +880,40 @@ function bindGlobalAndStageEvents(root: HTMLElement, snap: AppStateSnapshot): vo
       showToast('Switched active Minecraft session.', 'success');
       renderApp();
     },
+    onSignOutAccount: async (id) => {
+      state.snapshot = await bridge.signOutAccount(id);
+      showToast('Signed out of online session (local verified record preserved).', 'info');
+      renderApp();
+    },
     onRemoveAccount: async (id) => {
       state.snapshot = await bridge.removeAccount(id);
-      showToast('Removed account from encrypted vault.', 'info');
+      showToast('Permanently removed account from encrypted vault.', 'info');
       renderApp();
+    },
+    onLaunchOfflineSingleplayer: async () => {
+      try {
+        state.launchingGame = true;
+        renderApp();
+        state.snapshot = await bridge.setSessionMode('offline_singleplayer');
+        const { launchRes, snapshot } = await bridge.launchMinecraft('offline_singleplayer');
+        state.snapshot = snapshot;
+        state.launchingGame = false;
+        showToast(launchRes.message, launchRes.launched ? 'success' : 'error');
+        renderApp();
+      } catch (err) {
+        state.launchingGame = false;
+        showToast(err instanceof Error ? err.message : String(err), 'error');
+        renderApp();
+      }
+    },
+    onRestoreOnlineSession: async () => {
+      try {
+        state.snapshot = await bridge.setSessionMode('online_authenticated');
+        showToast('Restored Online Authenticated session mode.', 'success');
+        renderApp();
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : String(err), 'error');
+      }
     },
     onUpdateSettings: async (patch) => {
       state.snapshot = await bridge.updateSettings(patch);

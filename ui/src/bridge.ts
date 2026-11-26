@@ -1,6 +1,7 @@
 import { validateAndNormalizeSnapshot } from '@shared/snapshotValidator';
 import type {
   AppStateSnapshot,
+  AuthFlowState,
   BenchmarkSuiteReport,
   ClientProfile,
   DeviceCodeAuthChallenge,
@@ -8,8 +9,8 @@ import type {
   HudLayoutProfile,
   LaunchPreparationReport,
   LauncherSettings,
-  MinecraftVersionDescriptor,
   ModCategory,
+  ModloaderType,
   PerformanceModeId,
   PerformanceSettings,
   ShaderPackEntry,
@@ -142,9 +143,24 @@ class VesperaRpcBridge {
     name: string;
     archetype: ClientProfile['archetype'];
     mcVersion: string;
+    loader?: ModloaderType;
+    loaderVersion?: string;
+    customJavaPath?: string;
+    customGameDir?: string;
     description?: string;
   }) {
     return this.invokeSnapshot('createProfile', params);
+  }
+  updateProfileTarget(params: {
+    profileId?: string;
+    name?: string;
+    mcVersion?: string;
+    loader?: ModloaderType;
+    loaderVersion?: string;
+    customJavaPath?: string;
+    customGameDir?: string;
+  }) {
+    return this.invokeSnapshot('updateProfileTarget', params);
   }
   exportProfile(profileId: string) {
     return this.invoke<{ json: string }>('exportProfile', { profileId });
@@ -200,49 +216,77 @@ class VesperaRpcBridge {
   toggleMod(modId: string, enabled: boolean) {
     return this.invokeSnapshot('toggleMod', { modId, enabled });
   }
-  startDeviceAuth(clientId: string) {
-    return this.invoke<DeviceCodeAuthChallenge>('startDeviceAuth', { clientId });
+  async startPkceAuth() {
+    const raw = await this.invoke<{ flow: AuthFlowState; snapshot: unknown }>('startPkceAuth');
+    return {
+      flow: raw.flow,
+      snapshot: validateAndNormalizeSnapshot(raw.snapshot),
+    };
   }
-  async pollDeviceAuth() {
+  startDeviceAuth() {
+    return this.invoke<DeviceCodeAuthChallenge>('startDeviceAuth', {});
+  }
+  async pollDeviceAuth(deviceCode?: string) {
     const raw = await this.invoke<{
-      authStatus: { status: 'pending' | 'authenticated'; message: string };
+      authStatus: {
+        status: 'pending' | 'completed' | 'expired' | 'cancelled' | 'authenticated';
+        message: string;
+      };
       snapshot: unknown;
-    }>('pollDeviceAuth');
+    }>('pollDeviceAuth', deviceCode ? { deviceCode } : {});
     return {
       authStatus: raw.authStatus,
       snapshot: validateAndNormalizeSnapshot(raw.snapshot),
     };
   }
+  cancelAuthFlow() {
+    return this.invokeSnapshot('cancelAuthFlow');
+  }
+  refreshAccountSession(accountId?: string) {
+    return this.invokeSnapshot('refreshAccountSession', accountId ? { accountId } : {});
+  }
   switchAccount(accountId: string) {
     return this.invokeSnapshot('switchAccount', { accountId });
+  }
+  signOutAccount(accountId: string) {
+    return this.invokeSnapshot('signOutAccount', { accountId });
   }
   removeAccount(accountId: string) {
     return this.invokeSnapshot('removeAccount', { accountId });
   }
-  prepareLaunch() {
-    return this.invoke<LaunchPreparationReport>('prepareLaunch');
+  setSessionMode(mode: 'online_authenticated' | 'offline_singleplayer') {
+    return this.invokeSnapshot('setSessionMode', { mode });
+  }
+  prepareLaunch(mode?: 'online_authenticated' | 'offline_singleplayer') {
+    return this.invoke<LaunchPreparationReport>('prepareLaunch', mode ? { mode } : {});
   }
   async verifyAndRepair() {
     const raw = await this.invoke<{
-      repair: { instanceDir: string; repairedFiles: string[]; verifiedCount: number };
+      repair: {
+        instanceDir: string;
+        repairedFiles: string[];
+        verifiedCount: number;
+        issues?: string[];
+      };
       snapshot: unknown;
-    }>('verifyAndRepair', {}, 60000);
+    }>('verifyAndRepair', {}, 120000);
     return {
       repair: raw.repair,
       snapshot: validateAndNormalizeSnapshot(raw.snapshot),
     };
   }
-  async launchMinecraft() {
+  async launchMinecraft(mode?: 'online_authenticated' | 'offline_singleplayer') {
     const raw = await this.invoke<{
       launchRes: {
         launched: boolean;
-        pid: number | null;
+        pid?: number | null;
         stageReached: string;
+        sessionMode?: 'online_authenticated' | 'offline_singleplayer';
         message: string;
-        preparation: LaunchPreparationReport;
+        preparation?: LaunchPreparationReport;
       };
       snapshot: unknown;
-    }>('launchMinecraft', {}, 180000);
+    }>('launchMinecraft', mode ? { mode } : {}, 300000);
     return {
       launchRes: raw.launchRes,
       snapshot: validateAndNormalizeSnapshot(raw.snapshot),
@@ -264,9 +308,38 @@ class VesperaRpcBridge {
     };
   }
   syncVersions() {
-    return this.invoke<{ versions: MinecraftVersionDescriptor[]; liveManifestFetched: boolean }>(
-      'syncVersions'
+    return this.invokeSnapshot('syncVersions', {}, 30000);
+  }
+  getFabricLoaders(mcVersion: string) {
+    return this.invoke<{
+      mcVersion: string;
+      loaders: Array<{ version: string; stable: boolean }>;
+    }>('getFabricLoaders', { mcVersion });
+  }
+  async installVersion(params: {
+    versionId: string;
+    loader?: ModloaderType;
+    loaderVersion?: string;
+    forceRepair?: boolean;
+  }) {
+    const raw = await this.invoke<{ receipt: unknown; snapshot: unknown }>(
+      'installVersion',
+      params,
+      600000
     );
+    return {
+      receipt: raw.receipt,
+      snapshot: validateAndNormalizeSnapshot(raw.snapshot),
+    };
+  }
+  async cancelVersionDownload() {
+    const raw = await this.invoke<{ cancelled: unknown; snapshot: unknown }>(
+      'cancelVersionDownload'
+    );
+    return validateAndNormalizeSnapshot(raw.snapshot);
+  }
+  deleteVersion(versionId: string) {
+    return this.invokeSnapshot('deleteVersion', { versionId });
   }
 }
 

@@ -8,6 +8,8 @@
 #define NOMINMAX
 #endif
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <shellapi.h>
 #include <wincrypt.h>
@@ -17,10 +19,12 @@
 #include <shobjidl.h>
 #include <psapi.h>
 
+#include <atomic>
 #include <cstdio>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -228,7 +232,7 @@ inline HttpResponse winhttp_request(
         return res;
     }
 
-    HINTERNET hSession = WinHttpOpen(L"VesperaClient/1.0.0 (Windows NT 10.0; Win64; x64)",
+    HINTERNET hSession = WinHttpOpen(L"VesperaClient/1.1.0 (Windows NT 10.0; Win64; x64)",
                                      WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                      WINHTTP_NO_PROXY_NAME,
                                      WINHTTP_NO_PROXY_BYPASS, 0);
@@ -305,6 +309,193 @@ inline bool winhttp_download_file(const std::string& urlUtf8, const std::filesys
     HttpResponse r = winhttp_request("GET", urlUtf8);
     if (r.statusCode < 200 || r.statusCode >= 300 || r.body.empty()) return false;
     return write_file_atomic(destFile, r.body.data(), r.body.size());
+}
+
+inline std::string base64url_encode(const unsigned char* data, size_t len) {
+    static const char kTable[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t v = static_cast<uint32_t>(data[i]) << 16;
+        if (i + 1 < len) v |= static_cast<uint32_t>(data[i + 1]) << 8;
+        if (i + 2 < len) v |= static_cast<uint32_t>(data[i + 2]);
+        out.push_back(kTable[(v >> 18) & 0x3F]);
+        out.push_back(kTable[(v >> 12) & 0x3F]);
+        if (i + 1 < len) out.push_back(kTable[(v >> 6) & 0x3F]);
+        if (i + 2 < len) out.push_back(kTable[v & 0x3F]);
+    }
+    return out;
+}
+
+inline std::string bcrypt_random_base64url(size_t numBytes) {
+    std::vector<unsigned char> buf(numBytes, 0);
+    BCryptGenRandom(nullptr, buf.data(), static_cast<ULONG>(buf.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    return base64url_encode(buf.data(), buf.size());
+}
+
+inline std::string bcrypt_sha256_base64url(const std::string& asciiInput) {
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    BCRYPT_HASH_HANDLE hHash = nullptr;
+    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) return "";
+    DWORD objLen = 0, cbData = 0;
+    BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objLen), sizeof(DWORD), &cbData, 0);
+    std::vector<UCHAR> hashObj(objLen);
+    unsigned char digest[32] = {};
+    if (BCryptCreateHash(hAlg, &hHash, hashObj.data(), objLen, nullptr, 0, 0) == 0) {
+        BCryptHashData(hHash, reinterpret_cast<PUCHAR>(const_cast<char*>(asciiInput.data())),
+                       static_cast<ULONG>(asciiInput.size()), 0);
+        BCryptFinishHash(hHash, digest, 32, 0);
+        BCryptDestroyHash(hHash);
+    }
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    return base64url_encode(digest, 32);
+}
+
+/**
+ * Streaming WinHTTP downloader supporting HTTP Range resume on `.part` files,
+ * SHA-1 verification, cancellation, and live byte progress callbacks.
+ */
+inline bool winhttp_download_verified(
+    const std::string& urlUtf8,
+    const std::filesystem::path& destFile,
+    const std::string& expectedSha1,
+    bool verifyHashes,
+    std::atomic<bool>* cancelFlag,
+    const std::function<void(size_t)>& onChunkBytes,
+    std::string& outError
+) {
+    std::error_code ec;
+    std::filesystem::create_directories(destFile.parent_path(), ec);
+
+    if (std::filesystem::exists(destFile, ec) && std::filesystem::file_size(destFile, ec) > 0) {
+        if (!verifyHashes || expectedSha1.empty()) return true;
+        std::string curSha = bcrypt_hash_file(destFile, BCRYPT_SHA1_ALGORITHM);
+        if (_stricmp(curSha.c_str(), expectedSha1.c_str()) == 0) return true;
+    }
+
+    std::filesystem::path partFile = destFile;
+    partFile += ".part";
+
+    for (int attempt = 1; attempt <= 3; ++attempt) {
+        if (cancelFlag && cancelFlag->load()) {
+            outError = "Download cancelled by user.";
+            return false;
+        }
+
+        uintmax_t existingBytes = 0;
+        if (std::filesystem::exists(partFile, ec)) {
+            existingBytes = std::filesystem::file_size(partFile, ec);
+        }
+
+        std::wstring wurl = utf8_to_wide(urlUtf8);
+        URL_COMPONENTS uc{};
+        uc.dwStructSize = sizeof(uc);
+        wchar_t hostBuf[256] = {};
+        wchar_t pathBuf[2048] = {};
+        uc.lpszHostName = hostBuf;
+        uc.dwHostNameLength = 255;
+        uc.lpszUrlPath = pathBuf;
+        uc.dwUrlPathLength = 2047;
+        if (!WinHttpCrackUrl(wurl.c_str(), static_cast<DWORD>(wurl.size()), 0, &uc)) {
+            outError = "Invalid download URL: " + urlUtf8;
+            return false;
+        }
+
+        HINTERNET hSession = WinHttpOpen(L"VesperaClient/1.1.0 (Windows NT 10.0; Win64; x64)",
+                                         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!hSession) {
+            outError = "WinHttpOpen failed.";
+            continue;
+        }
+        HINTERNET hConnect = WinHttpConnect(hSession, hostBuf, uc.nPort, 0);
+        DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+        HINTERNET hRequest = hConnect
+            ? WinHttpOpenRequest(hConnect, L"GET", pathBuf, nullptr, WINHTTP_NO_REFERER,
+                                 WINHTTP_DEFAULT_ACCEPT_TYPES, flags)
+            : nullptr;
+
+        if (!hRequest) {
+            if (hConnect) WinHttpCloseHandle(hConnect);
+            WinHttpCloseHandle(hSession);
+            outError = "WinHttpOpenRequest failed.";
+            continue;
+        }
+
+        std::wstring hdrs;
+        if (existingBytes > 0) {
+            hdrs = L"Range: bytes=" + std::to_wstring(existingBytes) + L"-\r\n";
+        }
+
+        BOOL sent = WinHttpSendRequest(
+            hRequest,
+            hdrs.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : hdrs.c_str(),
+            hdrs.empty() ? 0 : static_cast<DWORD>(hdrs.size()),
+            WINHTTP_NO_REQUEST_DATA, 0, 0, 0
+        );
+
+        bool okAttempt = false;
+        if (sent && WinHttpReceiveResponse(hRequest, nullptr)) {
+            DWORD status = 0, sz = sizeof(status);
+            WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX);
+            if (status == 200 || status == 206) {
+                std::ios_base::openmode mode = std::ios::binary | ((status == 206 && existingBytes > 0) ? std::ios::app : std::ios::trunc);
+                std::ofstream ofs(partFile, mode);
+                if (ofs) {
+                    okAttempt = true;
+                    DWORD avail = 0;
+                    do {
+                        if (cancelFlag && cancelFlag->load()) {
+                            okAttempt = false;
+                            outError = "Download cancelled by user.";
+                            break;
+                        }
+                        avail = 0;
+                        if (!WinHttpQueryDataAvailable(hRequest, &avail) || avail == 0) break;
+                        std::vector<char> chunk(avail);
+                        DWORD readBytes = 0;
+                        if (WinHttpReadData(hRequest, chunk.data(), avail, &readBytes) && readBytes > 0) {
+                            ofs.write(chunk.data(), readBytes);
+                            if (onChunkBytes) onChunkBytes(readBytes);
+                        }
+                    } while (avail > 0);
+                    ofs.close();
+                }
+            } else {
+                outError = "HTTP " + std::to_string(status) + " fetching " + urlUtf8;
+            }
+        } else {
+            outError = "Network error fetching " + urlUtf8;
+        }
+
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+
+        if (cancelFlag && cancelFlag->load()) {
+            return false;
+        }
+
+        if (okAttempt) {
+            if (verifyHashes && !expectedSha1.empty()) {
+                std::string gotSha = bcrypt_hash_file(partFile, BCRYPT_SHA1_ALGORITHM);
+                if (_stricmp(gotSha.c_str(), expectedSha1.c_str()) != 0) {
+                    std::filesystem::remove(partFile, ec);
+                    outError = "SHA-1 integrity mismatch on " + wide_to_utf8(destFile.filename().wstring());
+                    continue;
+                }
+            }
+            std::filesystem::rename(partFile, destFile, ec);
+            if (ec) {
+                std::filesystem::copy_file(partFile, destFile, std::filesystem::copy_options::overwrite_existing, ec);
+                std::filesystem::remove(partFile, ec);
+            }
+            return std::filesystem::exists(destFile, ec);
+        }
+        Sleep(static_cast<DWORD>(200 * attempt));
+    }
+    return false;
 }
 
 /**

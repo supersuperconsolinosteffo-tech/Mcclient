@@ -4,6 +4,7 @@ import type {
   HudLayoutProfile,
   LauncherSettings,
   ModCategory,
+  ModloaderType,
   PerformanceModeId,
   PerformanceSettings,
   ShaderPackEntry,
@@ -28,7 +29,26 @@ export async function dispatchRpcMethod(
         name: String(params.name ?? 'Custom Profile'),
         archetype: (params.archetype as ClientProfile['archetype']) ?? 'custom',
         mcVersion: String(params.mcVersion ?? '1.21.4'),
+        loader: params.loader ? (String(params.loader) as ModloaderType) : undefined,
+        loaderVersion: params.loaderVersion ? String(params.loaderVersion) : undefined,
+        customJavaPath: params.customJavaPath ? String(params.customJavaPath) : undefined,
+        customGameDir: params.customGameDir ? String(params.customGameDir) : undefined,
         description: params.description ? String(params.description) : undefined,
+      });
+      return coordinator.getSnapshot();
+
+    case 'updateProfileTarget':
+      coordinator.updateProfileInstallationTarget({
+        profileId: params.profileId ? String(params.profileId) : undefined,
+        name: params.name !== undefined ? String(params.name) : undefined,
+        mcVersion: params.mcVersion !== undefined ? String(params.mcVersion) : undefined,
+        loader: params.loader ? (String(params.loader) as ModloaderType) : undefined,
+        loaderVersion:
+          params.loaderVersion !== undefined ? String(params.loaderVersion) : undefined,
+        customJavaPath:
+          params.customJavaPath !== undefined ? String(params.customJavaPath) : undefined,
+        customGameDir:
+          params.customGameDir !== undefined ? String(params.customGameDir) : undefined,
       });
       return coordinator.getSnapshot();
 
@@ -100,64 +120,160 @@ export async function dispatchRpcMethod(
       coordinator.toggleMod(String(params.modId ?? ''), Boolean(params.enabled));
       return coordinator.getSnapshot();
 
+    // --- Part 1 & 2: Microsoft OAuth 2.0 PKCE + Device Code Fallback + Offline Singleplayer ---
+    case 'startPkceAuth': {
+      const flow = await coordinator.authService.startBrowserPkceSignIn();
+      return { flow, snapshot: coordinator.getSnapshot() };
+    }
+
     case 'startDeviceAuth':
-      return coordinator.authService.startDeviceCodeFlow(
-        String(params.clientId ?? coordinator.getSnapshot().settings.microsoftAzureClientId ?? '')
-      );
+      return coordinator.authService.startDeviceCodeFlow();
 
     case 'pollDeviceAuth': {
-      const authStatus = await coordinator.authService.pollDeviceCodeCompletion();
+      const authStatus = await coordinator.authService.pollDeviceCodeCompletion(
+        params.deviceCode ? String(params.deviceCode) : undefined
+      );
       return { authStatus, snapshot: coordinator.getSnapshot() };
     }
 
+    case 'cancelAuthFlow':
+      coordinator.authService.cancelActiveAuthFlow();
+      return coordinator.getSnapshot();
+
+    case 'refreshAccountSession':
+      await coordinator.authService.refreshOrValidateSession(
+        String(params.accountId ?? coordinator.authService.getActiveAccountId() ?? '')
+      );
+      return coordinator.getSnapshot();
+
     case 'switchAccount':
       coordinator.authService.switchActiveAccount(String(params.accountId ?? ''));
+      return coordinator.getSnapshot();
+
+    case 'signOutAccount':
+      coordinator.authService.signOutAccount(
+        String(params.accountId ?? coordinator.authService.getActiveAccountId() ?? '')
+      );
       return coordinator.getSnapshot();
 
     case 'removeAccount':
       coordinator.authService.removeAccount(String(params.accountId ?? ''));
       return coordinator.getSnapshot();
 
-    case 'prepareLaunch': {
-      const snap = coordinator.getSnapshot();
-      const activeAcc = coordinator.authService.getActiveAccount();
-      return coordinator.launcherService.prepareLaunchCommand(
-        coordinator.getActiveProfile(),
-        snap.settings,
-        snap.installedMods,
-        activeAcc
+    case 'setSessionMode':
+      coordinator.authService.setSessionMode(
+        params.mode === 'offline_singleplayer'
+          ? 'offline_singleplayer'
+          : 'online_authenticated'
       );
+      return coordinator.getSnapshot();
+
+    // --- Part 3 & 4: Dynamic Version Manager, Installer, Repair & Deletion ---
+    case 'syncVersions': {
+      await coordinator.launcherService.syncOfficialVersionManifest(
+        coordinator.getSnapshot().settings.gameDataDir
+      );
+      return coordinator.getSnapshot();
+    }
+
+    case 'getFabricLoaders': {
+      const mcVersion = String(
+        params.mcVersion ?? coordinator.getActiveProfile().mcVersion
+      );
+      const loaders = await coordinator.launcherService.fetchCompatibleFabricLoaders(mcVersion);
+      return { mcVersion, loaders };
+    }
+
+    case 'installVersion': {
+      const receipt = await coordinator.installMinecraftVersionForTarget({
+        versionId: params.versionId ? String(params.versionId) : undefined,
+        loader: params.loader ? (String(params.loader) as ModloaderType) : undefined,
+        loaderVersion: params.loaderVersion ? String(params.loaderVersion) : undefined,
+        forceRepair: Boolean(params.forceRepair),
+      });
+      return { receipt, snapshot: coordinator.getSnapshot() };
+    }
+
+    case 'cancelVersionDownload': {
+      const cancelled = coordinator.launcherService.cancelActiveDownload();
+      coordinator.appendLog('[VersionManager] Cancelled active download operation.');
+      return { cancelled, snapshot: coordinator.getSnapshot() };
+    }
+
+    case 'deleteVersion': {
+      const versionId = String(params.versionId ?? '');
+      coordinator.launcherService.deleteInstalledVersion(
+        versionId,
+        coordinator.getSnapshot().settings.gameDataDir
+          ? coordinator.getSnapshot().settings
+          : coordinator.getSnapshot().settings
+      );
+      coordinator.appendLog(
+        `[VersionManager] Deleted local version binaries for Minecraft ${versionId} (profiles & world saves preserved).`
+      );
+      return coordinator.getSnapshot();
+    }
+
+    case 'prepareLaunch': {
+      const mode =
+        params.mode === 'offline_singleplayer'
+          ? 'offline_singleplayer'
+          : params.mode === 'online_authenticated'
+            ? 'online_authenticated'
+            : undefined;
+      return coordinator.prepareActiveLaunch(mode);
     }
 
     case 'verifyAndRepair': {
+      const active = coordinator.getActiveProfile();
       const snap = coordinator.getSnapshot();
-      const repair = coordinator.launcherService.verifyAndMaterializeInstance(
-        coordinator.getActiveProfile(),
+      const integrity = coordinator.launcherService.verifyVersionIntegrity(
+        active.mcVersion,
+        snap.settings
+      );
+      const materialized = coordinator.launcherService.materializeInstanceFiles(
+        active,
         snap.settings,
-        snap.installedMods
+        snap.hudLayouts.find((h) => h.id === active.hudLayoutId) ?? snap.hudLayouts[0],
+        snap.installedMods,
+        snap.shaderPacks
       );
+      let repairedVersion = false;
+      if (!integrity.healthy) {
+        try {
+          await coordinator.installMinecraftVersionForTarget({
+            versionId: active.mcVersion,
+            loader: active.loader,
+            loaderVersion: active.loaderVersion,
+            forceRepair: true,
+          });
+          repairedVersion = true;
+        } catch {
+          // Offline environment: instance files materialized, version download deferred until online
+        }
+      }
       coordinator.appendLog(
-        `[VerifyRepair] Verified ${repair.verifiedCount} artifacts in ${repair.instanceDir} (${repair.repairedFiles.length} repaired).`
+        `[VerifyRepair] Verified ${materialized.instanceDir} (${integrity.healthy ? 'all version hashes intact' : repairedVersion ? 'repaired version files' : `${integrity.issues.length} missing online files noted`}).`
       );
-      return { repair, snapshot: coordinator.getSnapshot() };
+      return {
+        repair: {
+          instanceDir: materialized.instanceDir,
+          verifiedCount: materialized.syncedModFiles.length,
+          repairedFiles: repairedVersion ? integrity.issues : [],
+          issues: integrity.issues,
+        },
+        snapshot: coordinator.getSnapshot(),
+      };
     }
 
     case 'launchMinecraft': {
-      const snap = coordinator.getSnapshot();
-      let session: { account: import('../shared/types').MinecraftAccount; mcAccessToken: string } | null = null;
-      try {
-        session = await coordinator.authService.acquireLaunchSessionToken(
-          snap.settings.microsoftAzureClientId
-        );
-      } catch {
-        session = null;
-      }
-      const launchRes = await coordinator.launcherService.installAndLaunchMinecraft(
-        coordinator.getActiveProfile(),
-        snap.settings,
-        snap.installedMods,
-        session
-      );
+      const mode =
+        params.mode === 'offline_singleplayer'
+          ? 'offline_singleplayer'
+          : params.mode === 'online_authenticated'
+            ? 'online_authenticated'
+            : undefined;
+      const launchRes = await coordinator.launchActiveProfile(mode);
       return { launchRes, snapshot: coordinator.getSnapshot() };
     }
 
@@ -169,9 +285,6 @@ export async function dispatchRpcMethod(
       const report = coordinator.runBenchmarks();
       return { report, snapshot: coordinator.getSnapshot() };
     }
-
-    case 'syncVersions':
-      return coordinator.launcherService.syncOfficialVersionManifest();
 
     default:
       throw new Error(`Unknown RPC method: "${method}"`);

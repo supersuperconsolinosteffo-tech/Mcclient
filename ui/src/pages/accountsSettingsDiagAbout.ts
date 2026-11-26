@@ -6,108 +6,299 @@ import type {
 } from '@shared/types';
 import { escapeHtml } from '../icons';
 
+function formatTimestampShort(ts: number | null | undefined): string {
+  if (!ts || ts <= 0) return 'Never';
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return 'Unknown';
+  return d.toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
+}
+
 export function renderAccountsPage(
   snap: AppStateSnapshot,
   authChallenge: DeviceCodeAuthChallenge | null
 ): string {
+  const oauthCfg = snap.oauthConfig;
+  const oauthConfigured = Boolean(oauthCfg?.configured);
+  const flow = snap.authFlow;
+  const activeChallenge = authChallenge || flow?.deviceChallenge || null;
+  const offline = snap.offlineAvailability;
+  const activeProfile =
+    snap.profiles.find((p) => p.id === snap.activeProfileId) ?? snap.profiles[0];
+
   return `
     <div class="page-header">
       <div>
-        <h2 class="page-title">Microsoft / Minecraft Account Authentication</h2>
+        <h2 class="page-title">Microsoft Accounts &amp; Session Management</h2>
         <p class="page-subtitle">
-          Official OAuth 2.0 Device Code + PKCE → Xbox Live → XSTS → Minecraft Services authentication chain. Zero passwords stored, zero tokens logged, DPAPI/AES-256-GCM encrypted local vault, and zero cracked-account shortcuts.
+          Sign in effortlessly with your Microsoft account via your default system browser (OAuth 2.0 Authorization Code + PKCE). Verified Minecraft: Java Edition entitlements are stored in an encrypted DPAPI / AES-256-GCM local vault with zero plaintext tokens.
         </p>
       </div>
+      <span class="badge badge-supported">DPAPI / AES-256-GCM Encrypted Vault</span>
     </div>
 
-    <div class="grid-2">
-      <div class="card">
+    <div class="grid-2" style="margin-bottom:18px">
+      <!-- LEFT CARD: COMMERCIAL MICROSOFT SIGN-IN -->
+      <div class="card elevated">
         <div class="card-title">
-          <span>Sign In with Official Microsoft Account</span>
-          <span class="badge badge-supported">DPAPI / AES-256-GCM Vault</span>
+          <span>Sign in with Microsoft</span>
+          <span class="badge ${oauthConfigured ? 'badge-healthy' : 'badge-warning'}">
+            ${oauthConfigured ? 'PKCE + System Browser Ready' : 'Developer Config Required'}
+          </span>
         </div>
         <div class="card-desc">
-          Vespera uses Microsoft's official OAuth 2.0 Device Code & PKCE endpoints (<code>login.microsoftonline.com/consumers/oauth2/v2.0</code>) with scope <code>XboxLive.signin offline_access</code>.
-        </div>
-
-        <div class="form-row" style="margin-top:12px">
-          <div style="flex:1">
-            <div class="form-label">Microsoft Entra (Azure) Application Client ID</div>
-            <div class="form-hint">Register a Public Client App with Device Code / Live SDK support, then paste its Client ID below.</div>
-            <input
-              type="text"
-              class="input"
-              id="msa-client-id-input"
-              placeholder="e.g. 00000000-0000-0000-0000-000000000000"
-              value="${escapeHtml(snap.settings.microsoftAzureClientId)}"
-              style="width:100%;margin-top:6px;font-family:var(--font-mono)"
-            />
-          </div>
-        </div>
-
-        <div style="display:flex;gap:10px;margin-top:12px">
-          <button class="btn btn-primary" id="btn-start-msa-auth">Sign In with Microsoft (Device Code)</button>
-          ${
-            authChallenge && authChallenge.clientIdConfigured
-              ? `<button class="btn btn-cyan" id="btn-poll-msa-auth">Verify Browser Authorization</button>`
-              : ''
-          }
+          Authenticates through Microsoft OAuth 2.0 → Xbox Live → XSTS → Minecraft Services and verifies genuine Minecraft: Java Edition ownership automatically.
         </div>
 
         ${
-          authChallenge
-            ? `<div style="margin-top:14px;padding:12px 14px;border-radius:8px;background:var(--bg-canvas);border:1px solid ${
-                authChallenge.clientIdConfigured ? 'var(--accent-cyan)' : 'var(--accent-amber)'
-              }">
-                ${
-                  authChallenge.clientIdConfigured
-                    ? `<div style="font-size:12px;color:var(--text-secondary)">Open <a href="${escapeHtml(authChallenge.verificationUri)}" target="_blank" rel="noreferrer" style="color:var(--accent-cyan)">${escapeHtml(authChallenge.verificationUri)}</a> and enter code:</div>
-                       <div style="font-size:24px;font-weight:800;font-family:var(--font-mono);letter-spacing:3px;color:var(--accent-amber-bright);margin:6px 0">${escapeHtml(authChallenge.userCode)}</div>`
-                    : ''
-                }
-                <div style="font-size:12px;color:var(--text-primary)">${escapeHtml(authChallenge.statusMessage)}</div>
-              </div>`
+          !oauthConfigured
+            ? `
+          <div id="oauth-dev-config-notice" style="margin-top:14px;padding:14px 16px;border-radius:8px;background:rgba(245,158,11,0.09);border:1px solid rgba(245,158,11,0.4)">
+            <div style="font-weight:700;font-size:13px;color:var(--accent-amber-bright)">
+              Maintainer / Developer Build Configuration Notice
+            </div>
+            <div style="font-size:12.5px;color:var(--text-secondary);margin-top:6px;line-height:1.55">
+              This local/CI build was compiled without a build-time Microsoft Entra public Client ID.
+              End users never enter or register a Client ID in Vespera Client.<br/><br/>
+              <strong>For Maintainers:</strong> Set <code>VESPERA_MSA_CLIENT_ID</code> or configure <code>config/oauth.local.json</code> (or <code>config/oauth.release.json</code> for official distribution) as documented in <code>${escapeHtml(
+                oauthCfg?.developerSetupDocPath || 'docs/OAUTH_DEVELOPER_SETUP.md'
+              )}</code>.
+            </div>
+          </div>
+        `
+            : `
+          <div style="margin-top:16px;display:flex;flex-wrap:wrap;gap:10px">
+            <button class="btn btn-primary btn-launch" id="btn-start-pkce-auth" style="padding:11px 20px">
+              Sign in with Microsoft
+            </button>
+            <button class="btn" id="btn-start-device-auth">
+              Use Device Code Instead
+            </button>
+            ${
+              flow && (flow.mode === 'pkce_browser' || flow.mode === 'device_code')
+                ? `<button class="btn btn-danger" id="btn-cancel-auth-flow">✕ Cancel Sign-In</button>`
+                : ''
+            }
+          </div>
+        `
+        }
+
+        ${
+          flow?.mode === 'pkce_browser'
+            ? `
+          <div style="margin-top:14px;padding:13px 15px;border-radius:8px;background:var(--bg-canvas);border:1px solid var(--accent-cyan)">
+            <div style="font-weight:700;font-size:13px;color:var(--accent-cyan)">
+              ⏳ Waiting for Microsoft Sign-In in System Browser…
+            </div>
+            <div style="font-size:12px;color:var(--text-secondary);margin-top:5px">
+              ${escapeHtml(flow.message)}
+            </div>
+            ${
+              flow.authorizeUrl
+                ? `<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+                    <a class="btn btn-sm btn-cyan" href="${escapeHtml(flow.authorizeUrl)}" target="_blank" rel="noreferrer">Open Browser Window</a>
+                    <button class="btn btn-sm" id="btn-refresh-pkce-state">Check Completion</button>
+                  </div>`
+                : ''
+            }
+          </div>
+        `
+            : ''
+        }
+
+        ${
+          activeChallenge
+            ? `
+          <div style="margin-top:14px;padding:14px 16px;border-radius:8px;background:var(--bg-canvas);border:1px solid var(--accent-amber)">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+              <span style="font-size:12px;font-weight:700;color:var(--accent-amber-bright)">Device Code Fallback Sign-In</span>
+              <span style="font-size:11px;color:var(--text-muted);font-family:var(--font-mono)">Expires in ${Math.round(
+                (activeChallenge.expiresInSeconds || 900) / 60
+              )}m</span>
+            </div>
+            <div style="font-size:12px;color:var(--text-secondary);margin-top:6px">
+              1. Open <a href="${escapeHtml(activeChallenge.verificationUri)}" target="_blank" rel="noreferrer" style="color:var(--accent-cyan)">${escapeHtml(activeChallenge.verificationUri)}</a> in any browser.<br/>
+              2. Enter this verification code:
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;margin:10px 0">
+              <div style="font-size:24px;font-weight:800;font-family:var(--font-mono);letter-spacing:3px;color:var(--accent-amber-bright);padding:6px 12px;border-radius:6px;background:rgba(245,158,11,0.1);border:1px solid rgba(245,158,11,0.3)">
+                ${escapeHtml(activeChallenge.userCode)}
+              </div>
+              <button class="btn btn-sm" id="btn-copy-device-code" data-device-code-val="${escapeHtml(activeChallenge.userCode)}">Copy Code</button>
+              <a class="btn btn-sm" href="${escapeHtml(activeChallenge.verificationUri)}" target="_blank" rel="noreferrer">Open Browser</a>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
+              <button class="btn btn-sm btn-cyan" id="btn-poll-msa-auth">Check Authorization Progress</button>
+              <button class="btn btn-sm btn-danger" id="btn-cancel-device-auth">Cancel</button>
+            </div>
+            <div style="font-size:11.5px;color:var(--text-muted);margin-top:8px">${escapeHtml(activeChallenge.statusMessage)}</div>
+          </div>
+        `
+            : ''
+        }
+
+        ${
+          flow && (flow.mode === 'error' || flow.mode === 'completed' || flow.mode === 'cancelled')
+            ? `
+          <div style="margin-top:12px;padding:10px 12px;border-radius:6px;font-size:12px;background:var(--bg-canvas);border:1px solid ${
+            flow.mode === 'completed'
+              ? 'rgba(16,185,129,0.4)'
+              : flow.mode === 'error'
+                ? 'rgba(239,68,68,0.4)'
+                : 'var(--border-subtle)'
+          };color:${flow.mode === 'completed' ? '#34d399' : flow.mode === 'error' ? '#fca5a5' : 'var(--text-secondary)'}">
+            ${escapeHtml(flow.message)}
+          </div>
+        `
             : ''
         }
       </div>
 
+      <!-- RIGHT CARD: AUTHENTICATED ACCOUNTS -->
       <div class="card">
-        <div class="card-title">Authenticated Accounts (${snap.accounts.length})</div>
-        <div class="card-desc">Switch active profile session or revoke stored OAuth tokens at any time.</div>
+        <div class="card-title">
+          <span>Verified Minecraft Accounts (${snap.accounts.length})</span>
+          <span style="font-size:11.5px;color:var(--text-muted)">Multi-Account Vault</span>
+        </div>
+        <div class="card-desc">Switch active profile account, silently refresh tokens, sign out, or permanently remove an account from this PC.</div>
 
         <div style="display:flex;flex-direction:column;gap:10px;margin-top:14px">
           ${
             snap.accounts.length === 0
-              ? `<div style="padding:18px;background:var(--bg-canvas);border:1px dashed var(--border-strong);border-radius:8px;color:var(--text-secondary);font-size:12.5px">
-                  No Microsoft/Minecraft account currently signed in.<br/><br/>
-                  <strong>Security Notice:</strong> Vespera never fabricates fake offline accounts or bypasses Mojang session servers. Configure your Azure Client ID on the left to authenticate a genuine Minecraft: Java Edition account.
+              ? `<div style="padding:18px;background:var(--bg-canvas);border:1px dashed var(--border-strong);border-radius:8px;color:var(--text-secondary);font-size:12.5px;line-height:1.55">
+                  No Microsoft / Minecraft account signed in on this device yet.<br/><br/>
+                  Click <strong>Sign in with Microsoft</strong> on the left to authenticate your Minecraft: Java Edition account in your system browser.
                 </div>`
               : snap.accounts
-                  .map(
-                    (acc) => `
-                  <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:var(--bg-canvas);border:1px solid ${
+                  .map((acc) => {
+                    const cleanUuid = acc.uuid.replace(/-/g, '');
+                    const avatarUrl = `https://mc-heads.net/avatar/${encodeURIComponent(cleanUuid)}/44`;
+                    const statusBadge =
+                      acc.sessionStatus === 'valid'
+                        ? `<span class="badge badge-supported">Active Session</span>`
+                        : acc.sessionStatus === 'refresh_required'
+                          ? `<span class="badge badge-experimental">Refresh Ready</span>`
+                          : acc.sessionStatus === 'signed_out'
+                            ? `<span class="badge badge-legacy">Signed Out</span>`
+                            : `<span class="badge badge-warning">Expired</span>`;
+                    return `
+                  <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:12px 14px;background:var(--bg-canvas);border:1px solid ${
                     acc.active ? 'var(--accent-amber)' : 'var(--border-subtle)'
                   };border-radius:8px">
-                    <div>
-                      <div style="font-weight:700;font-size:13.5px">
-                        ${escapeHtml(acc.username)}
-                        <span class="badge ${acc.sessionStatus === 'valid' ? 'badge-supported' : 'badge-warning'}">${escapeHtml(acc.sessionStatus)}</span>
+                    <div style="display:flex;align-items:center;gap:12px">
+                      <img
+                        src="${avatarUrl}"
+                        alt="${escapeHtml(acc.username)}"
+                        width="42"
+                        height="42"
+                        style="border-radius:6px;image-rendering:pixelated;border:1px solid var(--border-strong);background:#1e293b"
+                        onerror="this.style.display='none'"
+                      />
+                      <div>
+                        <div style="font-weight:700;font-size:14px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                          <span>${escapeHtml(acc.username)}</span>
+                          ${statusBadge}
+                          ${acc.ownsMinecraftJava ? `<span class="badge badge-healthy">Java Edition Verified</span>` : ''}
+                        </div>
+                        <div style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);margin-top:2px">
+                          UUID: ${escapeHtml(acc.uuid)} · Last Verified: ${escapeHtml(formatTimestampShort(acc.lastValidatedAt))}
+                        </div>
                       </div>
-                      <div style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)">UUID: ${escapeHtml(acc.uuid)}</div>
                     </div>
-                    <div style="display:flex;gap:6px">
+
+                    <div style="display:flex;gap:6px;flex-wrap:wrap">
                       ${
                         !acc.active
-                          ? `<button class="btn btn-sm" data-switch-account="${escapeHtml(acc.id)}">Use Account</button>`
-                          : `<span class="badge badge-supported">ACTIVE</span>`
+                          ? `<button class="btn btn-sm btn-primary" data-switch-account="${escapeHtml(acc.id)}">Switch Active</button>`
+                          : `<span class="badge badge-supported">SELECTED</span>`
                       }
-                      <button class="btn btn-sm btn-danger" data-remove-account="${escapeHtml(acc.id)}">Sign Out</button>
+                      ${
+                        acc.sessionStatus !== 'signed_out'
+                          ? `<button class="btn btn-sm" data-refresh-account="${escapeHtml(acc.id)}">Refresh</button>
+                             <button class="btn btn-sm" data-signout-account="${escapeHtml(acc.id)}">Sign Out</button>`
+                          : ''
+                      }
+                      <button class="btn btn-sm btn-danger" data-remove-account="${escapeHtml(acc.id)}">Remove</button>
                     </div>
                   </div>
-                `
-                  )
+                `;
+                  })
                   .join('')
           }
+        </div>
+      </div>
+    </div>
+
+    <!-- DEDICATED PART 2 SECTION: LEGITIMATE OFFLINE AVAILABILITY -->
+    <div class="card" id="offline-availability-section">
+      <div class="card-title">
+        <span>Offline Availability (Legitimate Local Singleplayer)</span>
+        <span class="badge ${offline?.eligible ? 'badge-supported' : 'badge-legacy'}">
+          ${
+            offline?.activeSessionMode === 'offline_singleplayer'
+              ? 'Offline Singleplayer Active'
+              : offline?.eligible
+                ? 'Offline Singleplayer Ready'
+                : 'Online Verification Required First'
+          }
+        </span>
+      </div>
+      <div class="card-desc">
+        Allows launching local singleplayer worlds when your internet connection is unavailable — strictly for an account that previously completed official Microsoft authentication and Minecraft: Java Edition entitlement verification on this device.
+      </div>
+
+      <div class="grid-2" style="margin-top:14px">
+        <div style="padding:12px 14px;border-radius:8px;background:var(--bg-canvas);border:1px solid var(--border-subtle);font-size:12.5px;display:flex;flex-direction:column;gap:8px">
+          <div style="display:flex;justify-content:space-between">
+            <span style="color:var(--text-secondary)">Verified Local Account:</span>
+            <strong>${
+              offline?.verifiedUsername
+                ? `${escapeHtml(offline.verifiedUsername)} (${escapeHtml((offline.verifiedUuid || '').slice(0, 8))}…)`
+                : 'None Verified Yet'
+            }</strong>
+          </div>
+          <div style="display:flex;justify-content:space-between">
+            <span style="color:var(--text-secondary)">Last Successful Online Auth:</span>
+            <span style="font-family:var(--font-mono)">${escapeHtml(formatTimestampShort(offline?.lastOnlineAuthAt))}</span>
+          </div>
+          <div style="display:flex;justify-content:space-between">
+            <span style="color:var(--text-secondary)">Local Game Files (${escapeHtml(activeProfile.mcVersion)}):</span>
+            <span style="color:${offline?.localGameReady ? '#34d399' : '#fbbf24'};font-weight:700">
+              ${offline?.localGameReady ? '✓ Installed & Hash-Verified' : '○ Install While Online First'}
+            </span>
+          </div>
+          <div style="margin-top:4px;font-size:12px;color:var(--text-muted)">
+            ${escapeHtml(offline?.statusReason || '')}
+          </div>
+        </div>
+
+        <div style="padding:12px 14px;border-radius:8px;background:var(--bg-canvas);border:1px solid var(--border-subtle);font-size:12px;display:flex;flex-direction:column;justify-content:space-between;gap:10px">
+          <div>
+            <div style="font-weight:700;color:var(--text-primary);margin-bottom:6px">Enforced Offline Mode Restrictions</div>
+            ${(
+              offline?.restrictions || [
+                'Singleplayer and local worlds only (--disableMultiplayer enforced).',
+                'Multiplayer server connections are disabled while offline.',
+                'Identity locked to your previously Microsoft-verified account.',
+              ]
+            )
+              .map((r) => `<div style="color:var(--text-secondary);margin-bottom:3px">• ${escapeHtml(r)}</div>`)
+              .join('')}
+          </div>
+
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button
+              class="btn btn-primary"
+              id="btn-launch-offline-sp"
+              ${offline?.eligible ? '' : 'disabled'}
+            >
+              ▶ Launch Offline Singleplayer (${escapeHtml(activeProfile.mcVersion)})
+            </button>
+            ${
+              offline?.activeSessionMode === 'offline_singleplayer'
+                ? `<button class="btn btn-cyan" id="btn-restore-online-session">↻ Restore Online Session</button>`
+                : ''
+            }
+          </div>
         </div>
       </div>
     </div>
@@ -152,6 +343,21 @@ export function renderSettingsPage(snap: AppStateSnapshot): string {
           `
             )
             .join('')}
+        </div>
+
+        <div class="form-row" style="margin-top:12px">
+          <div style="flex:1">
+            <div class="form-label">Custom Global Java Executable Path (Advanced Override)</div>
+            <div class="form-hint">Optional path to a custom <code>java</code> / <code>javaw.exe</code> binary. Leave blank to let Vespera automatically match Java 8, 17, or 21 per Minecraft version.</div>
+            <input
+              type="text"
+              class="input"
+              id="set-custom-java-exe"
+              value="${escapeHtml(s.customJavaExecutablePath || '')}"
+              placeholder="Auto-managed per version (Java 8 / 17 / 21)"
+              style="width:100%;margin-top:6px;font-family:var(--font-mono)"
+            />
+          </div>
         </div>
 
         <div class="form-row" style="margin-top:12px">
@@ -407,7 +613,7 @@ export function renderAboutPage(snap: AppStateSnapshot): string {
           </div>
         </div>
         <div class="card-desc">
-          Vespera separates its lightweight native Windows desktop launcher (<code>VesperaClient.exe</code>, Win32 + Edge WebView2 + WinHTTP + DPAPI + CNG BCrypt) from its decoupled client-side Fabric integration mod (<code>vespera-client-1.0.0+mc1.21.4.jar</code>), keeping launcher RAM overhead minimal and background CPU utilization at 0.0% during gameplay.
+          Vespera separates its lightweight native Windows desktop launcher (<code>VesperaClient.exe</code>, Win32 + Edge WebView2 + WinHTTP + WinSock2 PKCE + DPAPI + CNG BCrypt) from its decoupled client-side Fabric integration mod (<code>vespera-client-1.1.0+mc1.21.4.jar</code>), keeping launcher RAM overhead minimal and background CPU utilization at 0.0% during gameplay.
         </div>
       </div>
 
@@ -475,28 +681,54 @@ export function renderAboutPage(snap: AppStateSnapshot): string {
 export function bindAccountsSettingsDiagEvents(
   stage: HTMLElement,
   callbacks: {
-    onStartMsaAuth: (clientId: string) => void;
+    onStartPkceAuth: () => void;
+    onStartDeviceAuth: () => void;
     onPollMsaAuth: () => void;
+    onCancelAuthFlow: () => void;
+    onRefreshPkceState: () => void;
+    onCopyDeviceCode: (code: string) => void;
+    onRefreshAccount: (id: string) => void;
     onSwitchAccount: (id: string) => void;
+    onSignOutAccount: (id: string) => void;
     onRemoveAccount: (id: string) => void;
+    onLaunchOfflineSingleplayer: () => void;
+    onRestoreOnlineSession: () => void;
     onUpdateSettings: (patch: Partial<LauncherSettings>) => void;
     onUpdateGraphics: (patch: Partial<GraphicsSettings>) => void;
     onRunBenchmarks: () => void;
     onApplyAutoFix: (actionId: string) => void;
   }
 ): void {
-  stage.querySelector('#btn-start-msa-auth')?.addEventListener('click', () => {
-    const cid = (stage.querySelector('#msa-client-id-input') as HTMLInputElement)?.value || '';
-    callbacks.onUpdateSettings({ microsoftAzureClientId: cid.trim() });
-    callbacks.onStartMsaAuth(cid.trim());
-  });
-
+  stage.querySelector('#btn-start-pkce-auth')?.addEventListener('click', callbacks.onStartPkceAuth);
+  stage.querySelector('#btn-start-device-auth')?.addEventListener('click', callbacks.onStartDeviceAuth);
   stage.querySelector('#btn-poll-msa-auth')?.addEventListener('click', callbacks.onPollMsaAuth);
+  stage.querySelector('#btn-cancel-auth-flow')?.addEventListener('click', callbacks.onCancelAuthFlow);
+  stage.querySelector('#btn-cancel-device-auth')?.addEventListener('click', callbacks.onCancelAuthFlow);
+  stage.querySelector('#btn-refresh-pkce-state')?.addEventListener('click', callbacks.onRefreshPkceState);
+
+  stage.querySelector('#btn-copy-device-code')?.addEventListener('click', (ev) => {
+    const code = (ev.currentTarget as HTMLElement).getAttribute('data-device-code-val') || '';
+    if (code) callbacks.onCopyDeviceCode(code);
+  });
 
   stage.querySelectorAll<HTMLElement>('[data-switch-account]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const id = btn.dataset.switchAccount;
       if (id) callbacks.onSwitchAccount(id);
+    });
+  });
+
+  stage.querySelectorAll<HTMLElement>('[data-refresh-account]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const id = btn.dataset.refreshAccount;
+      if (id) callbacks.onRefreshAccount(id);
+    });
+  });
+
+  stage.querySelectorAll<HTMLElement>('[data-signout-account]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const id = btn.dataset.signoutAccount;
+      if (id) callbacks.onSignOutAccount(id);
     });
   });
 
@@ -507,7 +739,19 @@ export function bindAccountsSettingsDiagEvents(
     });
   });
 
+  stage
+    .querySelector('#btn-launch-offline-sp')
+    ?.addEventListener('click', callbacks.onLaunchOfflineSingleplayer);
+  stage
+    .querySelector('#btn-restore-online-session')
+    ?.addEventListener('click', callbacks.onRestoreOnlineSession);
+
   // Settings controls
+  stage.querySelector('#set-custom-java-exe')?.addEventListener('change', (ev) => {
+    callbacks.onUpdateSettings({
+      customJavaExecutablePath: (ev.target as HTMLInputElement).value.trim(),
+    });
+  });
   stage.querySelector('#set-extra-jvm')?.addEventListener('change', (ev) => {
     callbacks.onUpdateSettings({ customJvmExtraArgs: (ev.target as HTMLInputElement).value });
   });

@@ -17,19 +17,24 @@ import type {
   GraphicsSettings,
   HudLayoutProfile,
   InstalledModRecord,
+  LaunchPreparationReport,
   LauncherSettings,
   ModCategory,
   ModHistoryEvent,
+  ModloaderType,
   PerformanceModeId,
   PerformanceSettings,
   ProfileSnapshotBackup,
   ResourcePackEntry,
   ShaderPackEntry,
 } from '../shared/types';
-import { getVersionDescriptor, MINECRAFT_VERSION_CATALOG } from '../shared/versionCatalog';
-import { MicrosoftAuthService } from './authService';
+import { getVersionDescriptor, isVesperaCustomModCompatible } from '../shared/versionCatalog';
+import { AuthService, type AuthServiceOptions } from './authService';
 import { DiagnosticsAndBenchmarkService } from './diagnosticsAndBenchmarkService';
-import { MinecraftLauncherService } from './minecraftLauncherService';
+import {
+  MinecraftLauncherService,
+  type MinecraftLauncherServiceOptions,
+} from './minecraftLauncherService';
 import { ModManagerService } from './modManagerService';
 import { redactSensitiveTokens, writeFileAtomicSync } from './securityUtils';
 
@@ -47,6 +52,11 @@ interface PersistedStateFile {
   latestBenchmark: BenchmarkSuiteReport | null;
 }
 
+export interface StateCoordinatorOptions {
+  authOptions?: AuthServiceOptions;
+  launcherOptions?: MinecraftLauncherServiceOptions;
+}
+
 export class VesperaStateCoordinator {
   readonly dataRootDir: string;
   private readonly stateFilePath: string;
@@ -55,15 +65,14 @@ export class VesperaStateCoordinator {
   private persisted: PersistedStateFile;
   private recentLogs: string[] = [];
 
-  readonly authService: MicrosoftAuthService;
+  readonly authService: AuthService;
   readonly modManager: ModManagerService;
   readonly launcherService: MinecraftLauncherService;
   readonly diagBenchService: DiagnosticsAndBenchmarkService;
 
-  constructor(customDataRootDir?: string) {
+  constructor(customDataRootDir?: string, options: StateCoordinatorOptions = {}) {
     this.dataRootDir =
-      customDataRootDir ??
-      path.resolve(process.cwd(), '.vespera-dev-data');
+      customDataRootDir ?? path.resolve(process.cwd(), '.vespera-dev-data');
     fs.mkdirSync(this.dataRootDir, { recursive: true });
 
     this.stateFilePath = path.join(this.dataRootDir, 'vespera-state.json');
@@ -71,17 +80,25 @@ export class VesperaStateCoordinator {
     this.ipcDir = path.join(this.dataRootDir, 'ipc');
     fs.mkdirSync(this.ipcDir, { recursive: true });
 
-    const bundledModJarPath = path.resolve(
+    const v110ModJar = path.resolve(
+      process.cwd(),
+      'release/mods/vespera-client-1.1.0+mc1.21.4.jar'
+    );
+    const v100ModJar = path.resolve(
       process.cwd(),
       'release/mods/vespera-client-1.0.0+mc1.21.4.jar'
     );
+    const bundledModJarPath = fs.existsSync(v110ModJar) ? v110ModJar : v100ModJar;
     const benchJarPath = path.resolve(
       process.cwd(),
       'dist/bench/vespera-benchmark-runner.jar'
     );
 
     const logSink = (line: string) => this.appendLog(line);
-    this.authService = new MicrosoftAuthService(path.join(this.dataRootDir, 'vault'), logSink);
+    this.authService = new AuthService(path.join(this.dataRootDir, 'vault'), {
+      onLog: logSink,
+      ...options.authOptions,
+    });
     this.modManager = new ModManagerService(
       path.join(this.dataRootDir, 'mods-pool'),
       bundledModJarPath,
@@ -89,8 +106,7 @@ export class VesperaStateCoordinator {
     );
     this.launcherService = new MinecraftLauncherService(
       this.dataRootDir,
-      bundledModJarPath,
-      logSink
+      options.launcherOptions
     );
     this.diagBenchService = new DiagnosticsAndBenchmarkService(
       this.ipcDir,
@@ -124,21 +140,70 @@ export class VesperaStateCoordinator {
   }
 
   shutdownCleanly(): void {
+    this.authService.cancelActiveAuthFlow();
+    this.launcherService.cancelActiveDownload();
     if (fs.existsSync(this.crashLockPath)) {
       fs.unlinkSync(this.crashLockPath);
     }
+  }
+
+  private migratePersistedState(raw: PersistedStateFile): PersistedStateFile {
+    const defaultSettings = createDefaultLauncherSettings(this.dataRootDir);
+    const migratedProfiles: ClientProfile[] = raw.profiles.map((p) => {
+      const loader: ModloaderType =
+        p.loader === 'vanilla' || p.loader === 'legacy_fabric' ? p.loader : 'fabric';
+      const vesperaOk = loader === 'fabric' && isVesperaCustomModCompatible(p.mcVersion);
+      return {
+        ...p,
+        loader,
+        loaderVersion: p.loaderVersion || (loader === 'vanilla' ? 'vanilla' : '0.16.10'),
+        vesperaModCompatible: vesperaOk,
+        enabledModIds:
+          loader === 'vanilla'
+            ? []
+            : (p.enabledModIds || []).filter(
+                (id) => id !== 'vespera-client' || vesperaOk
+              ),
+      };
+    });
+
+    return {
+      ...raw,
+      schemaVersion: 2,
+      profiles: migratedProfiles,
+      settings: {
+        ...defaultSettings,
+        ...raw.settings,
+        customJavaExecutablePath: raw.settings?.customJavaExecutablePath ?? '',
+        showSnapshotsInVersionList: raw.settings?.showSnapshotsInVersionList ?? false,
+        showHistoricalInVersionList: raw.settings?.showHistoricalInVersionList ?? false,
+      },
+    };
   }
 
   private loadOrInitializeState(): PersistedStateFile {
     if (fs.existsSync(this.stateFilePath)) {
       try {
         const raw = JSON.parse(fs.readFileSync(this.stateFilePath, 'utf8')) as PersistedStateFile;
-        if (raw && raw.schemaVersion === 1 && Array.isArray(raw.profiles) && raw.profiles.length > 0) {
-          this.appendLog('[Core] Loaded persisted Vespera Client configuration.');
-          return raw;
+        if (
+          raw &&
+          (raw.schemaVersion === 1 || raw.schemaVersion === 2) &&
+          Array.isArray(raw.profiles) &&
+          raw.profiles.length > 0
+        ) {
+          const migrated = this.migratePersistedState(raw);
+          if (raw.schemaVersion !== 2) {
+            this.saveState(migrated);
+            this.appendLog('[Migration] Seamlessly upgraded v1.0.0 user profiles to v1.1.0 schema.');
+          } else {
+            this.appendLog('[Core] Loaded persisted Vespera Client v1.1.0 configuration.');
+          }
+          return migrated;
         }
       } catch {
-        this.appendLog('[CrashRecovery] State file unreadable; restoring clean verified configuration.');
+        this.appendLog(
+          '[CrashRecovery] State file unreadable; restoring clean verified configuration.'
+        );
       }
     }
 
@@ -148,7 +213,7 @@ export class VesperaStateCoordinator {
     const installedMods = this.modManager.bootstrapDefaultMods('1.21.4');
 
     const fresh: PersistedStateFile = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       profiles,
       activeProfileId: profiles[0].id,
       profileBackups: [],
@@ -160,8 +225,9 @@ export class VesperaStateCoordinator {
           profileId: profiles[0].id,
           action: 'install',
           modName: 'Vespera Optimization Bundle',
-          version: '1.0.0+mc1.21.4',
-          details: 'Initialized curated Sodium + Lithium + FerriteCore + ImmediatelyFast + Iris + Vespera Core stack.',
+          version: '1.1.0+mc1.21.4',
+          details:
+            'Initialized curated Sodium + Lithium + FerriteCore + ImmediatelyFast + Iris + Vespera Core stack.',
         },
       ],
       shaderPacks: createDefaultShaderPacks(),
@@ -182,7 +248,7 @@ export class VesperaStateCoordinator {
     };
 
     this.saveState(fresh);
-    this.appendLog(`[Core] Initialized Vespera Client v1.0.0 (Recommended Heap: ${recRam} MB).`);
+    this.appendLog(`[Core] Initialized Vespera Client v1.1.0 (Recommended Heap: ${recRam} MB).`);
     return fresh;
   }
 
@@ -194,6 +260,13 @@ export class VesperaStateCoordinator {
     return (
       this.persisted.profiles.find((p) => p.id === this.persisted.activeProfileId) ??
       this.persisted.profiles[0]
+    );
+  }
+
+  private getActiveHudLayout(profile: ClientProfile): HudLayoutProfile {
+    return (
+      this.persisted.hudLayouts.find((h) => h.id === profile.hudLayoutId) ??
+      this.persisted.hudLayouts[0]
     );
   }
 
@@ -213,7 +286,9 @@ export class VesperaStateCoordinator {
       this.persisted.profileBackups = this.persisted.profileBackups.slice(0, 30);
     }
     this.saveState();
-    this.appendLog(`[Backup] Saved rollback snapshot "${backup.id}" for "${prof.name}" (${reason}).`);
+    this.appendLog(
+      `[Backup] Saved rollback snapshot "${backup.id}" for "${prof.name}" (${reason}).`
+    );
     return backup;
   }
 
@@ -249,7 +324,6 @@ export class VesperaStateCoordinator {
     const prof = this.persisted.profiles.find((p) => p.id === profileId);
     if (!prof) throw new Error(`Profile "${profileId}" not found.`);
     this.persisted.activeProfileId = prof.id;
-    // Sync active shader state
     for (const sp of this.persisted.shaderPacks) {
       sp.active = sp.id === prof.activeShaderPackId;
     }
@@ -258,7 +332,9 @@ export class VesperaStateCoordinator {
     }
     this.saveState();
     this.syncActiveHudToIpc();
-    this.appendLog(`[Profiles] Activated profile "${prof.name}" (MC ${prof.mcVersion}).`);
+    this.appendLog(
+      `[Profiles] Activated profile "${prof.name}" (MC ${prof.mcVersion} • ${prof.loader}).`
+    );
     return prof;
   }
 
@@ -266,39 +342,88 @@ export class VesperaStateCoordinator {
     name: string;
     archetype: ClientProfile['archetype'];
     mcVersion: string;
+    loader?: ModloaderType;
+    loaderVersion?: string;
+    customJavaPath?: string;
+    customGameDir?: string;
     description?: string;
   }): ClientProfile {
-    const ver = getVersionDescriptor(params.mcVersion);
+    const dynamicCatalog = this.launcherService.getAnnotatedVersions(
+      this.persisted.settings.gameDataDir
+    );
+    const ver = getVersionDescriptor(params.mcVersion, dynamicCatalog);
     if (!ver || ver.supportTier === 'unsupported') {
-      throw new Error(`Cannot create profile for unsupported Minecraft version "${params.mcVersion}".`);
+      throw new Error(
+        `Cannot create profile for unsupported Minecraft version "${params.mcVersion}".`
+      );
     }
+
     const base = this.getActiveProfile();
     const now = new Date().toISOString();
-    const loader = ver.supportTier === 'legacy_pvp' ? 'legacy_fabric' : 'fabric';
+
+    let loader: ModloaderType;
+    if (params.loader) {
+      if (params.loader === 'fabric' && ver.fabricSupported === false) {
+        throw new Error(
+          `Minecraft ${params.mcVersion} is Vanilla-only and does not support modern Fabric Loader.`
+        );
+      }
+      loader = params.loader;
+    } else if (ver.supportTier === 'legacy_pvp') {
+      loader = 'legacy_fabric';
+    } else if (ver.fabricSupported) {
+      loader = 'fabric';
+    } else {
+      loader = 'vanilla';
+    }
+
+    const vesperaOk = loader === 'fabric' && isVesperaCustomModCompatible(params.mcVersion);
+
     const compatibleModIds =
-      loader === 'legacy_fabric'
+      loader === 'vanilla' || loader === 'legacy_fabric'
         ? []
         : base.enabledModIds.filter((modId) => {
+            if (modId === 'vespera-client' && !vesperaOk) return false;
             const c = CURATED_MOD_CATALOG.find((m) => m.id === modId);
             return c ? c.supportedMcVersions.includes(params.mcVersion) : false;
           });
 
+    const recommendedRam =
+      ver.recommendedJavaMajor === 8
+        ? Math.min(3072, base.performance.allocatedRamMb)
+        : base.performance.allocatedRamMb;
+
     const created: ClientProfile = {
       id: `profile-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      name: params.name.trim() || `Custom ${params.mcVersion}`,
+      name: params.name.trim() || `${loader === 'vanilla' ? 'Vanilla' : 'Fabric'} ${params.mcVersion}`,
       archetype: params.archetype,
       description:
         params.description?.trim() ||
-        `Independent ${params.archetype} configuration for Minecraft ${params.mcVersion}.`,
+        `Isolated ${loader === 'vanilla' ? 'Vanilla' : 'Fabric'} installation for Minecraft ${params.mcVersion}.`,
       mcVersion: params.mcVersion,
       loader,
-      loaderVersion: ver.recommendedFabricLoader ?? '0.16.10',
-      performance: { ...base.performance },
+      loaderVersion:
+        loader === 'vanilla'
+          ? 'vanilla'
+          : params.loaderVersion || ver.recommendedFabricLoader || '0.16.10',
+      vesperaModCompatible: vesperaOk,
+      customJavaPath: params.customJavaPath?.trim() || undefined,
+      customGameDir: params.customGameDir?.trim() || undefined,
+      performance: {
+        ...base.performance,
+        allocatedRamMb: recommendedRam,
+        gcMode: ver.recommendedJavaMajor < 21 ? 'adaptive_g1gc' : base.performance.gcMode,
+      },
       graphics: { ...base.graphics },
       hudLayoutId: base.hudLayoutId,
       enabledModIds: compatibleModIds,
       activeShaderPackId: null,
-      enabledResourcePackIds: loader === 'legacy_fabric' ? ['rp-legacy-1.8-pack'] : ['rp-vespera-clarity-32x'],
+      enabledResourcePackIds:
+        params.mcVersion === '1.8.9'
+          ? ['rp-legacy-1.8-pack']
+          : vesperaOk
+            ? ['rp-vespera-clarity-32x']
+            : [],
       createdAt: now,
       updatedAt: now,
     };
@@ -306,8 +431,90 @@ export class VesperaStateCoordinator {
     this.persisted.profiles.push(created);
     this.persisted.activeProfileId = created.id;
     this.saveState();
-    this.appendLog(`[Profiles] Created independent profile "${created.name}" (${created.mcVersion}).`);
+    this.appendLog(
+      `[Profiles] Created isolated profile "${created.name}" (MC ${created.mcVersion} • ${created.loader}).`
+    );
     return created;
+  }
+
+  /**
+   * Updates the active profile's target Minecraft version, modloader (`vanilla` / `fabric`),
+   * loader version, or custom Java / game directory while strictly enforcing mod compatibility.
+   */
+  updateProfileInstallationTarget(params: {
+    profileId?: string;
+    name?: string;
+    mcVersion?: string;
+    loader?: ModloaderType;
+    loaderVersion?: string;
+    customJavaPath?: string;
+    customGameDir?: string;
+  }): ClientProfile {
+    const target = params.profileId
+      ? this.persisted.profiles.find((p) => p.id === params.profileId)
+      : this.getActiveProfile();
+    if (!target) {
+      throw new Error('Target installation profile not found.');
+    }
+
+    const nextMcVersion = params.mcVersion ?? target.mcVersion;
+    const dynamicCatalog = this.launcherService.getAnnotatedVersions(
+      this.persisted.settings.gameDataDir
+    );
+    const ver = getVersionDescriptor(nextMcVersion, dynamicCatalog);
+    if (!ver || ver.supportTier === 'unsupported') {
+      throw new Error(`Minecraft version "${nextMcVersion}" is unsupported.`);
+    }
+
+    let nextLoader = params.loader ?? target.loader;
+    if (nextLoader === 'fabric' && ver.fabricSupported === false) {
+      nextLoader = ver.id === '1.8.9' ? 'vanilla' : 'vanilla';
+    }
+
+    const vesperaOk = nextLoader === 'fabric' && isVesperaCustomModCompatible(nextMcVersion);
+    target.mcVersion = nextMcVersion;
+    target.loader = nextLoader;
+    target.loaderVersion =
+      nextLoader === 'vanilla'
+        ? 'vanilla'
+        : params.loaderVersion ||
+          (target.loaderVersion !== 'vanilla' ? target.loaderVersion : undefined) ||
+          ver.recommendedFabricLoader ||
+          '0.16.10';
+    target.vesperaModCompatible = vesperaOk;
+
+    if (params.name !== undefined && params.name.trim()) {
+      target.name = params.name.trim();
+    }
+    if (params.customJavaPath !== undefined) {
+      target.customJavaPath = params.customJavaPath.trim() || undefined;
+    }
+    if (params.customGameDir !== undefined) {
+      target.customGameDir = params.customGameDir.trim() || undefined;
+    }
+
+    // Strip any incompatible mods when changing version or switching to Vanilla
+    if (nextLoader === 'vanilla' || nextLoader === 'legacy_fabric') {
+      target.enabledModIds = [];
+      target.activeShaderPackId = null;
+    } else {
+      target.enabledModIds = target.enabledModIds.filter((modId) => {
+        if (modId === 'vespera-client' && !vesperaOk) return false;
+        const c = CURATED_MOD_CATALOG.find((m) => m.id === modId);
+        return c ? c.supportedMcVersions.includes(nextMcVersion) : false;
+      });
+    }
+
+    if (ver.recommendedJavaMajor < 21 && target.performance.gcMode === 'generational_zgc') {
+      target.performance.gcMode = 'adaptive_g1gc';
+    }
+
+    target.updatedAt = new Date().toISOString();
+    this.saveState();
+    this.appendLog(
+      `[Profiles] Updated "${target.name}" -> MC ${target.mcVersion} (${target.loader}).`
+    );
+    return target;
   }
 
   exportProfileJson(profileId: string): string {
@@ -332,12 +539,22 @@ export class VesperaStateCoordinator {
       profile?: ClientProfile;
       hudLayout?: HudLayoutProfile;
     };
-    if (parsed.vesperaProfileFormat !== 1 || !parsed.profile || !parsed.profile.name || !parsed.profile.mcVersion) {
+    if (
+      parsed.vesperaProfileFormat !== 1 ||
+      !parsed.profile ||
+      !parsed.profile.name ||
+      !parsed.profile.mcVersion
+    ) {
       throw new Error('Invalid .vesperaprofile schema.');
     }
-    const ver = getVersionDescriptor(parsed.profile.mcVersion);
+    const dynamicCatalog = this.launcherService.getAnnotatedVersions(
+      this.persisted.settings.gameDataDir
+    );
+    const ver = getVersionDescriptor(parsed.profile.mcVersion, dynamicCatalog);
     if (!ver || ver.supportTier === 'unsupported') {
-      throw new Error(`Imported profile targets unsupported version "${parsed.profile.mcVersion}".`);
+      throw new Error(
+        `Imported profile targets unsupported version "${parsed.profile.mcVersion}".`
+      );
     }
 
     const now = new Date().toISOString();
@@ -368,9 +585,14 @@ export class VesperaStateCoordinator {
       this.createProfileBackup(active.id, `Before switching performance mode to ${mode}`);
     }
     const preset = PERFORMANCE_MODE_PRESETS[mode];
+    const ver = getVersionDescriptor(active.mcVersion);
     active.performance = {
       ...active.performance,
       ...preset.performance,
+      gcMode:
+        ver && ver.recommendedJavaMajor < 21 && preset.performance.gcMode === 'generational_zgc'
+          ? 'adaptive_g1gc'
+          : preset.performance.gcMode,
       mode,
     };
     active.graphics = {
@@ -408,10 +630,12 @@ export class VesperaStateCoordinator {
     const active = this.getActiveProfile();
     active.graphics = { ...active.graphics, ...patch };
     active.updatedAt = new Date().toISOString();
-    this.launcherService.verifyAndMaterializeInstance(
+    this.launcherService.materializeInstanceFiles(
       active,
       this.persisted.settings,
-      this.persisted.installedMods
+      this.getActiveHudLayout(active),
+      this.persisted.installedMods,
+      this.persisted.shaderPacks
     );
     this.saveState();
     return active;
@@ -440,9 +664,7 @@ export class VesperaStateCoordinator {
 
   private syncActiveHudToIpc(): void {
     const active = this.getActiveProfile();
-    const hud =
-      this.persisted.hudLayouts.find((h) => h.id === active.hudLayoutId) ??
-      this.persisted.hudLayouts[0];
+    const hud = this.getActiveHudLayout(active);
     if (hud) {
       writeFileAtomicSync(
         path.join(this.ipcDir, 'hud-profile.json'),
@@ -451,14 +673,19 @@ export class VesperaStateCoordinator {
     }
   }
 
-  selectShaderPack(shaderId: string | null, profileQuality?: ShaderPackEntry['selectedProfile']): ShaderPackEntry[] {
+  selectShaderPack(
+    shaderId: string | null,
+    profileQuality?: ShaderPackEntry['selectedProfile']
+  ): ShaderPackEntry[] {
     const active = this.getActiveProfile();
-    if (shaderId && !active.enabledModIds.includes('iris')) {
-      // Automatically ensure Iris + Sodium are enabled if compatible
-      if (active.mcVersion !== '1.8.9') {
+    if (shaderId && active.loader === 'fabric' && !active.enabledModIds.includes('iris')) {
+      const ver = getVersionDescriptor(active.mcVersion);
+      if (ver?.irisSupported) {
         if (!active.enabledModIds.includes('sodium')) active.enabledModIds.push('sodium');
         active.enabledModIds.push('iris');
-        this.appendLog('[Shaders] Auto-enabled Iris Shaders + Sodium for active shader pipeline.');
+        this.appendLog(
+          '[Shaders] Auto-enabled Iris Shaders + Sodium for active shader pipeline.'
+        );
       }
     }
     active.activeShaderPackId = shaderId;
@@ -480,7 +707,9 @@ export class VesperaStateCoordinator {
     if (enabled && !active.enabledResourcePackIds.includes(packId)) {
       active.enabledResourcePackIds.push(packId);
     } else if (!enabled) {
-      active.enabledResourcePackIds = active.enabledResourcePackIds.filter((id) => id !== packId);
+      active.enabledResourcePackIds = active.enabledResourcePackIds.filter(
+        (id) => id !== packId
+      );
     }
     this.saveState();
     return this.persisted.resourcePacks;
@@ -497,6 +726,11 @@ export class VesperaStateCoordinator {
 
   async installMod(modIdOrSlug: string) {
     const active = this.getActiveProfile();
+    if (active.loader === 'vanilla') {
+      throw new Error(
+        `Profile "${active.name}" is configured as pure Vanilla (${active.mcVersion}). Switch its modloader to Fabric to install mods.`
+      );
+    }
     if (this.persisted.settings.autoBackupBeforeProfileUpdate) {
       this.createProfileBackup(active.id, `Before installing mod ${modIdOrSlug}`);
     }
@@ -512,6 +746,14 @@ export class VesperaStateCoordinator {
 
   toggleMod(modId: string, enabled: boolean) {
     const active = this.getActiveProfile();
+    if (active.loader === 'vanilla') {
+      throw new Error('Cannot toggle mods on a pure Vanilla profile.');
+    }
+    if (enabled && modId === 'vespera-client' && !isVesperaCustomModCompatible(active.mcVersion)) {
+      throw new Error(
+        `Vespera's custom HUD mod is currently built and verified for Minecraft 1.21.4 only (active profile is ${active.mcVersion}).`
+      );
+    }
     this.modManager.toggleModForProfile(
       modId,
       enabled,
@@ -522,14 +764,183 @@ export class VesperaStateCoordinator {
     this.saveState();
   }
 
+  async installMinecraftVersionForTarget(params: {
+    versionId?: string;
+    loader?: ModloaderType;
+    loaderVersion?: string;
+    forceRepair?: boolean;
+  }) {
+    const active = this.getActiveProfile();
+    const versionId = params.versionId || active.mcVersion;
+    const loader = params.loader ?? (versionId === active.mcVersion ? active.loader : 'vanilla');
+    const loaderVersion =
+      params.loaderVersion ??
+      (versionId === active.mcVersion ? active.loaderVersion : undefined);
+
+    this.appendLog(
+      `[VersionManager] Starting verified ${params.forceRepair ? 'repair' : 'installation'} for Minecraft ${versionId} (${loader})...`
+    );
+
+    const receipt = await this.launcherService.installMinecraftVersion({
+      versionId,
+      loader,
+      loaderVersion,
+      profileId: versionId === active.mcVersion ? active.id : null,
+      settings: this.persisted.settings,
+      forceRepair: params.forceRepair,
+    });
+
+    this.appendLog(
+      `[VersionManager] Completed Minecraft ${versionId} (${loader}) — SHA-1 ${receipt.clientJarSha1.slice(0, 12)} verified, ${receipt.verifiedLibraries.length} libraries, ${receipt.nativesExtractedCount} native binaries extracted.`
+    );
+    return receipt;
+  }
+
+  prepareActiveLaunch(
+    requestedMode?: 'online_authenticated' | 'offline_singleplayer'
+  ): LaunchPreparationReport {
+    const active = this.getActiveProfile();
+    const sessionMode = requestedMode ?? this.authService.getActiveSessionMode();
+    const totalRamMb = Math.round(os.totalmem() / (1024 * 1024));
+
+    this.launcherService.materializeInstanceFiles(
+      active,
+      this.persisted.settings,
+      this.getActiveHudLayout(active),
+      this.persisted.installedMods,
+      this.persisted.shaderPacks
+    );
+
+    return this.launcherService.prepareLaunchCommand({
+      profile: active,
+      settings: this.persisted.settings,
+      account: this.authService.getActiveAccount(),
+      totalSystemRamMb: totalRamMb,
+      installedMods: this.persisted.installedMods,
+      sessionMode,
+    });
+  }
+
+  async launchActiveProfile(requestedMode?: 'online_authenticated' | 'offline_singleplayer'): Promise<{
+    launched: boolean;
+    stageReached: string;
+    pid?: number;
+    instanceDir?: string;
+    sessionMode: 'online_authenticated' | 'offline_singleplayer';
+    message: string;
+  }> {
+    const active = this.getActiveProfile();
+    const sessionMode = requestedMode ?? this.authService.getActiveSessionMode();
+    const totalRamMb = Math.round(os.totalmem() / (1024 * 1024));
+
+    if (sessionMode === 'offline_singleplayer') {
+      const localStatus = this.launcherService.getVersionInstallStatus(
+        active.mcVersion,
+        this.persisted.settings.gameDataDir
+      );
+      const offlineState = this.authService.computeOfflineAvailability(localStatus === 'ready');
+      if (!offlineState.eligible) {
+        return {
+          launched: false,
+          stageReached: offlineState.verifiedAccountId
+            ? 'version_not_installed_offline'
+            : 'authentication_required',
+          sessionMode,
+          message: offlineState.statusReason,
+        };
+      }
+      const verifiedAcc = this.authService
+        .listAccounts()
+        .find((a) => a.id === offlineState.verifiedAccountId)!;
+      const spawned = await this.launcherService.installAndLaunchMinecraft({
+        profile: active,
+        settings: this.persisted.settings,
+        account: verifiedAcc,
+        mcAccessToken: null,
+        sessionMode: 'offline_singleplayer',
+        hudLayout: this.getActiveHudLayout(active),
+        installedMods: this.persisted.installedMods,
+        shaderPacks: this.persisted.shaderPacks,
+        totalSystemRamMb: totalRamMb,
+        onLog: (line) => this.appendLog(line),
+      });
+      active.lastPlayedAt = new Date().toISOString();
+      this.saveState();
+      return {
+        launched: true,
+        stageReached: 'process_spawned_offline_singleplayer',
+        pid: spawned.pid,
+        instanceDir: spawned.instanceDir,
+        sessionMode: 'offline_singleplayer',
+        message: `Launched Minecraft ${active.mcVersion} in Offline Singleplayer mode as ${verifiedAcc.username} (multiplayer disabled).`,
+      };
+    }
+
+    // Online Authenticated Mode
+    let session: { account: import('../shared/types').MinecraftAccount; mcAccessToken: string } | null =
+      null;
+    try {
+      session = await this.authService.acquireLaunchSessionToken();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.appendLog(`[Auth] Online session validation halted: ${msg}`);
+      return {
+        launched: false,
+        stageReached: 'authentication_required',
+        sessionMode: 'online_authenticated',
+        message: msg,
+      };
+    }
+
+    if (!session) {
+      this.appendLog(
+        '[Launch] Blocked online launch: Sign in with a Microsoft account owning Minecraft: Java Edition first.'
+      );
+      return {
+        launched: false,
+        stageReached: 'authentication_required',
+        sessionMode: 'online_authenticated',
+        message:
+          'Sign in with Microsoft on the Accounts page before launching online multiplayer, or use Offline Singleplayer if previously verified.',
+      };
+    }
+
+    const spawned = await this.launcherService.installAndLaunchMinecraft({
+      profile: active,
+      settings: this.persisted.settings,
+      account: session.account,
+      mcAccessToken: session.mcAccessToken,
+      sessionMode: 'online_authenticated',
+      hudLayout: this.getActiveHudLayout(active),
+      installedMods: this.persisted.installedMods,
+      shaderPacks: this.persisted.shaderPacks,
+      totalSystemRamMb: totalRamMb,
+      onLog: (line) => this.appendLog(line),
+    });
+
+    active.lastPlayedAt = new Date().toISOString();
+    this.saveState();
+    return {
+      launched: true,
+      stageReached: 'process_spawned_authenticated',
+      pid: spawned.pid,
+      instanceDir: spawned.instanceDir,
+      sessionMode: 'online_authenticated',
+      message: `Launched Minecraft ${active.mcVersion} (${active.loader}) as ${session.account.username}.`,
+    };
+  }
+
   applyDiagnosticAutoFix(actionId: string): void {
     const active = this.getActiveProfile();
     if (actionId === 'autofix-apply-recommended-ram') {
       const totalRamMb = Math.round(os.totalmem() / (1024 * 1024));
-      const rec = computeRecommendedRam(totalRamMb, 21);
+      const ver = getVersionDescriptor(active.mcVersion);
+      const rec = computeRecommendedRam(totalRamMb, ver?.recommendedJavaMajor ?? 21);
       active.performance.allocatedRamMb = rec.recommendedMb;
       active.performance.gcMode = rec.recommendedGc;
-      this.appendLog(`[Doctor] Applied recommended heap (${rec.recommendedMb} MB) & ${rec.recommendedGc}.`);
+      this.appendLog(
+        `[Doctor] Applied recommended heap (${rec.recommendedMb} MB) & ${rec.recommendedGc}.`
+      );
     } else if (actionId.startsWith('autofix-enable-mod:')) {
       const modId = actionId.split(':')[1];
       if (!active.enabledModIds.includes(modId)) active.enabledModIds.push(modId);
@@ -543,12 +954,18 @@ export class VesperaStateCoordinator {
   }
 
   runBenchmarks(): BenchmarkSuiteReport {
-    const runtimes = this.launcherService.detectJavaRuntimes();
-    const java21 = runtimes.find((r) => r.major === 21 && r.installed) ?? runtimes.find((r) => r.installed);
+    const runtimes = this.launcherService.detectJavaRuntimes(
+      this.persisted.settings.customJavaExecutablePath
+    );
+    const java21 =
+      runtimes.find((r) => r.major === 21 && r.installed) ?? runtimes.find((r) => r.installed);
     if (!java21) {
       throw new Error('Java 21 runtime is required to execute the JVM & Voxel Benchmark Suite.');
     }
-    const report = this.diagBenchService.runReproducibleBenchmarks(java21.path, this.getActiveProfile());
+    const report = this.diagBenchService.runReproducibleBenchmarks(
+      java21.path,
+      this.getActiveProfile()
+    );
     this.persisted.latestBenchmark = report;
     this.saveState();
     return report;
@@ -556,7 +973,9 @@ export class VesperaStateCoordinator {
 
   getSnapshot(): AppStateSnapshot {
     const activeProfile = this.getActiveProfile();
-    const javaRuntimes = this.launcherService.detectJavaRuntimes();
+    const customJava =
+      activeProfile.customJavaPath || this.persisted.settings.customJavaExecutablePath;
+    const javaRuntimes = this.launcherService.detectJavaRuntimes(customJava);
     const mcProc = this.launcherService.isGameRunning();
     const telemetry = this.diagBenchService.collectTelemetry(
       activeProfile,
@@ -573,7 +992,16 @@ export class VesperaStateCoordinator {
     const accounts = this.authService.listAccounts();
     const activeAccount = this.authService.getActiveAccount();
 
-    // Update resource pack compatibility flags relative to active profile's MC version
+    const versions = this.launcherService.getAnnotatedVersions(
+      this.persisted.settings.gameDataDir
+    );
+    const manifestMeta = this.launcherService.getManifestMetadata();
+    const activeVersionReady =
+      this.launcherService.getVersionInstallStatus(
+        activeProfile.mcVersion,
+        this.persisted.settings.gameDataDir
+      ) === 'ready';
+
     const isLegacy18 = activeProfile.mcVersion === '1.8.9';
     const resourcePacks = this.persisted.resourcePacks.map((rp) => ({
       ...rp,
@@ -582,11 +1010,18 @@ export class VesperaStateCoordinator {
     }));
 
     return {
-      version: '1.0.0',
+      version: '1.1.0',
       platformMode: 'node_preview_bridge',
+      oauthConfig: this.authService.getOAuthConfigState(),
+      authFlow: this.authService.getAuthFlowState(),
+      offlineAvailability: this.authService.computeOfflineAvailability(activeVersionReady),
       accounts,
       activeAccountId: activeAccount?.id ?? null,
-      versions: MINECRAFT_VERSION_CATALOG,
+      versions,
+      latestReleaseId: manifestMeta.latestReleaseId,
+      latestSnapshotId: manifestMeta.latestSnapshotId,
+      manifestSource: manifestMeta.manifestSource,
+      activeDownload: this.launcherService.getActiveDownloadProgress(),
       javaRuntimes,
       profiles: this.persisted.profiles,
       activeProfileId: activeProfile.id,

@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "provider": "microsoft_entra_public_client",
+  "clientId": "",
+  "tenant": "consumers",
+  "scopes": ["XboxLive.signin", "offline_access"],
+  "loopbackRedirectPath": "/callback",
+  "notes": "Maintainer build-time public Client ID configuration. Never place a client secret in desktop builds. Override locally via config/oauth.local.json or VESPERA_MSA_CLIENT_ID."
+}

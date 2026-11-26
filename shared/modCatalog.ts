@@ -23,7 +23,7 @@ export const CURATED_MOD_CATALOG: CuratedModEntry[] = [
     category: 'pvp_hud',
     license: 'MIT',
     loader: 'fabric',
-    supportedMcVersions: ['1.21.4', '1.21.1'],
+    supportedMcVersions: ['1.21.4'],
     requiredDependencies: ['fabric-api', 'fabric-language-kotlin'],
     incompatibleWith: ['optifabric'],
     defaultEnabledInModes: ['max_fps', 'balanced', 'visual_quality', 'custom'],
@@ -38,14 +38,9 @@ export const CURATED_MOD_CATALOG: CuratedModEntry[] = [
     verifiedSha512Prefix: 'vespera-local-verified',
     versionByMc: {
       '1.21.4': {
-        versionNumber: '1.0.0+mc1.21.4',
-        fileName: 'vespera-client-1.0.0+mc1.21.4.jar',
-        downloadUrl: 'local://release/mods/vespera-client-1.0.0+mc1.21.4.jar',
-      },
-      '1.21.1': {
-        versionNumber: '1.0.0+mc1.21.1',
-        fileName: 'vespera-client-1.0.0+mc1.21.4.jar',
-        downloadUrl: 'local://release/mods/vespera-client-1.0.0+mc1.21.4.jar',
+        versionNumber: '1.1.0+mc1.21.4',
+        fileName: 'vespera-client-1.1.0+mc1.21.4.jar',
+        downloadUrl: 'local://release/mods/vespera-client-1.1.0+mc1.21.4.jar',
       },
     },
   },

@@ -44,10 +44,36 @@ if (!fs.existsSync(path.join(ROOT, 'native/resources/vespera.ico'))) {
 }
 console.log('[build-windows] Building fresh Vite UI bundle...');
 execFileSync('npm', ['run', 'build:ui'], { stdio: 'inherit' });
-const modJarPath = path.join(RELEASE_DIR, 'mods/vespera-client-1.0.0+mc1.21.4.jar');
+const modJarPath = path.join(RELEASE_DIR, 'mods/vespera-client-1.1.0+mc1.21.4.jar');
 if (!fs.existsSync(modJarPath)) {
   execFileSync('node', ['scripts/build-mod.mjs'], { stdio: 'inherit' });
 }
+
+// 1b. Resolve build-time Microsoft Entra public Client ID (zero secrets, zero fake IDs)
+console.log('[build-windows] Resolving build-time OAuth public Client ID configuration...');
+const oauthMetaJson = execFileSync(
+  path.join(ROOT, 'node_modules/.bin/tsx'),
+  [
+    '-e',
+    `import { resolveBuildTimeOAuthConfig } from './shared/oauthBuildConfig.ts';
+     const cfg = resolveBuildTimeOAuthConfig();
+     process.stdout.write(JSON.stringify(cfg));`,
+  ],
+  { encoding: 'utf8' }
+);
+const oauthMeta = JSON.parse(oauthMetaJson);
+const embeddedOAuthHeader = [
+  '#ifndef VESPERA_EMBEDDED_OAUTH_H',
+  '#define VESPERA_EMBEDDED_OAUTH_H',
+  `static const char* kEmbeddedMsaClientId = ${JSON.stringify(oauthMeta.clientId || '')};`,
+  `static const char* kEmbeddedMsaConfigSource = ${JSON.stringify(oauthMeta.source || 'unconfigured')};`,
+  '#endif',
+  '',
+].join('\n');
+fs.writeFileSync(path.join(OBJ_DIR, 'embedded_oauth.h'), embeddedOAuthHeader);
+console.log(
+  `[build-windows] OAuth build config: configured=${oauthMeta.configured} (source=${oauthMeta.source})`
+);
 
 // 2. Inline dist/ui into a single self-contained HTML payload for WebView2
 console.log('[build-windows] Bundling compiled UI assets into native C++ WebView2 header...');
@@ -94,7 +120,7 @@ const defaultJsonStr = execFileSync(
      if (fs.existsSync('./docs/BENCHMARK_LATEST.json')) {
        snap.latestBenchmark = JSON.parse(fs.readFileSync('./docs/BENCHMARK_LATEST.json', 'utf8'));
      }
-     snap.recentLogs = ['[00:00:00] Vespera Client v1.0.0 Native Windows Engine Ready.'];
+     snap.recentLogs = ['[00:00:00] Vespera Client v1.1.0 Native Windows Engine Ready.'];
      c.shutdownCleanly();
      process.stdout.write(JSON.stringify(snap));`,
   ],
@@ -164,6 +190,7 @@ execFileSync(
     '-lcrypt32',
     '-lbcrypt',
     '-lwinhttp',
+    '-lws2_32',
     '-lpsapi',
     '-o',
     launcherExePath,
@@ -195,6 +222,7 @@ execFileSync(
     '-lbcrypt',
     '-lcrypt32',
     '-lwinhttp',
+    '-lws2_32',
     '-lpsapi',
     '-o',
     uninstallExePath,
@@ -202,8 +230,8 @@ execFileSync(
   { stdio: 'inherit' }
 );
 
-// 8. Generate setup_payload.h with SHA-256 checksums and compile VesperaClient-1.0.0-win64-setup.exe
-console.log('[build-windows] Packaging SHA-256 verified payload into VesperaClient-1.0.0-win64-setup.exe...');
+// 8. Generate setup_payload.h with SHA-256 checksums and compile VesperaClient-1.1.0-win64-setup.exe
+console.log('[build-windows] Packaging SHA-256 verified payload into VesperaClient-1.1.0-win64-setup.exe...');
 const launcherBytes = fs.readFileSync(launcherExePath);
 const uninstallBytes = fs.readFileSync(uninstallExePath);
 const iconBytes = fs.readFileSync(path.join(resDir, 'vespera.ico'));
@@ -243,7 +271,10 @@ const setupPayloadHeader = [
 
 fs.writeFileSync(path.join(OBJ_DIR, 'setup_payload.h'), setupPayloadHeader);
 
-const setupExePath = path.join(RELEASE_DIR, 'VesperaClient-1.0.0-win64-setup.exe');
+const legacySetupPath = path.join(RELEASE_DIR, 'VesperaClient-1.0.0-win64-setup.exe');
+if (fs.existsSync(legacySetupPath)) fs.unlinkSync(legacySetupPath);
+
+const setupExePath = path.join(RELEASE_DIR, 'VesperaClient-1.1.0-win64-setup.exe');
 execFileSync(
   ZIG_PY,
   [
@@ -268,6 +299,7 @@ execFileSync(
     '-lbcrypt',
     '-lcrypt32',
     '-lwinhttp',
+    '-lws2_32',
     '-lpsapi',
     '-o',
     setupExePath,
@@ -284,10 +316,10 @@ const modSha = crypto.createHash('sha256').update(modJarBuf).digest('hex');
 const iconSha = crypto.createHash('sha256').update(iconBytes).digest('hex');
 
 const checksumLines = [
-  `${setupSha}  VesperaClient-1.0.0-win64-setup.exe`,
+  `${setupSha}  VesperaClient-1.1.0-win64-setup.exe`,
   `${launcherSha}  bin/VesperaClient.exe`,
   `${uninstallSha}  bin/VesperaUninstall.exe`,
-  `${modSha}  mods/vespera-client-1.0.0+mc1.21.4.jar`,
+  `${modSha}  mods/vespera-client-1.1.0+mc1.21.4.jar`,
   `${iconSha}  vespera.ico`,
   '',
 ].join('\n');

@@ -62,15 +62,19 @@ fs.writeFileSync(
   [
     'Manifest-Version: 1.0',
     'Implementation-Title: Vespera Client Core Fabric Mod',
-    'Implementation-Version: 1.0.0+mc1.21.4',
+    'Implementation-Version: 1.1.0+mc1.21.4',
     'Implementation-Vendor: Vespera Labs',
     'Fabric-Loom-Mixin-Remap-Type: static',
     '',
   ].join('\r\n')
 );
 
-const modJarPath = path.join(releaseModsDir, 'vespera-client-1.0.0+mc1.21.4.jar');
+const modJarPath = path.join(releaseModsDir, 'vespera-client-1.1.0+mc1.21.4.jar');
 if (fs.existsSync(modJarPath)) fs.unlinkSync(modJarPath);
+const legacyJarPath = path.join(releaseModsDir, 'vespera-client-1.0.0+mc1.21.4.jar');
+if (fs.existsSync(legacyJarPath)) fs.unlinkSync(legacyJarPath);
+const legacyShaPath = path.join(releaseModsDir, 'vespera-client-1.0.0+mc1.21.4.jar.sha256');
+if (fs.existsSync(legacyShaPath)) fs.unlinkSync(legacyShaPath);
 
 execFileSync('zip', ['-rq', modJarPath, '.'], { cwd: modClassesOut, stdio: 'inherit' });
 
@@ -93,8 +97,8 @@ execFileSync(
 const jarBytes = fs.readFileSync(modJarPath);
 const sha256 = crypto.createHash('sha256').update(jarBytes).digest('hex');
 fs.writeFileSync(
-  path.join(releaseModsDir, 'vespera-client-1.0.0+mc1.21.4.jar.sha256'),
-  `${sha256}  vespera-client-1.0.0+mc1.21.4.jar\n`
+  path.join(releaseModsDir, 'vespera-client-1.1.0+mc1.21.4.jar.sha256'),
+  `${sha256}  vespera-client-1.1.0+mc1.21.4.jar\n`
 );
 
 console.log(

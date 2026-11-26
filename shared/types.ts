@@ -1,4 +1,24 @@
-export type SupportTier = 'supported' | 'experimental' | 'legacy_pvp' | 'unsupported';
+export type SupportTier =
+  | 'vespera_supported'
+  | 'fabric_supported'
+  | 'vanilla_only'
+  | 'supported'
+  | 'experimental'
+  | 'legacy_pvp'
+  | 'unsupported';
+
+export type VersionInstallStatus =
+  | 'not_installed'
+  | 'metadata_cached'
+  | 'partially_downloaded'
+  | 'downloading'
+  | 'installing'
+  | 'installed'
+  | 'ready'
+  | 'update_available'
+  | 'failed';
+
+export type ModloaderType = 'vanilla' | 'fabric' | 'legacy_fabric';
 
 export type PerformanceModeId = 'max_fps' | 'balanced' | 'visual_quality' | 'custom';
 
@@ -32,8 +52,19 @@ export interface MinecraftVersionDescriptor {
   id: string;
   type: 'release' | 'snapshot' | 'old_beta' | 'old_alpha';
   supportTier: SupportTier;
+  compatibilityLabel?:
+    | 'Vespera Supported'
+    | 'Fabric Supported'
+    | 'Vanilla Only'
+    | 'Experimental'
+    | 'Unsupported';
   recommendedJavaMajor: 8 | 17 | 21;
   recommendedFabricLoader: string | null;
+  fabricSupported?: boolean;
+  vanillaSupported?: boolean;
+  installStatus?: VersionInstallStatus;
+  estimatedDownloadMb?: number;
+  sha1?: string;
   legacyNotes?: string;
   releaseTime: string;
   manifestUrl: string;
@@ -41,6 +72,24 @@ export interface MinecraftVersionDescriptor {
   sodiumSupported: boolean;
   irisSupported: boolean;
   vesperaModSupported: boolean;
+}
+
+export interface VersionDownloadProgress {
+  active: boolean;
+  versionId: string | null;
+  profileId: string | null;
+  loader: ModloaderType;
+  status: VersionInstallStatus;
+  stage: string;
+  percent: number;
+  bytesDownloaded: number;
+  totalBytes: number;
+  speedBytesPerSec: number;
+  etaSeconds: number | null;
+  completedFiles: number;
+  totalFiles: number;
+  cancellable: boolean;
+  error: string | null;
 }
 
 export interface JavaRuntimeInfo {
@@ -51,7 +100,7 @@ export interface JavaRuntimeInfo {
   path: string;
   installed: boolean;
   verifiedSha256: boolean;
-  source: 'bundled_managed' | 'system_detected' | 'adoptium_temurin';
+  source: 'bundled_managed' | 'system_detected' | 'adoptium_temurin' | 'user_custom';
 }
 
 export interface MinecraftAccount {
@@ -59,13 +108,44 @@ export interface MinecraftAccount {
   uuid: string;
   username: string;
   xuid?: string;
+  skinUrl?: string;
   authProvider: 'microsoft_oauth';
   tokenExpiresAt: number;
   lastValidatedAt: number;
-  sessionStatus: 'valid' | 'refresh_required' | 'expired';
+  sessionStatus: 'valid' | 'refresh_required' | 'expired' | 'signed_out';
   skinAvatarSeed: string;
   active: boolean;
   ownsMinecraftJava: boolean;
+}
+
+export interface OAuthAppConfigState {
+  configured: boolean;
+  source: 'env_override' | 'developer_local' | 'release_config' | 'unconfigured';
+  supportsPkceLoopback: boolean;
+  supportsDeviceCodeFallback: boolean;
+  developerSetupDocPath: string;
+}
+
+export interface AuthFlowState {
+  mode: 'idle' | 'pkce_browser' | 'device_code' | 'completed' | 'cancelled' | 'error';
+  authorizeUrl?: string;
+  redirectUri?: string;
+  startedAt?: number;
+  expiresAt?: number;
+  deviceChallenge?: DeviceCodeAuthChallenge | null;
+  message: string;
+}
+
+export interface OfflineAvailabilityState {
+  eligible: boolean;
+  verifiedAccountId: string | null;
+  verifiedUsername: string | null;
+  verifiedUuid: string | null;
+  lastOnlineAuthAt: number | null;
+  localGameReady: boolean;
+  activeSessionMode: 'online_authenticated' | 'offline_singleplayer';
+  restrictions: string[];
+  statusReason: string;
 }
 
 export interface DeviceCodeAuthChallenge {
@@ -285,8 +365,11 @@ export interface ClientProfile {
   archetype: 'pvp' | 'survival' | 'vanilla_plus' | 'performance' | 'graphics' | 'custom';
   description: string;
   mcVersion: string;
-  loader: 'fabric' | 'legacy_fabric';
+  loader: ModloaderType;
   loaderVersion: string;
+  vesperaModCompatible?: boolean;
+  customJavaPath?: string;
+  customGameDir?: string;
   performance: PerformanceSettings;
   graphics: GraphicsSettings;
   hudLayoutId: string;
@@ -321,6 +404,9 @@ export interface LauncherSettings {
   autoBackupBeforeProfileUpdate: boolean;
   language: 'en-US' | 'it-IT' | 'de-DE' | 'fr-FR' | 'es-ES';
   customJvmExtraArgs: string;
+  customJavaExecutablePath?: string;
+  showSnapshotsInVersionList?: boolean;
+  showHistoricalInVersionList?: boolean;
   microsoftAzureClientId: string;
   crashRecoveryEnabled: boolean;
   firstLaunchCompleted: boolean;
@@ -416,6 +502,9 @@ export interface LaunchPreparationReport {
   ready: boolean;
   profileId: string;
   mcVersion: string;
+  loader?: ModloaderType;
+  vesperaModActive?: boolean;
+  sessionMode?: 'online_authenticated' | 'offline_singleplayer';
   javaExecutable: string;
   jvmArguments: string[];
   gameArguments: string[];
@@ -429,9 +518,16 @@ export interface LaunchPreparationReport {
 export interface AppStateSnapshot {
   version: string;
   platformMode: 'windows_native_webview2' | 'node_preview_bridge';
+  oauthConfig?: OAuthAppConfigState;
+  authFlow?: AuthFlowState;
+  offlineAvailability?: OfflineAvailabilityState;
   accounts: MinecraftAccount[];
   activeAccountId: string | null;
   versions: MinecraftVersionDescriptor[];
+  latestReleaseId?: string;
+  latestSnapshotId?: string;
+  manifestSource?: 'live_mojang' | 'local_cache' | 'embedded_seed';
+  activeDownload?: VersionDownloadProgress | null;
   javaRuntimes: JavaRuntimeInfo[];
   profiles: ClientProfile[];
   activeProfileId: string;

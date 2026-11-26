@@ -1,6 +1,6 @@
 {
   "name": "vespera-client",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "Vespera Client — High-Performance Next-Generation Minecraft Java Edition Client & Windows Desktop Launcher",
   "type": "module",

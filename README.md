@@ -1,69 +1,64 @@
-# Vespera Client v1.0.0
+# Vespera Client v1.1.0
 
 **Precision Minecraft Java Edition Client & Native Windows 10/11 Launcher**  
-*Performance + Visual Fidelity + Fair-Play Functionality — Zero Electron Bloat*
+*Performance + Visual Fidelity + Dynamic Multi-Version Management + Frictionless Microsoft OAuth — Zero Electron Bloat*
 
 ---
 
 ## Executive Summary
 
-**Vespera Client** (`gg.vespera.client`) is an original, production-grade Minecraft Java Edition client ecosystem and native 64-bit Windows desktop launcher engineered as a modern, transparent, open-architecture alternative to Lunar Client and Badlion Client.
+**Vespera Client** (`gg.vespera.client`) is a production-grade Minecraft Java Edition client ecosystem and native 64-bit Windows desktop launcher engineered as a modern, transparent, open-architecture alternative to Lunar Client and Badlion Client.
 
-Most Minecraft clients force an artificial compromise: closed-source PvP clients lock down mod extensibility, while generic modpacks pile on overlapping mods and ship bloated 250 MB Chromium/Electron wrappers. **Vespera Client** solves all three dimensions simultaneously:
-
-1. **Performance Engine (Without Visual Degradation)**: Coordinates a verified non-conflicting modern Fabric rendering stack (**Sodium 0.6.5**, **Lithium**, **FerriteCore**, **ImmediatelyFast**, **ModernFix**, **Entity Culling**, **More Culling**, **Dynamic FPS**) paired with hardware-aware **OpenJDK 21 Generational ZGC** or **Client-Tuned Adaptive G1GC** flags. Even in **Maximum FPS** mode, Vespera preserves Smooth Lighting (`Maximum`), `4x` Mipmaps, Biome Blend, and >=12 chunk render distance.
-2. **Graphics & Shader Studio**: First-class **Iris Shaders 1.8.5** pipeline management, curated visual mods (**Entity Texture Features**, **Entity Model Features**, **Continuity**), 4 one-click shader quality tiers, and ordered Resource Pack profile management.
-3. **Custom Kotlin Fabric Client Mod + Modrinth Ecosystem**: Ships `vespera-client-1.0.0+mc1.21.4.jar` (compiled for Java 21 / Fabric 1.21.4) providing 12 customizable PvP & Survival HUD modules, a live drag-and-snap **HUD Layout Studio** (`Right Shift`), smooth scroll-zoom (`C`), vanilla-legal Toggle Sprint, chat compacting, rich durability/food tooltips, and bidirectional atomic sync with the desktop launcher—while keeping full **Modrinth API v2** mod search, dependency resolution, conflict blocking, and 1-click profile rollback.
+### What's New in v1.1.0
+1. **Frictionless Microsoft Account Sign-In (OAuth 2.0 PKCE + Device Code Fallback)**:
+   - End users **never** enter or create a Microsoft Azure/Entra Client ID in the UI. Public Client ID configuration is separated cleanly into build-time maintainer configuration (`config/oauth.release.json` / `config/oauth.local.json` / `VESPERA_MSA_CLIENT_ID`) with zero client secrets and zero fake IDs.
+   - **Primary Browser PKCE Flow**: Opens the system default browser (`ShellExecuteW` on Windows) with RFC 7636 `S256` PKCE + CSRF `state` verification and an ephemeral `http://127.0.0.1:<port>/callback` loopback listener, completing **Microsoft -> Xbox Live -> XSTS -> Minecraft Services -> Java Ownership Entitlement -> Profile** automatically.
+   - **Secondary Device Code Fallback**: Built-in fallback for restrictive local firewall environments.
+   - **Legitimate Offline Singleplayer Mode**: Strictly gated to previously verified Java Edition accounts when local game files are already verified on disk (`--accessToken 0 --disableMultiplayer --disableChat`). Never fabricates tokens or bypasses online multiplayer authentication.
+2. **Dynamic Official Minecraft Version Manager & Multi-Stage Installer**:
+   - Live sync with Mojang's official `version_manifest_v2.json` across **Releases**, **Snapshots**, **Old Beta**, and **Old Alpha** (newest-to-oldest) with offline manifest caching.
+   - **12-Stage Verified Downloader & Installer**: Downloads `<version>.json`, `<version>.jar`, `<assetIndex>.json` + asset objects, OS-filtered Maven libraries, native `.dll`/`.so` extraction, and optional **Fabric Loader** metadata—with **SHA-1 cryptographic verification**, **HTTP `Range` `.part` resumption**, cancellation, integrity repair, and safe version deletion.
+   - **Automatic Per-Version Java Runtime Provisioning**: Auto-detects and provisions **Java 21** (`1.20.5+`), **Java 17** (`1.18–1.20.4`), and **Java 8** (`<= 1.16.5`, `1.12.2`, `1.8.9`, Beta/Alpha), or honors custom Java paths.
+3. **Honest Version Compatibility & Strict Mod Isolation**:
+   - `1.21.4` -> **Vespera Supported** (Vanilla + Fabric + `vespera-client-1.1.0+mc1.21.4.jar` custom HUD/QoL mod).
+   - `1.14` – `1.21.x` (non-`1.21.4`) -> **Fabric Supported** (Vanilla + Fabric Loader; Vespera's `1.21.4`-compiled custom JAR is automatically isolated so older versions never crash with linkage mismatches).
+   - `<= 1.13.2` (`1.12.2`, `1.8.9`, Beta, Alpha) -> **Vanilla Only** (100% selectable, installable, and launchable with legacy `minecraftArguments` expansion).
+   - Snapshots -> **Experimental**.
 
 ---
 
-## Verified Windows 10/11 (x86_64) Release Deliverables
+## Verified Windows 10/11 (x86_64) Release Deliverables (`v1.1.0`)
 
-All release binaries are compiled natively as 64-bit Windows (`PE32+ AMD64`, `IMAGE_SUBSYSTEM_WINDOWS_GUI`) executables with embedded multi-resolution `.ico` resources and `PerMonitorV2` High-DPI Windows 10/11 manifests:
+All Windows binaries are compiled as native 64-bit (`PE32+ AMD64`, `IMAGE_SUBSYSTEM_WINDOWS_GUI`) executables with embedded multi-resolution `.ico` resources and `PerMonitorV2` High-DPI manifests:
 
-| Deliverable | Path | Size | Description |
+| Deliverable | Path | Size | SHA-256 |
 | :--- | :--- | ---: | :--- |
-| **Windows Setup Installer** | `release/VesperaClient-1.0.0-win64-setup.exe` | `1,753.5 KB` | Self-contained GUI + silent (`/S`) Setup Wizard with SHA-256 payload verification, Start Menu/Desktop shortcuts, and Windows Add/Remove Programs registration |
-| **Native Desktop Launcher** | `release/bin/VesperaClient.exe` | `1,215.5 KB` | Lightweight C++17 + Microsoft Edge WebView2 native GUI launcher (~1.2 MB binary; <45 MB active RAM; auto-idles when Minecraft runs) |
-| **Native Windows Uninstaller** | `release/bin/VesperaUninstall.exe` | `223.0 KB` | Clean GUI + silent (`/S`) uninstaller with optional preservation of `%APPDATA%\VesperaClient` worlds, screenshots, and profiles |
-| **Custom Fabric Client Mod** | `release/mods/vespera-client-1.0.0+mc1.21.4.jar` | `57.5 KB` | Compiled Kotlin 2.4 / JVM 21 client-side Fabric mod (`1.21.4`) with HUD engine, HUD Studio, Zoom, Toggle Sprint, QoL helpers, and IPC sync |
-| **Windows Application Icon** | `release/vespera.ico` | `18.3 KB` | Custom 7-layer 32-bit RGBA `.ico` (`16`, `24`, `32`, `48`, `64`, `128`, `256` px) |
-| **Release Checksums** | `release/SHA256SUMS.txt` | `0.4 KB` | Cryptographic SHA-256 manifest verified by `npm run test:verify-artifacts` |
+| **Windows Setup Installer** | `release/VesperaClient-1.1.0-win64-setup.exe` | `1,966.0 KB` | `047c69fda182dee1ffe3e18b239a4a8052e7ad266f177aefb92fecfc34777f4b` |
+| **Native Desktop Launcher** | `release/bin/VesperaClient.exe` | `1,428.0 KB` | `a4539d786995cf3ed25ec599c426cddfd2dafce28761ddff5f36e895a0e0980f` |
+| **Native Windows Uninstaller** | `release/bin/VesperaUninstall.exe` | `223.0 KB` | `52cbca40c1ba6c5a4b1916df892768520040878d3b5e7e4f0ccab476f21a7c13` |
+| **Custom Fabric Client Mod** | `release/mods/vespera-client-1.1.0+mc1.21.4.jar` | `57.5 KB` | `fd05e3a520633d56fbe7a5c137d355917aa53b086366eba6c3d50d193c0edb4c` |
+| **Windows Application Icon** | `release/vespera.ico` | `18.3 KB` | `9b58a181e96a143761c2234291d53545468d6d1fda507f6306dd090210e11cef` |
+| **Release Checksums** | `release/SHA256SUMS.txt` | `0.5 KB` | Verified by `npm run test:verify-artifacts` |
 
----
-
-## Brand & Interface Architecture
-
-- **Brand Identity**: **Vespera Client** — *Precision Obsidian & Solar Amber* (`#090B10` deep obsidian surfaces, `#F59E0B` solar amber primary accent, `#38BDF8` horizon cyan telemetry accent). Distinct geometry, iconography, and 3-column workbench ergonomics (`Navigation Rail` + `Main Workbench` + `Collapsible Launch & Telemetry Drawer`).
-- **All 12 Launcher Pages Implemented**:
-  1. **Home** — Active profile overview, system readiness, one-click Launch & HUD Studio access, optimization matrix.
-  2. **Play** — Minecraft version selector (`Supported` vs `Experimental` vs `Unsupported`), Fabric Loader & Java 21 readiness, pre-flight pipeline validator, real JVM command builder.
-  3. **Mods** — Installed stack control, **Modrinth API v2** live catalog search, compatibility & conflict gatekeeper (`OptiFabric`/`Indium` blocker), dependency resolver, history, and 1-click rollback.
-  4. **Performance** — 4 Performance Modes (`Maximum FPS`, `Balanced`, `Visual Quality`, `Custom`), hardware-aware RAM recommender, Generational ZGC vs Tuned G1GC selector, Sodium/Culling tuning.
-  5. **Graphics** — Render/Simulation/Shadow distance sliders, Clouds, Smooth Lighting, Mipmaps, Biome Blend, Entity Shadows, ETF/EMF/Continuity controls.
-  6. **Shader Packs** — Master shader toggle, 4 Iris Shader quality presets (`Low`, `Medium`, `High`, `Ultra`), pack switcher.
-  7. **Resource Packs** — Ordered priority stack (`Move Up` / `Move Down`), resolution & VRAM badges, texture previews.
-  8. **Accounts** — Official Microsoft OAuth 2.0 Device-Code authentication flow, multi-account switcher, token refresh, Windows DPAPI / AES-256-GCM encrypted vault, Client ID setup.
-  9. **Profiles** — Isolated game directories across PvP, Survival, Performance, Graphics, Vanilla+, and Custom archetypes; `.vesperaprofile` JSON import/export; timestamped backups & rollback.
-  10. **Settings** — Launcher behavior when game runs (`Idle Low-Memory`, `Minimize`, `Close`), update channel (`Stable`/`Beta`) & GitHub release checker, telemetry toggles, managed data path.
-  11. **Diagnostics** — Real host CPU/RAM/JVM sensors, 1-click **Diagnostics Doctor** with Auto-Fix, Crash Log Analyzer, and **Integrated OpenJDK 21 Benchmark Suite** (`Vanilla` vs `Max FPS` vs `Balanced` vs `Graphics`).
-  12. **About** — Architecture summary, Fair-Play policy, open-source notices, release build verification.
+### Verification Scope Note
+- **Verified Automatically in Build & Test Pipeline**: Full TypeScript/UI compilation, OpenJDK 21 Kotlin Fabric Mod compilation & 23 unit tests, Zig/MinGW-w64 `x86_64-windows-gnu` C++17 native cross-compilation (`Win32` + `WebView2` + `WinHTTP` + `WinSock2` + `DPAPI` + `BCrypt`), PE32+ binary header/resource/SHA-256 inspection, and 25 automated Vitest unit & integration tests (PKCE loopback callback, CSRF state rejection, Device Code flow, token refresh, Offline Singleplayer gating, Mojang manifest parsing, SHA-1 + HTTP `Range` resumable installation, PKZIP native extraction, Java 8/17/21 selection, and v1.0.0 -> v1.1.0 profile migration).
+- **Requires Native Windows Host + Registered Entra App ID for Live End-to-End Sign-In**: Live interactive Microsoft browser authentication and native DirectX/OpenGL Minecraft window execution require running `VesperaClient.exe` on Windows 10/11 with Edge WebView2 Runtime and a maintainer-configured Microsoft Entra Public Client ID (see [`docs/OAUTH_DEVELOPER_SETUP.md`](docs/OAUTH_DEVELOPER_SETUP.md)).
 
 ---
 
 ## Quickstart Commands
 
 ```bash
-# Run full automated verification (Vitest core tests + Kotlin JVM 21 mod tests + PE32+ binary inspection)
+# Run full automated verification (25 Vitest tests + 23 Kotlin JVM 21 mod tests + PE32+ binary & OAuth security verification)
 npm test
 
-# Rebuild everything from source (Branding -> UI -> Kotlin Fabric Mod JAR -> 64-bit Windows Binaries & Setup Installer)
-npm run build:all
+# Rebuild everything from source (UI -> Kotlin Fabric Mod JAR -> 64-bit Windows Binaries & Setup Installer)
+npm run build
 
-# Execute reproducible OpenJDK 21 benchmark suite and update docs/BENCHMARK_LATEST.json
-npm run benchmark
+# Build with a registered Microsoft Entra Public Client ID embedded at build time
+VESPERA_MSA_CLIENT_ID="YOUR-PUBLIC-CLIENT-UUID" npm run build
 
-# Launch local cross-platform desktop UI preview server (http://0.0.0.0:4173)
+# Launch local desktop UI preview server (http://0.0.0.0:4173)
 npm run preview
 ```
 
@@ -71,10 +66,11 @@ npm run preview
 
 ## Documentation Index
 
-- **[User Guide](docs/USER_GUIDE.md)** — Installation, First-Launch Setup Wizard, Microsoft Sign-In, Performance & Shader tuning, HUD Editor, Profiles, and Troubleshooting.
-- **[Developer & Build Guide](docs/DEVELOPER_AND_BUILD_GUIDE.md)** — Repository layout, reproducible build toolchain, Microsoft Azure/Entra OAuth Client ID configuration, and test suites.
-- **[Architecture, Compatibility Matrix & Fair-Play Policy](docs/ARCHITECTURE_AND_COMPATIBILITY.md)** — Deep dive into native Win32/WebView2 IPC, version support (`1.21.4` primary + `1.8.9` legacy PvP evaluation), mod conflict matrix, and security design.
-- **[Benchmark & Telemetry Report](docs/BENCHMARK_REPORT.md)** — Measured OpenJDK 21.0.13.1 frame-pacing, chunk-meshing, culling, and GC pause results (`+95.7%` throughput, `-52%` P99 frame time vs Vanilla baseline).
+- **[Maintainer Microsoft OAuth 2.0 Setup Guide](docs/OAUTH_DEVELOPER_SETUP.md)** — Entra ID public client registration, loopback redirect URIs, `config/oauth.local.json` vs `VESPERA_MSA_CLIENT_ID`, and zero-secret security architecture.
+- **[User Guide](docs/USER_GUIDE.md)** — Installation, Microsoft Sign-In & Offline Singleplayer, Dynamic Version Manager, Performance & Shader tuning, HUD Editor, and Profiles.
+- **[Developer & Build Guide](docs/DEVELOPER_AND_BUILD_GUIDE.md)** — Repository layout, reproducible build toolchain, and automated test suites.
+- **[Architecture, Compatibility Matrix & Fair-Play Policy](docs/ARCHITECTURE_AND_COMPATIBILITY.md)** — Native Win32/WebView2 IPC, version compatibility tiers, mod conflict matrix, and security design.
+- **[Benchmark & Telemetry Report](docs/BENCHMARK_REPORT.md)** — Measured OpenJDK 21 frame-pacing, chunk-meshing, culling, and GC pause results.
 
 ---
 
