@@ -2161,7 +2161,7 @@ export class MinecraftLauncherService {
       ...baseFlags,
       `-Djava.library.path=${nativesDir}`,
       `-Dminecraft.launcher.brand=VesperaClient`,
-      `-Dminecraft.launcher.version=1.2.3`,
+      `-Dminecraft.launcher.version=1.2.4`,
       ...(sessionMode === 'offline_account' ? ['-Dvespera.accountType=offline'] : []),
       ...(sessionMode === 'offline_singleplayer'
         ? ['-Dvespera.offlineSingleplayer=true']
@@ -2221,7 +2221,7 @@ export class MinecraftLauncherService {
         '--userType',
         userType,
         '--versionType',
-        profile.loader === 'vanilla' ? 'Vespera-Vanilla/1.2.3' : 'Vespera-Fabric/1.2.3',
+        profile.loader === 'vanilla' ? 'Vespera-Vanilla/1.2.4' : 'Vespera-Fabric/1.2.4',
         '--width',
         String(profile.graphics.resolutionWidth),
         '--height',

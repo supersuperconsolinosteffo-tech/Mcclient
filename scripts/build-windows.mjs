@@ -120,7 +120,7 @@ const defaultJsonStr = execFileSync(
      if (fs.existsSync('./docs/BENCHMARK_LATEST.json')) {
        snap.latestBenchmark = JSON.parse(fs.readFileSync('./docs/BENCHMARK_LATEST.json', 'utf8'));
      }
-     snap.recentLogs = ['[00:00:00] Vespera Client v1.2.3 Native Windows Engine Ready.'];
+     snap.recentLogs = ['[00:00:00] Vespera Client v1.2.4 Native Windows Engine Ready.'];
      c.shutdownCleanly();
      process.stdout.write(JSON.stringify(snap));`,
   ],
@@ -156,6 +156,11 @@ for (const rcStem of ['launcher', 'uninstall', 'setup']) {
   );
 }
 
+// Compile the ZIP reader as C, then link it into the native launcher.
+for (const source of ['miniz.c', 'miniz_tinfl.c', 'miniz_tdef.c']) {
+  execFileSync(ZIG_PY, ['-m', 'ziglang', 'cc', '-target', 'x86_64-windows-gnu', '-O2', '-I', path.join(ROOT, 'native/third_party/miniz'), '-c', path.join(ROOT, 'native/third_party/miniz', source), '-o', path.join(OBJ_DIR, `${source}.o`)], { stdio: 'inherit' });
+}
+
 // 6. Compile VesperaClient.exe (64-bit Windows WebView2 Native GUI Launcher)
 const launcherExePath = path.join(RELEASE_BIN_DIR, 'VesperaClient.exe');
 console.log('[build-windows] Compiling VesperaClient.exe (x86_64-windows-gnu PE32+ GUI)...');
@@ -174,8 +179,12 @@ execFileSync(
     `-I${path.join(ROOT, 'native/third_party/webview/compatibility/mingw/include')}`,
     `-I${path.join(ROOT, 'native/third_party/webview2')}`,
     `-I${path.join(ROOT, 'native/third_party')}`,
+    `-I${path.join(ROOT, 'native/third_party/miniz')}`,
     `-I${OBJ_DIR}`,
     path.join(ROOT, 'native/third_party/webview/core/src/webview.cc'),
+    path.join(OBJ_DIR, 'miniz.c.o'),
+    path.join(OBJ_DIR, 'miniz_tinfl.c.o'),
+    path.join(OBJ_DIR, 'miniz_tdef.c.o'),
     path.join(ROOT, 'native/src/vespera_launcher.cpp'),
     path.join(OBJ_DIR, 'launcher.res'),
     '-lole32',
@@ -230,8 +239,8 @@ execFileSync(
   { stdio: 'inherit' }
 );
 
-// 8. Generate setup_payload.h with SHA-256 checksums and compile VesperaClient-1.2.3-win64-setup.exe
-console.log('[build-windows] Packaging SHA-256 verified payload into VesperaClient-1.2.3-win64-setup.exe...');
+// 8. Generate setup_payload.h with SHA-256 checksums and compile VesperaClient-1.2.4-win64-setup.exe
+console.log('[build-windows] Packaging SHA-256 verified payload into VesperaClient-1.2.4-win64-setup.exe...');
 const launcherBytes = fs.readFileSync(launcherExePath);
 const uninstallBytes = fs.readFileSync(uninstallExePath);
 const iconBytes = fs.readFileSync(path.join(resDir, 'vespera.ico'));
@@ -276,7 +285,7 @@ for (const oldVer of ['1.0.0', '1.1.0', '1.1.1', '1.2.0']) {
   if (fs.existsSync(oldSetup)) fs.unlinkSync(oldSetup);
 }
 
-const setupExePath = path.join(RELEASE_DIR, 'VesperaClient-1.2.3-win64-setup.exe');
+const setupExePath = path.join(RELEASE_DIR, 'VesperaClient-1.2.4-win64-setup.exe');
 execFileSync(
   ZIG_PY,
   [
@@ -318,7 +327,7 @@ const modSha = crypto.createHash('sha256').update(modJarBuf).digest('hex');
 const iconSha = crypto.createHash('sha256').update(iconBytes).digest('hex');
 
 const checksumLines = [
-  `${setupSha}  VesperaClient-1.2.3-win64-setup.exe`,
+  `${setupSha}  VesperaClient-1.2.4-win64-setup.exe`,
   `${launcherSha}  bin/VesperaClient.exe`,
   `${uninstallSha}  bin/VesperaUninstall.exe`,
   `${modSha}  mods/vespera-client-1.2.2+mc1.21.4.jar`,

@@ -210,7 +210,7 @@ export class VesperaStateCoordinator {
             this.saveState(migrated);
             this.appendLog('[Migration] Seamlessly upgraded v1.0.0 user profiles to v1.2.2 schema.');
           } else {
-            this.appendLog('[Core] Loaded persisted Vespera Client v1.2.3 configuration.');
+            this.appendLog('[Core] Loaded persisted Vespera Client v1.2.4 configuration.');
           }
           return migrated;
         }
@@ -262,7 +262,7 @@ export class VesperaStateCoordinator {
     };
 
     this.saveState(fresh);
-    this.appendLog(`[Core] Initialized Vespera Client v1.2.3 (Recommended Heap: ${recRam} MB).`);
+    this.appendLog(`[Core] Initialized Vespera Client v1.2.4 (Recommended Heap: ${recRam} MB).`);
     return fresh;
   }
 
@@ -1147,7 +1147,7 @@ export class VesperaStateCoordinator {
     }));
 
     return {
-      version: '1.2.3',
+      version: '1.2.4',
       platformMode: 'node_preview_bridge',
       oauthConfig: this.authService.getOAuthConfigState(),
       authFlow: this.authService.getAuthFlowState(),

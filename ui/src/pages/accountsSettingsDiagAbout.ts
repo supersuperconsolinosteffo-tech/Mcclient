@@ -116,7 +116,7 @@ export function renderFirstLaunchAccountModal(snap: AppStateSnapshot): string {
         <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap">
           <div>
             <div style="display:inline-flex;align-items:center;gap:8px;margin-bottom:6px">
-              <span class="badge badge-supported">Welcome to Vespera Client v1.2.3</span>
+              <span class="badge badge-supported">Welcome to Vespera Client v1.2.4</span>
               <span class="badge badge-cyan">No Forced Login</span>
             </div>
             <h2 style="font-size:22px;font-weight:800;margin:0;color:var(--text-primary)">

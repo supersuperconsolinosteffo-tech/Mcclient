@@ -1,4 +1,6 @@
 #include "win32_platform.hpp"
+#include "native_zip.hpp"
+#include "native_classifier.hpp"
 #include "webview/webview.h"
 #include "nlohmann/json.hpp"
 
@@ -172,6 +174,20 @@ bool validate_fabric_profile(const json& profile) {
     return true;
 }
 
+std::string minecraft_windows_arch_token() {
+#if defined(_M_X64) || defined(__x86_64__)
+    return "64";
+#elif defined(_M_IX86) || defined(__i386__)
+    return "32";
+#else
+    throw std::runtime_error("This launcher build does not support the current Windows processor architecture.");
+#endif
+}
+
+std::string install_loader_key(const std::string& loader) {
+    return loader == "fabric" ? "fabric" : (loader == "legacy_fabric" ? "legacy_fabric" : "vanilla");
+}
+
 bool evaluate_mojang_windows_rules(const json& lib) {
     if (!lib.contains("rules") || !lib["rules"].is_array() || lib["rules"].empty()) return true;
     bool allowed = false;
@@ -182,7 +198,7 @@ bool evaluate_mojang_windows_rules(const json& lib) {
             std::string osName = rule["os"].value("name", "");
             if (!osName.empty() && osName != "windows") matches = false;
             std::string arch = rule["os"].value("arch", "");
-            if (arch == "x86") matches = false;
+            if (arch == "x86" && minecraft_windows_arch_token() != "32") matches = false;
         }
         if (matches) {
             allowed = (rule.value("action", "allow") == "allow");
@@ -583,7 +599,7 @@ public:
             bool vesperaOk = (p["loader"] == "fabric" && p.value("mcVersion", "") == "1.21.4");
             p["vesperaModCompatible"] = vesperaOk;
         }
-        state["version"] = "1.2.3";
+        state["version"] = "1.2.4";
         state["platformMode"] = "windows_native_webview2";
     }
 
@@ -608,7 +624,7 @@ public:
                 state = json::parse(read_text_file(statePath));
                 sanitizeLoadedState(defaults);
                 saveState();
-                appendLog("[Core] Loaded and verified Vespera Client v1.2.3 Windows configuration.");
+                appendLog("[Core] Loaded and verified Vespera Client v1.2.4 Windows configuration.");
                 return;
             } catch (...) {
                 appendLog("[CrashRecovery] State file corrupted; restoring verified factory configuration.");
@@ -856,7 +872,7 @@ public:
         return fs::u8path(state["settings"].value("gameDataDir", wide_to_utf8((dataRoot / "minecraft").wstring())));
     }
 
-    std::string getVersionInstallStatusOnDisk(const std::string& verId) const {
+    std::string getVersionInstallStatusOnDisk(const std::string& verId, const std::string& requestedLoader = "") const {
         {
             std::lock_guard<std::mutex> progressLock(progressMtx);
             if (!activeDownloadState.is_null() && activeDownloadState.value("active", false) &&
@@ -864,10 +880,20 @@ public:
                 return activeDownloadState.value("status", "downloading");
             }
         }
+        std::string selectedLoader = requestedLoader;
+        if (selectedLoader.empty()) {
+            const std::string activeId = state.value("activeProfileId", "");
+            if (state.contains("profiles") && state["profiles"].is_array()) {
+                for (const auto& profile : state["profiles"]) if (profile.value("id", "") == activeId) {
+                    selectedLoader = profile.value("loader", "vanilla"); break;
+                }
+            }
+        }
+        const std::string loaderKey = install_loader_key(selectedLoader.empty() ? "vanilla" : selectedLoader);
         fs::path vDir = getGameRootDir() / "versions" / verId;
         std::error_code ec;
         if (!fs::exists(vDir, ec)) return "not_installed";
-        fs::path receipt = vDir / "vespera-install-receipt.json";
+        fs::path receipt = vDir / ("vespera-install-receipt-" + loaderKey + ".json");
         fs::path jar = vDir / (verId + ".jar");
         fs::path partJar = vDir / (verId + ".jar.part");
         fs::path meta = vDir / (verId + ".json");
@@ -889,6 +915,28 @@ public:
                         fs::path libraryPath = getGameRootDir() / fs::u8path(rel.get<std::string>());
                         if (!fs::exists(libraryPath, ec) || fs::file_size(libraryPath, ec) == 0 || !is_valid_jar_archive(libraryPath)) {
                             complete = false; break;
+                        }
+                    }
+                    if (complete) {
+                        const std::string nativeRelative = record.value("nativeDirectory", "");
+                        const uint64_t expectedNativeCount = record.value("nativeDllCount", 0ULL);
+                        const std::string expectedNativeDirectory = (vDir / ("natives-" + loaderKey)).lexically_relative(getGameRootDir()).generic_string();
+                        complete = record.value("loader", "") == (selectedLoader.empty() ? "vanilla" : selectedLoader) &&
+                                   nativeRelative == expectedNativeDirectory && safe_maven_relative_path(nativeRelative) && expectedNativeCount > 0 &&
+                                   record.contains("verifiedNativeFiles") && record["verifiedNativeFiles"].is_array() &&
+                                   record["verifiedNativeFiles"].size() == expectedNativeCount;
+                        if (complete) {
+                            for (const auto& nativeFile : record["verifiedNativeFiles"]) {
+                                if (!nativeFile.is_object()) { complete = false; break; }
+                                const std::string rel = nativeFile.value("path", "");
+                                const std::string sha1 = nativeFile.value("sha1", "");
+                                fs::path path = getGameRootDir() / fs::u8path(rel);
+                                if (!safe_maven_relative_path(rel) || rel.rfind(nativeRelative + "/", 0) != 0 ||
+                                    !isSha1Hex(sha1) || !fs::is_regular_file(path, ec) || fs::file_size(path, ec) == 0 ||
+                                    _stricmp(bcrypt_hash_file(path, BCRYPT_SHA1_ALGORITHM).c_str(), sha1.c_str()) != 0) {
+                                    complete = false; break;
+                                }
+                            }
                         }
                     }
                     if (complete && record.contains("verifiedLibraryIntegrity") && record["verifiedLibraryIntegrity"].is_array()) {
@@ -1124,7 +1172,7 @@ public:
             publicAccs.push_back(acc);
             if (acc.value("active", false)) activeAccId = acc.value("id", "");
         }
-        state["version"] = "1.2.3";
+        state["version"] = "1.2.4";
         state["accounts"] = publicAccs;
         state["activeAccountId"] = activeAccId.empty() ? json(nullptr) : json(activeAccId);
         state["oauthConfig"] = {
@@ -1385,22 +1433,21 @@ public:
         bool forceRepair
     ) {
         const std::string activeProfileId = state.value("activeProfileId", "");
+        const std::string journalLoaderKey = install_loader_key(loader);
         bool verifyHashes = state["settings"].value("verifyFileHashes", true);
         fs::path gameRoot = getGameRootDir();
         fs::path vDir = gameRoot / "versions" / verId;
         fs::path libRoot = gameRoot / "libraries";
         fs::path assetsRoot = gameRoot / "assets";
-        fs::path nativesDir = vDir / "natives";
-        fs::path receiptPath = vDir / "vespera-install-receipt.json";
+        fs::path nativesDir = vDir / ("natives-" + journalLoaderKey);
+        fs::path receiptPath = vDir / ("vespera-install-receipt-" + journalLoaderKey + ".json");
 
         std::error_code ec;
         fs::create_directories(vDir, ec);
         fs::create_directories(libRoot, ec);
         fs::create_directories(assetsRoot / "indexes", ec);
         fs::create_directories(assetsRoot / "objects", ec);
-        fs::create_directories(nativesDir, ec);
 
-        const std::string journalLoaderKey = loader == "fabric" ? "fabric" : (loader == "legacy_fabric" ? "legacy_fabric" : "vanilla");
         const fs::path journalPath = vDir / ("vespera-install-journal-" + journalLoaderKey + ".json");
         json journal = {
             {"schemaVersion", 1},
@@ -1429,7 +1476,7 @@ public:
         }
         persistJournal();
 
-        if (fs::exists(receiptPath, ec)) fs::remove(receiptPath, ec);
+        // Keep any prior receipt in place until the new complete install is validated and atomically committed.
 
         auto startTime = std::chrono::steady_clock::now();
         size_t bytesDownloaded = 0;
@@ -1498,7 +1545,6 @@ public:
             }
             if (!downloadVersionMetadata(verId, metaPath, metadataUrl, expectedMetaSha1, dlErr)) {
                 updateDlState("failed", dlErr, 0, dlErr);
-                std::error_code rmEc; fs::remove(receiptPath, rmEc);
                 throw std::runtime_error(dlErr);
             }
             meta = json::parse(read_text_file(metaPath), nullptr, false);
@@ -1512,7 +1558,6 @@ public:
         if (meta.is_discarded() || !validateVersionMetadata(meta, verId, metadataWhy)) {
             std::string err = meta.is_discarded() ? "Invalid JSON for Minecraft " + verId + " version metadata." : metadataWhy;
             updateDlState("failed", err, 0, err);
-            std::error_code rmEc; fs::remove(receiptPath, rmEc);
             throw std::runtime_error(err);
         }
         if (fs::exists(metaPath, ec)) bytesDownloaded += static_cast<size_t>(fs::file_size(metaPath, ec));
@@ -1538,7 +1583,8 @@ public:
         fs::path assetIndexPath;
         fs::path fabricProfilePath;
         std::string fabricProfileUrl;
-        std::vector<fs::path> nativeJars;
+        struct NativeArchive { fs::path path; std::string coordinate; std::vector<std::string> excludes; };
+        std::vector<NativeArchive> nativeJars;
 
         std::string clientUrl = meta["downloads"]["client"].value("url", "");
         std::string clientSha1 = meta["downloads"]["client"].value("sha1", "");
@@ -1555,6 +1601,15 @@ public:
                     std::string err = "Invalid Mojang library metadata for Minecraft " + verId + ": malformed Maven coordinate '" + name + "'.";
                     updateDlState("failed", err, 0, err); throw std::runtime_error(err);
                 }
+                if (!parsed.classifier.empty() && parsed.classifier.find("natives-windows") != std::string::npos &&
+                    !vespera::windows_classifier_matches_target(parsed.classifier, minecraft_windows_arch_token())) {
+                    appendLog("[NativeClassifier] Skipping platform-mismatched classifier " + name + " for Windows arch token " + minecraft_windows_arch_token());
+                    continue;
+                }
+                std::vector<std::string> nativeExclusions;
+                if (lib.contains("extract") && lib["extract"].is_object() && lib["extract"].contains("exclude") && lib["extract"]["exclude"].is_array()) {
+                    for (const auto& exclusion : lib["extract"]["exclude"]) if (exclusion.is_string()) nativeExclusions.push_back(exclusion.get<std::string>());
+                }
                 auto addMojangArtifact = [&](const std::string& coordinate, const std::string& rel, const std::string& url,
                                              const std::string& sha1, size_t size, bool isNative) {
                     if (!safe_maven_relative_path(rel) || url.rfind("https://", 0) != 0 || (!sha1.empty() && !isSha1Hex(sha1))) {
@@ -1566,7 +1621,7 @@ public:
                     plan.push_back({isNative ? "native_jar" : "library", url, destination, sha1, size,
                                     "Mojang", coordinate, true, ""});
                     verifiedLibraryFiles.push_back(destination.lexically_relative(gameRoot).generic_string());
-                    if (isNative) nativeJars.push_back(destination);
+                    if (isNative) nativeJars.push_back({destination, coordinate, nativeExclusions});
                     else verifiedLibs.push_back(rel);
                     appendLog("[LibraryResolver] Mojang coordinate=" + coordinate + " url=" + url +
                               " upstreamSha1=" + (sha1.empty() ? "not-published" : sha1) + " destination=" + destination.string());
@@ -1603,7 +1658,7 @@ public:
                 if (lib.contains("natives") && lib["natives"].is_object() && lib["natives"].contains("windows")) {
                     std::string key = lib["natives"].value("windows", "");
                     auto pos = key.find("${arch}");
-                    if (pos != std::string::npos) key.replace(pos, 7, "64");
+                    if (pos != std::string::npos) key.replace(pos, 7, minecraft_windows_arch_token());
                     if (!lib.contains("downloads") || !lib["downloads"].contains("classifiers") ||
                         !lib["downloads"]["classifiers"].is_object() || !lib["downloads"]["classifiers"].contains(key)) {
                         std::string err = "Missing Mojang Windows native classifier for library " + name + " (" + key + ").";
@@ -1868,37 +1923,83 @@ public:
         journal["lastSuccessfulOperation"] = "all_planned_artifacts_downloaded";
         persistJournal();
 
-        // Extract Windows native DLLs via built-in tar.exe
-        updateDlState("installing", "Extracting Windows x64 native libraries...", 96);
-        int extractedNatives = 0;
-        for (const auto& nj : nativeJars) {
-            if (cancelDownloadFlag.load()) throw std::runtime_error("Installation cancelled while extracting native libraries.");
-            if (!fs::exists(nj, ec)) {
-                throw std::runtime_error("Required native library archive is missing: " + nj.string());
+        // Build native output in a clean sibling staging directory; preserve current output unless all archives validate.
+        updateDlState("installing", "Validating and extracting Windows native libraries...", 96);
+        const fs::path nativeStage = vDir / ("natives.staging-" + std::to_string(GetTickCount64()));
+        const fs::path nativeBackup = vDir / ("natives.previous-" + journalLoaderKey);
+        std::error_code stageEc;
+        if (fs::exists(nativeBackup, stageEc)) {
+            bool currentMatchesReceipt = false;
+            json oldReceipt = fs::exists(receiptPath, stageEc) ? json::parse(read_text_file(receiptPath), nullptr, false) : json(nullptr);
+            const std::string expectedNativeRel = nativesDir.lexically_relative(gameRoot).generic_string();
+            if (fs::exists(nativesDir, stageEc) && oldReceipt.is_object() &&
+                oldReceipt.value("loader", "") == loader && oldReceipt.value("nativeDirectory", "") == expectedNativeRel &&
+                oldReceipt.contains("verifiedNativeFiles") && oldReceipt["verifiedNativeFiles"].is_array() &&
+                oldReceipt["verifiedNativeFiles"].size() == oldReceipt.value("nativeDllCount", 0ULL)) {
+                currentMatchesReceipt = true;
+                for (const auto& nativeFile : oldReceipt["verifiedNativeFiles"]) {
+                    if (!nativeFile.is_object()) { currentMatchesReceipt = false; break; }
+                    const std::string rel = nativeFile.value("path", ""), hash = nativeFile.value("sha1", "");
+                    const fs::path file = gameRoot / fs::u8path(rel);
+                    if (!safe_maven_relative_path(rel) || rel.rfind(expectedNativeRel + "/", 0) != 0 || !isSha1Hex(hash) ||
+                        !fs::is_regular_file(file, stageEc) || _stricmp(bcrypt_hash_file(file, BCRYPT_SHA1_ALGORITHM).c_str(), hash.c_str()) != 0) {
+                        currentMatchesReceipt = false; break;
+                    }
+                }
             }
-            std::wstring cmd = L"tar.exe -xf \"" + nj.wstring() + L"\" -C \"" + nativesDir.wstring() + L"\"";
-            STARTUPINFOW si{};
-            si.cb = sizeof(si);
-            PROCESS_INFORMATION pi{};
-            if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-                throw std::runtime_error("Unable to start tar.exe to extract native archive " + nj.string() + ". Win32 error " + std::to_string(GetLastError()));
+            if (currentMatchesReceipt) {
+                fs::remove_all(nativeBackup, stageEc);
+            } else {
+                fs::remove_all(nativesDir, stageEc);
+                stageEc.clear();
+                fs::rename(nativeBackup, nativesDir, stageEc);
+                if (stageEc) throw std::runtime_error("Cannot restore previous native directory after interrupted activation: " + stageEc.message());
+                appendLog("[Recovery] Restored previous native output after an interrupted or uncommitted activation.");
             }
-            DWORD waitResult = WaitForSingleObject(pi.hProcess, 30000);
-            DWORD exitCode = STILL_ACTIVE;
-            if (waitResult == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &exitCode);
-            else {
-                TerminateProcess(pi.hProcess, 1);
-                WaitForSingleObject(pi.hProcess, 5000);
-            }
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
-            if (waitResult != WAIT_OBJECT_0 || exitCode != 0) {
-                throw std::runtime_error("Native archive extraction failed for " + nj.string() +
-                    (waitResult == WAIT_TIMEOUT ? " (timed out after 30 seconds)." : " (tar.exe exit code " + std::to_string(exitCode) + ")."));
-            }
-            extractedNatives++;
         }
-        fs::remove_all(nativesDir / "META-INF", ec);
+        stageEc.clear();
+        fs::remove_all(nativeStage, stageEc);
+        fs::create_directories(nativeStage, stageEc);
+        if (stageEc) throw std::runtime_error("Cannot create native extraction staging directory: " + nativeStage.string() + ": " + stageEc.message());
+        uint64_t extractedNativeDlls = 0;
+        try {
+            for (size_t nativeIndex = 0; nativeIndex < nativeJars.size(); ++nativeIndex) {
+                const auto& native = nativeJars[nativeIndex];
+                updateDlState("installing", "Validating native archive " + std::to_string(nativeIndex + 1) + " of " + std::to_string(nativeJars.size()) + "…", 96);
+                if (cancelDownloadFlag.load()) throw std::runtime_error("Installation cancelled while extracting native libraries.");
+                if (!fs::exists(native.path, ec)) throw std::runtime_error("Required native archive is missing: " + native.path.string());
+                try {
+                    const auto result = vespera::native_zip::extract_dlls(native.path, nativeStage, native.excludes, [&]() {
+                        if (cancelDownloadFlag.load()) throw std::runtime_error("Installation cancelled while validating native ZIP entries.");
+                    });
+                    extractedNativeDlls += result.extracted;
+                    appendLog("[NativeZip] Validated " + native.coordinate + " from " + native.path.string() +
+                              "; entries=" + std::to_string(result.entries) + ", extractedDlls=" + std::to_string(result.extracted));
+                } catch (const std::exception& e) {
+                    throw std::runtime_error("Native ZIP validation/extraction failed for " + native.coordinate +
+                                             " at " + native.path.string() + ": " + e.what());
+                }
+            }
+            if (extractedNativeDlls == 0) throw std::runtime_error("Native metadata selected no Windows DLLs; refusing to launch with an empty native directory.");
+            fs::remove_all(nativeBackup, stageEc);
+            stageEc.clear();
+            if (fs::exists(nativesDir, stageEc)) {
+                fs::rename(nativesDir, nativeBackup, stageEc);
+                if (stageEc) throw std::runtime_error("Cannot preserve existing native directory before replacement: " + stageEc.message());
+            }
+            fs::rename(nativeStage, nativesDir, stageEc);
+            if (stageEc) {
+                const std::string why = stageEc.message();
+                if (fs::exists(nativeBackup)) { std::error_code rollbackEc; fs::rename(nativeBackup, nativesDir, rollbackEc); }
+                throw std::runtime_error("Cannot activate fully extracted native directory: " + why);
+            }
+            fs::remove_all(nativeBackup, stageEc);
+            appendLog("[NativeZip] Activated complete native directory for " + verId + "; DLLs=" + std::to_string(extractedNativeDlls));
+        } catch (...) {
+            std::error_code cleanupEc;
+            fs::remove_all(nativeStage, cleanupEc);
+            throw;
+        }
 
         updateDlState("verifying", "Revalidating metadata, client JAR, libraries, and assets…", -1);
         for (const auto& item : plan) {
@@ -1959,6 +2060,18 @@ public:
         journal["lastSuccessfulOperation"] = "complete_artifact_integrity_validation";
         persistJournal();
 
+        json verifiedNativeFiles = json::array();
+        for (const auto& entry : fs::directory_iterator(nativesDir)) {
+            if (!entry.is_regular_file() || !vespera::native_zip::is_dll(entry.path().filename().u8string())) continue;
+            const std::string hash = bcrypt_hash_file(entry.path(), BCRYPT_SHA1_ALGORITHM);
+            if (!isSha1Hex(hash)) throw std::runtime_error("Unable to verify extracted native DLL integrity: " + entry.path().string());
+            verifiedNativeFiles.push_back({
+                {"path", entry.path().lexically_relative(gameRoot).generic_string()},
+                {"sha1", hash}
+            });
+        }
+        if (verifiedNativeFiles.size() != extractedNativeDlls) throw std::runtime_error("Native DLL output count changed before receipt commit.");
+
         json receipt = {
             {"schemaVersion", 1},
             {"versionId", verId},
@@ -1973,12 +2086,17 @@ public:
             {"verifiedLibraryFiles", verifiedLibraryFiles},
             {"verifiedAssets", verifiedAssets},
             {"verifiedHashes", verifiedHashes},
-            {"nativesExtractedCount", extractedNatives},
+            {"nativeDirectory", nativesDir.lexically_relative(gameRoot).generic_string()},
+            {"verifiedNativeFiles", verifiedNativeFiles},
+            {"nativesExtractedCount", nativeJars.size()},
+            {"nativeDllCount", extractedNativeDlls},
             {"installedAt", iso_timestamp_now()}
         };
         if (!write_text_atomic(receiptPath, receipt.dump(2))) {
             throw std::runtime_error("Could not atomically write verified installation receipt for Minecraft " + verId + ".");
         }
+        std::error_code nativeBackupCleanupEc;
+        fs::remove_all(nativeBackup, nativeBackupCleanupEc);
         journal["state"] = "installed";
         journal["lastSuccessfulOperation"] = "receipt_committed";
         persistJournal();
@@ -2006,9 +2124,10 @@ public:
         fs::path gameRoot = getGameRootDir();
         fs::path vDir = gameRoot / "versions" / mcVer;
         fs::path metaPath = vDir / (mcVer + ".json");
-        fs::path receiptPath = vDir / "vespera-install-receipt.json";
+        const std::string nativeLoaderKey = install_loader_key(loader);
+        fs::path receiptPath = vDir / ("vespera-install-receipt-" + nativeLoaderKey + ".json");
         fs::path clientJar = vDir / (mcVer + ".jar");
-        fs::path nativesDir = vDir / "natives";
+        fs::path nativesDir = vDir / ("natives-" + nativeLoaderKey);
 
         json meta = fs::exists(metaPath) ? json::parse(read_text_file(metaPath), nullptr, false) : json(nullptr);
         json receipt = fs::exists(receiptPath) ? json::parse(read_text_file(receiptPath), nullptr, false) : json(nullptr);
@@ -2127,7 +2246,7 @@ public:
         for (const auto& a : gameArgs) preview << a.get<std::string>() << " ";
 
         return {
-            {"ready", hasAuth && getVersionInstallStatusOnDisk(mcVer) == "ready"},
+            {"ready", hasAuth && getVersionInstallStatusOnDisk(mcVer, loader) == "ready"},
             {"profileId", prof["id"]},
             {"mcVersion", mcVer},
             {"loader", loader},
@@ -2259,7 +2378,7 @@ public:
     }
 
     /**
-     * Primary Vespera v1.2.3 Windows Sign-In: OAuth 2.0 Authorization Code + PKCE (`S256`)
+     * Primary Vespera v1.2.4 Windows Sign-In: OAuth 2.0 Authorization Code + PKCE (`S256`)
      * via default system browser (`ShellExecuteW`) + temporary loopback listener (`http://localhost:<port>`).
      */
     json startBrowserPkceAuthNative() {
@@ -3359,7 +3478,7 @@ public:
                     };
                 }
             } else if (mode == "offline_singleplayer") {
-                bool localReady = (getVersionInstallStatusOnDisk(mcVer) == "ready");
+                bool localReady = (getVersionInstallStatusOnDisk(mcVer, loader) == "ready");
                 json off = computeOfflineAvailabilityJson(localReady);
                 if (!off.value("eligible", false)) {
                     refreshTelemetry();
@@ -3399,7 +3518,7 @@ public:
             }
 
             // Ensure Minecraft version is installed and verified before launching
-            if (getVersionInstallStatusOnDisk(mcVer) != "ready") {
+            if (getVersionInstallStatusOnDisk(mcVer, loader) != "ready") {
                 installMinecraftVersionNative(mcVer, loader, prof.value("loaderVersion", "0.16.10"), false);
             }
 
@@ -3497,7 +3616,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
     VesperaNativeEngine engine;
 
     webview::webview w(false, nullptr);
-    w.set_title("Vespera Client v1.2.3 — Precision Minecraft Java Edition Client");
+    w.set_title("Vespera Client v1.2.4 — Precision Minecraft Java Edition Client");
     w.set_size(1340, 860, WEBVIEW_HINT_NONE);
 
     NativeRpcTaskGroup rpcTasks;

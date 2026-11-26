@@ -12,7 +12,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
     if (!silent) {
         int confirm = MessageBoxW(
             nullptr,
-            L"Are you sure you want to uninstall Vespera Client v1.2.3 from your computer?",
+            L"Are you sure you want to uninstall Vespera Client v1.2.4 from your computer?",
             L"Vespera Client Uninstaller",
             MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2
         );

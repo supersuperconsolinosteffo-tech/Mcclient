@@ -1,12 +1,12 @@
 # Vespera Client — User Guide
 
-Welcome to **Vespera Client v1.2.3** for Windows 10 and Windows 11 (64-bit). This guide walks you through creating offline accounts, signing in with your official Microsoft Minecraft account, tuning FPS and shaders, customizing your in-game HUD, and managing isolated mod profiles.
+Welcome to **Vespera Client v1.2.4** for Windows 10 and Windows 11 (64-bit). This guide walks you through creating offline accounts, signing in with your official Microsoft Minecraft account, tuning FPS and shaders, customizing your in-game HUD, and managing isolated mod profiles.
 
 ---
 
 ## 1. Installation & First-Launch Setup Wizard
 
-1. Run **`VesperaClient-1.2.3-win64-setup.exe`**.
+1. Run **`VesperaClient-1.2.4-win64-setup.exe`**.
    - Standard user permissions (`asInvoker`) are used—no Administrator UAC prompt is required when installing to your user profile.
    - Default binary path: `%LOCALAPPDATA%\Programs\VesperaClient\`
    - Default managed data path: `%APPDATA%\VesperaClient\`
@@ -14,7 +14,7 @@ Welcome to **Vespera Client v1.2.3** for Windows 10 and Windows 11 (64-bit). Thi
    - Every embedded binary (`VesperaClient.exe`, `VesperaUninstall.exe`, `vespera-client-1.2.2+mc1.21.4.jar`) is cryptographically verified via **SHA-256** during extraction.
    - Silent enterprise/power-user installation is also supported:
      ```powershell
-     .\VesperaClient-1.2.3-win64-setup.exe /S /D=C:\Games\VesperaClient
+     .\VesperaClient-1.2.4-win64-setup.exe /S /D=C:\Games\VesperaClient
      ```
 3. On first launch, the **First-Launch Setup Wizard** detects your CPU cores, total system RAM, and Java runtime, and lets you pick your starting optimization preset (**Balanced**, **Maximum FPS**, or **Visual Quality + Shaders**) in one click.
 
