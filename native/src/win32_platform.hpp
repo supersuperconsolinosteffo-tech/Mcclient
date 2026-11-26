@@ -232,7 +232,7 @@ inline HttpResponse winhttp_request(
         return res;
     }
 
-    HINTERNET hSession = WinHttpOpen(L"VesperaClient/1.1.0 (Windows NT 10.0; Win64; x64)",
+    HINTERNET hSession = WinHttpOpen(L"VesperaClient/1.1.1 (Windows NT 10.0; Win64; x64)",
                                      WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                      WINHTTP_NO_PROXY_NAME,
                                      WINHTTP_NO_PROXY_BYPASS, 0);
@@ -401,7 +401,7 @@ inline bool winhttp_download_verified(
             return false;
         }
 
-        HINTERNET hSession = WinHttpOpen(L"VesperaClient/1.1.0 (Windows NT 10.0; Win64; x64)",
+        HINTERNET hSession = WinHttpOpen(L"VesperaClient/1.1.1 (Windows NT 10.0; Win64; x64)",
                                          WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                          WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         if (!hSession) {

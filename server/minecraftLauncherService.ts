@@ -1460,13 +1460,13 @@ export class MinecraftLauncherService {
         process.cwd(),
         'release',
         'mods',
-        'vespera-client-1.1.0+mc1.21.4.jar'
+        'vespera-client-1.1.1+mc1.21.4.jar'
       );
       const legacyReleaseModJar = path.join(
         process.cwd(),
         'release',
         'mods',
-        'vespera-client-1.0.0+mc1.21.4.jar'
+        'vespera-client-1.1.0+mc1.21.4.jar'
       );
 
       // Clean stale Vespera custom JAR if profile version is NOT 1.21.4
@@ -1688,7 +1688,7 @@ export class MinecraftLauncherService {
       ...baseFlags,
       `-Djava.library.path=${nativesDir}`,
       `-Dminecraft.launcher.brand=VesperaClient`,
-      `-Dminecraft.launcher.version=1.1.0`,
+      `-Dminecraft.launcher.version=1.1.1`,
       ...(sessionMode === 'offline_singleplayer'
         ? ['-Dvespera.offlineSingleplayer=true']
         : []),
@@ -1747,7 +1747,7 @@ export class MinecraftLauncherService {
         '--userType',
         userType,
         '--versionType',
-        profile.loader === 'vanilla' ? 'Vespera-Vanilla/1.1.0' : 'Vespera-Fabric/1.1.0',
+        profile.loader === 'vanilla' ? 'Vespera-Vanilla/1.1.1' : 'Vespera-Fabric/1.1.1',
         '--width',
         String(profile.graphics.resolutionWidth),
         '--height',

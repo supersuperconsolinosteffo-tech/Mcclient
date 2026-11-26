@@ -54,16 +54,16 @@ function verifyPe64GuiExecutable(filePath, label) {
   );
 }
 
-console.log('=== Verifying Vespera Client v1.1.0 Final Release Artifacts ===');
+console.log('=== Verifying Vespera Client v1.1.1 Final Release Artifacts ===');
 
-const setupExe = path.join(ROOT, 'release/VesperaClient-1.1.0-win64-setup.exe');
+const setupExe = path.join(ROOT, 'release/VesperaClient-1.1.1-win64-setup.exe');
 const launcherExe = path.join(ROOT, 'release/bin/VesperaClient.exe');
 const uninstallExe = path.join(ROOT, 'release/bin/VesperaUninstall.exe');
-const modJar = path.join(ROOT, 'release/mods/vespera-client-1.1.0+mc1.21.4.jar');
+const modJar = path.join(ROOT, 'release/mods/vespera-client-1.1.1+mc1.21.4.jar');
 const iconIco = path.join(ROOT, 'release/vespera.ico');
 const sumsFile = path.join(ROOT, 'release/SHA256SUMS.txt');
 
-verifyPe64GuiExecutable(setupExe, 'Windows 64-bit Setup Installer (VesperaClient-1.1.0-win64-setup.exe)');
+verifyPe64GuiExecutable(setupExe, 'Windows 64-bit Setup Installer (VesperaClient-1.1.1-win64-setup.exe)');
 verifyPe64GuiExecutable(launcherExe, 'Windows 64-bit Desktop Launcher (VesperaClient.exe)');
 verifyPe64GuiExecutable(uninstallExe, 'Windows 64-bit Uninstaller (VesperaUninstall.exe)');
 
@@ -89,11 +89,15 @@ assert(
   'Native C++ launcher emits DiagnosticFinding[] array contract for state["diagnostics"]'
 );
 
-// Verify zero manual Client ID input in Accounts UI & zero committed OAuth secrets
+// Verify zero manual Client ID input & zero intimidating Developer Config panel in Accounts UI
 const accountsUiSrc = fs.readFileSync(path.join(ROOT, 'ui/src/pages/accountsSettingsDiagAbout.ts'), 'utf8');
 assert(
-  !accountsUiSrc.includes('msa-client-id-input'),
-  'Accounts UI removes manual end-user Microsoft Client ID input field'
+  !accountsUiSrc.includes('msa-client-id-input') &&
+    !accountsUiSrc.includes('Developer Config Required') &&
+    !accountsUiSrc.includes('Maintainer / Developer Build Configuration Notice') &&
+    accountsUiSrc.includes('Connect your Minecraft account') &&
+    accountsUiSrc.includes('Sign in with Microsoft'),
+  'Accounts UI presents clean "Connect your Minecraft account" + "Sign in with Microsoft" UX without developer panels'
 );
 const oauthReleaseCfg = JSON.parse(fs.readFileSync(path.join(ROOT, 'config/oauth.release.json'), 'utf8'));
 assert(

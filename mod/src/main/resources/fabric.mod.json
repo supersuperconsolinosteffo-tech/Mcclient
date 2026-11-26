@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "vespera-client",
-  "version": "1.1.0+mc1.21.4",
+  "version": "1.1.1+mc1.21.4",
   "name": "Vespera Client Core",
   "description": "Precision client-side HUD suite, interactive HUD editor, smooth cinematic zoom, fair-play Toggle Sprint, chat/tooltip QoL, and low-overhead launcher telemetry sync.",
   "authors": [

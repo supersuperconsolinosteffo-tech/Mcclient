@@ -17,7 +17,7 @@ import java.nio.file.Paths
 @Environment(EnvType.CLIENT)
 object VesperaClientMod : ClientModInitializer {
     const val MOD_ID = "vespera-client"
-    const val MOD_VERSION = "1.1.0+mc1.21.4"
+    const val MOD_VERSION = "1.1.1+mc1.21.4"
 
     val frameAnalyzer = FrameTimeAnalyzer(600)
     val cpsTracker = CpsRingTracker(256, 1_000L)

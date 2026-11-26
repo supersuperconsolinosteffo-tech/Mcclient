@@ -204,6 +204,7 @@ public:
     std::atomic<bool> cancelDownloadFlag{false};
     std::atomic<bool> cancelAuthFlag{false};
     SOCKET activePkceListenSocket = INVALID_SOCKET;
+    std::set<std::string> consumedAuthCodes;
 
     std::vector<std::string> logs;
     std::mutex mtx;
@@ -267,13 +268,34 @@ public:
         if (ofs) ofs << clean << "\n";
     }
 
-    bool isOAuthConfigured() const {
-        std::string cid = kEmbeddedMsaClientId ? kEmbeddedMsaClientId : "";
-        return cid.size() >= 32;
+    static bool isValidPublicClientUuid(const std::string& s) {
+        if (s.size() != 36) return false;
+        if (s == "00000000-0000-0000-0000-000000000000") return false;
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (i == 8 || i == 13 || i == 18 || i == 23) {
+                if (s[i] != '-') return false;
+            } else {
+                char c = s[i];
+                bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+                if (!hex) return false;
+            }
+        }
+        return true;
     }
 
     std::string getEmbeddedClientId() const {
-        return kEmbeddedMsaClientId ? std::string(kEmbeddedMsaClientId) : std::string("");
+        wchar_t envBuf[128] = {};
+        DWORD n = GetEnvironmentVariableW(L"VESPERA_MSA_CLIENT_ID", envBuf, 127);
+        if (n > 0 && n < 127) {
+            std::string envCid = wide_to_utf8(envBuf);
+            if (isValidPublicClientUuid(envCid)) return envCid;
+        }
+        std::string embedded = kEmbeddedMsaClientId ? std::string(kEmbeddedMsaClientId) : std::string("");
+        return isValidPublicClientUuid(embedded) ? embedded : std::string("");
+    }
+
+    bool isOAuthConfigured() const {
+        return !getEmbeddedClientId().empty();
     }
 
     void sanitizeLoadedState(const json& defaults) {
@@ -323,7 +345,7 @@ public:
             bool vesperaOk = (p["loader"] == "fabric" && p.value("mcVersion", "") == "1.21.4");
             p["vesperaModCompatible"] = vesperaOk;
         }
-        state["version"] = "1.1.0";
+        state["version"] = "1.1.1";
         state["platformMode"] = "windows_native_webview2";
     }
 
@@ -336,10 +358,10 @@ public:
         }
         write_text_atomic(crashLockPath, "{\"active\":true}");
 
-        fs::path targetMod = modsPoolDir / "vespera-client-1.1.0+mc1.21.4.jar";
+        fs::path targetMod = modsPoolDir / "vespera-client-1.1.1+mc1.21.4.jar";
         if (!fs::exists(targetMod)) {
             write_file_atomic(targetMod, kEmbeddedModJarData, kEmbeddedModJarSize);
-            appendLog("[FirstLaunch] Provisioned verified vespera-client-1.1.0+mc1.21.4.jar to managed mods pool.");
+            appendLog("[FirstLaunch] Provisioned verified vespera-client-1.1.1+mc1.21.4.jar to managed mods pool.");
         }
 
         json defaults = json::parse(kDefaultSnapshotJson);
@@ -348,7 +370,7 @@ public:
                 state = json::parse(read_text_file(statePath));
                 sanitizeLoadedState(defaults);
                 saveState();
-                appendLog("[Core] Loaded and verified Vespera Client v1.1.0 Windows configuration.");
+                appendLog("[Core] Loaded and verified Vespera Client v1.1.1 Windows configuration.");
                 return;
             } catch (...) {
                 appendLog("[CrashRecovery] State file corrupted; restoring verified factory configuration.");
@@ -802,8 +824,8 @@ public:
             }
 
             // Provision custom 1.21.4 mod ONLY on Fabric 1.21.4 when enabled
-            fs::path srcMod = modsPoolDir / "vespera-client-1.1.0+mc1.21.4.jar";
-            fs::path dstMod = instDir / "mods" / "vespera-client-1.1.0+mc1.21.4.jar";
+            fs::path srcMod = modsPoolDir / "vespera-client-1.1.1+mc1.21.4.jar";
+            fs::path dstMod = instDir / "mods" / "vespera-client-1.1.1+mc1.21.4.jar";
             if (mcVer == "1.21.4" && enabledSet.count("vespera-client") > 0 && fs::exists(srcMod)) {
                 if (!fs::exists(dstMod)) {
                     fs::copy_file(srcMod, dstMod, fs::copy_options::overwrite_existing, ec);
@@ -1279,13 +1301,20 @@ public:
     }
 
     json completeXboxAndMinecraftExchange(const std::string& msaAccess, const std::string& msaRefresh) {
+        if (authFlowState.value("mode", "") == "pkce_browser") {
+            authFlowState["step"] = "connecting_xbox";
+            authFlowState["message"] = "Connecting to Xbox services...";
+        }
+
         json xblReq = {
             {"Properties", {{"AuthMethod", "RPS"}, {"SiteName", "user.auth.xboxlive.com"}, {"RpsTicket", "d=" + msaAccess}}},
             {"RelyingParty", "http://auth.xboxlive.com"},
             {"TokenType", "JWT"}
         };
         HttpResponse xblResp = winhttp_request("POST", "https://user.auth.xboxlive.com/user/authenticate", xblReq.dump());
-        if (xblResp.statusCode != 200) throw std::runtime_error("Xbox Live authentication failed (HTTP " + std::to_string(xblResp.statusCode) + ").");
+        if (xblResp.statusCode != 200) {
+            throw std::runtime_error("Xbox Live could not verify your Microsoft session (HTTP " + std::to_string(xblResp.statusCode) + ").");
+        }
         json xbl = json::parse(xblResp.body);
         std::string xblToken = xbl.value("Token", "");
         std::string uhs = xbl["DisplayClaims"]["xui"][0].value("uhs", "");
@@ -1296,15 +1325,24 @@ public:
             {"TokenType", "JWT"}
         };
         HttpResponse xstsResp = winhttp_request("POST", "https://xsts.auth.xboxlive.com/xsts/authorize", xstsReq.dump());
-        if (xstsResp.statusCode != 200) throw std::runtime_error("XSTS authorization failed (HTTP " + std::to_string(xstsResp.statusCode) + ").");
+        if (xstsResp.statusCode != 200) {
+            throw std::runtime_error("Xbox services could not authorize Minecraft access for this account (HTTP " + std::to_string(xstsResp.statusCode) + ").");
+        }
         std::string xstsToken = json::parse(xstsResp.body).value("Token", "");
 
         json mcReq = {{"identityToken", "XBL3.0 x=" + uhs + ";" + xstsToken}};
         HttpResponse mcResp = winhttp_request("POST", "https://api.minecraftservices.com/authentication/login_with_xbox", mcReq.dump());
-        if (mcResp.statusCode != 200) throw std::runtime_error("Minecraft login_with_xbox failed.");
+        if (mcResp.statusCode != 200) {
+            throw std::runtime_error("Minecraft Services rejected the Xbox session token.");
+        }
         json mcAuth = json::parse(mcResp.body);
         std::string mcToken = mcAuth.value("access_token", "");
         long long expiresIn = mcAuth.value("expires_in", 86400LL);
+
+        if (authFlowState.value("mode", "") == "pkce_browser") {
+            authFlowState["step"] = "checking_ownership";
+            authFlowState["message"] = "Checking Minecraft ownership...";
+        }
 
         // Verify Minecraft Java Edition entitlement
         HttpResponse entResp = winhttp_request("GET", "https://api.minecraftservices.com/entitlements/mcstore", "", "application/json", mcToken);
@@ -1318,10 +1356,18 @@ public:
                 }
             }
         }
+        if (!ownsGame) {
+            throw std::runtime_error("This Microsoft account does not own an active Minecraft: Java Edition license.");
+        }
+
+        if (authFlowState.value("mode", "") == "pkce_browser") {
+            authFlowState["step"] = "retrieving_profile";
+            authFlowState["message"] = "Retrieving Minecraft profile...";
+        }
 
         HttpResponse profResp = winhttp_request("GET", "https://api.minecraftservices.com/minecraft/profile", "", "application/json", mcToken);
-        if (profResp.statusCode != 200 || !ownsGame) {
-            throw std::runtime_error("Authenticated Microsoft account does not own an active Minecraft: Java Edition license.");
+        if (profResp.statusCode != 200) {
+            throw std::runtime_error("Your Microsoft account owns Minecraft, but no Java Edition username has been created yet on minecraft.net.");
         }
         json prof = json::parse(profResp.body);
         std::string uuid = prof.value("id", "");
@@ -1361,14 +1407,20 @@ public:
     }
 
     /**
-     * Primary Vespera v1.1.0 Windows Sign-In: OAuth 2.0 Authorization Code + PKCE (`S256`)
-     * via default system browser (`ShellExecuteW`) + temporary loopback listener on `127.0.0.1:0`.
+     * Primary Vespera v1.1.1 Windows Sign-In: OAuth 2.0 Authorization Code + PKCE (`S256`)
+     * via default system browser (`ShellExecuteW`) + temporary loopback listener (`http://localhost:<port>`).
      */
     json startBrowserPkceAuthNative() {
         if (!isOAuthConfigured()) {
-            std::string msg = "Developer Build Configuration Required: No Microsoft Entra public Client ID was injected at build time (see docs/OAUTH_DEVELOPER_SETUP.md).";
-            authFlowState = {{"mode", "error"}, {"message", msg}};
-            throw std::runtime_error(msg);
+            std::string userMsg = "This build of Vespera Client does not include a registered Microsoft OAuth Application ID yet, so Microsoft sign-in cannot start.";
+            authFlowState = {
+                {"mode", "error"},
+                {"errorCode", "missing_app_config"},
+                {"userTitle", "Microsoft Sign-In Not Configured in This Build"},
+                {"message", userMsg},
+                {"technicalDetail", "Missing build-time Microsoft Entra Application (client) ID. Set VESPERA_MSA_CLIENT_ID or configure config/oauth.local.json / config/oauth.release.json with http://localhost redirect URI (see docs/OAUTH_DEVELOPER_SETUP.md)."}
+            };
+            throw std::runtime_error(userMsg);
         }
 
         cancelAuthFlag.store(true);
@@ -1385,13 +1437,13 @@ public:
 
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // Strictly 127.0.0.1 only
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // Strictly local loopback only
         addr.sin_port = 0; // Ephemeral free port
 
         if (bind(listenSock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR ||
-            listen(listenSock, 1) == SOCKET_ERROR) {
+            listen(listenSock, 4) == SOCKET_ERROR) {
             closesocket(listenSock);
-            throw std::runtime_error("Unable to bind ephemeral 127.0.0.1 callback port.");
+            throw std::runtime_error("Unable to bind ephemeral localhost callback port.");
         }
 
         int addrLen = sizeof(addr);
@@ -1402,8 +1454,8 @@ public:
         std::string clientId = getEmbeddedClientId();
         std::string codeVerifier = bcrypt_random_base64url(32);
         std::string codeChallenge = bcrypt_sha256_base64url(codeVerifier);
-        std::string csrfState = bcrypt_random_base64url(18);
-        std::string redirectUri = "http://127.0.0.1:" + std::to_string(port) + "/callback";
+        std::string csrfState = bcrypt_random_base64url(24);
+        std::string redirectUri = "http://localhost:" + std::to_string(port);
 
         std::string authorizeUrl =
             "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize?client_id=" + url_encode_comp(clientId) +
@@ -1415,111 +1467,218 @@ public:
 
         authFlowState = {
             {"mode", "pkce_browser"},
+            {"step", "opening_browser"},
             {"authorizeUrl", authorizeUrl},
             {"redirectUri", redirectUri},
-            {"message", "Complete sign-in in your default browser. Vespera Client will finish verification automatically."}
+            {"message", "Opening Microsoft login..."}
         };
 
         // Launch official system browser (never an embedded credential prompt)
         std::wstring wAuthUrl = utf8_to_wide(authorizeUrl);
-        ShellExecuteW(nullptr, L"open", wAuthUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        HINSTANCE hBr = ShellExecuteW(nullptr, L"open", wAuthUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        if (reinterpret_cast<INT_PTR>(hBr) <= 32) {
+            closesocket(listenSock);
+            activePkceListenSocket = INVALID_SOCKET;
+            std::string errMsg = "Vespera Client could not automatically open your default Windows browser. Check your default browser settings and try again.";
+            authFlowState = {
+                {"mode", "error"},
+                {"errorCode", "browser_launch_failed"},
+                {"userTitle", "Could Not Open Default Browser"},
+                {"message", errMsg}
+            };
+            throw std::runtime_error(errMsg);
+        }
+
+        authFlowState["step"] = "waiting_for_login";
+        authFlowState["browserOpened"] = true;
+        authFlowState["message"] = "Waiting for authentication in your default browser...";
 
         std::thread([this, listenSock, clientId, codeVerifier, csrfState, redirectUri]() {
-            fd_set readSet;
-            FD_ZERO(&readSet);
-            FD_SET(listenSock, &readSet);
-            timeval tv{300, 0}; // 5-minute timeout
-            int sel = select(0, &readSet, nullptr, nullptr, &tv);
-            if (sel <= 0 || cancelAuthFlag.load()) {
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(300);
+
+            auto closeListenIfActive = [&]() {
                 std::lock_guard<std::mutex> lk(mtx);
                 if (activePkceListenSocket == listenSock) {
                     closesocket(listenSock);
                     activePkceListenSocket = INVALID_SOCKET;
                 }
-                if (!cancelAuthFlag.load()) {
-                    authFlowState = {{"mode", "error"}, {"message", "Browser sign-in timed out. Try again or use Device Code fallback."}};
-                }
-                return;
-            }
-
-            SOCKET clientSock = accept(listenSock, nullptr, nullptr);
-            {
-                std::lock_guard<std::mutex> lk(mtx);
-                if (activePkceListenSocket == listenSock) {
-                    closesocket(listenSock);
-                    activePkceListenSocket = INVALID_SOCKET;
-                }
-            }
-            if (clientSock == INVALID_SOCKET) return;
-
-            char reqBuf[4096] = {};
-            int recvd = recv(clientSock, reqBuf, sizeof(reqBuf) - 1, 0);
-            std::string reqStr(reqBuf, recvd > 0 ? recvd : 0);
-            std::istringstream firstLine(reqStr);
-            std::string httpMethod, targetPath;
-            firstLine >> httpMethod >> targetPath;
-
-            std::string gotState = query_param_from_target(targetPath, "state");
-            std::string gotCode = query_param_from_target(targetPath, "code");
-            std::string gotErr = query_param_from_target(targetPath, "error");
-
-            auto sendHtmlAndClose = [&](int status, const std::string& msg) {
-                std::string html = "<!doctype html><html><body style='background:#070B14;color:#F8FAFC;font-family:Segoe UI,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0'>"
-                                   "<div style='max-width:440px;padding:28px;border-radius:14px;background:#0F172A;border:1px solid #334155;text-align:center'>"
-                                   "<h2>Vespera Client</h2><p>" + msg + "</p></div></body></html>";
-                std::ostringstream resp;
-                resp << "HTTP/1.1 " << status << (status == 200 ? " OK\r\n" : " Bad Request\r\n")
-                     << "Content-Type: text/html; charset=utf-8\r\n"
-                     << "Content-Length: " << html.size() << "\r\n"
-                     << "Connection: close\r\n\r\n" << html;
-                std::string wire = resp.str();
-                send(clientSock, wire.data(), static_cast<int>(wire.size()), 0);
-                closesocket(clientSock);
             };
 
-            if (gotState != csrfState) {
-                sendHtmlAndClose(400, "Security state mismatch. Sign-in rejected.");
-                std::lock_guard<std::mutex> lk(mtx);
-                authFlowState = {{"mode", "error"}, {"message", "OAuth state mismatch rejected."}};
-                return;
-            }
-            if (!gotErr.empty() || gotCode.empty()) {
-                sendHtmlAndClose(400, "Sign-in was cancelled or declined in browser.");
-                std::lock_guard<std::mutex> lk(mtx);
-                authFlowState = {{"mode", "cancelled"}, {"message", "Microsoft sign-in cancelled in browser."}};
-                return;
-            }
-
-            std::string tokenBody =
-                "client_id=" + url_encode_comp(clientId) +
-                "&grant_type=authorization_code" +
-                "&code=" + url_encode_comp(gotCode) +
-                "&redirect_uri=" + url_encode_comp(redirectUri) +
-                "&code_verifier=" + url_encode_comp(codeVerifier) +
-                "&scope=" + url_encode_comp("XboxLive.signin offline_access");
-
-            HttpResponse tokResp = winhttp_request(
-                "POST",
-                "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
-                tokenBody,
-                "application/x-www-form-urlencoded"
-            );
-
-            std::lock_guard<std::mutex> lk(mtx);
-            try {
-                if (tokResp.statusCode != 200) {
-                    throw std::runtime_error("Microsoft PKCE token exchange failed (HTTP " + std::to_string(tokResp.statusCode) + ").");
+            while (!cancelAuthFlag.load()) {
+                auto now = std::chrono::steady_clock::now();
+                if (now >= deadline) {
+                    closeListenIfActive();
+                    std::lock_guard<std::mutex> lk(mtx);
+                    authFlowState = {
+                        {"mode", "error"},
+                        {"errorCode", "callback_timeout"},
+                        {"userTitle", "Sign-In Timed Out"},
+                        {"message", "We did not receive a sign-in response from your browser in time. Click \"Sign in with Microsoft\" whenever you are ready to try again."}
+                    };
+                    return;
                 }
-                json tokJson = json::parse(tokResp.body);
-                json acc = completeXboxAndMinecraftExchange(tokJson.value("access_token", ""), tokJson.value("refresh_token", ""));
-                sendHtmlAndClose(200, "Signed in as " + acc.value("username", "") + "! You may close this browser tab and return to Vespera Client.");
-                authFlowState = {
-                    {"mode", "completed"},
-                    {"message", "Signed in as " + acc.value("username", "") + " (Minecraft: Java Edition verified)."}
+
+                long remainSec = std::max<long>(1, static_cast<long>(std::chrono::duration_cast<std::chrono::seconds>(deadline - now).count()));
+                fd_set readSet;
+                FD_ZERO(&readSet);
+                FD_SET(listenSock, &readSet);
+                timeval tv{std::min<long>(remainSec, 2), 0};
+                int sel = select(0, &readSet, nullptr, nullptr, &tv);
+                if (sel == 0) continue;
+                if (sel < 0 || cancelAuthFlag.load()) {
+                    closeListenIfActive();
+                    return;
+                }
+
+                SOCKET clientSock = accept(listenSock, nullptr, nullptr);
+                if (clientSock == INVALID_SOCKET) continue;
+
+                DWORD recvTimeoutMs = 3000;
+                setsockopt(clientSock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&recvTimeoutMs), sizeof(recvTimeoutMs));
+
+                char reqBuf[8192] = {};
+                int recvd = recv(clientSock, reqBuf, sizeof(reqBuf) - 1, 0);
+                if (recvd <= 0) {
+                    closesocket(clientSock);
+                    continue; // Browser speculative empty socket; keep waiting for real redirect
+                }
+
+                std::string reqStr(reqBuf, recvd);
+                std::istringstream firstLine(reqStr);
+                std::string httpMethod, targetPath;
+                firstLine >> httpMethod >> targetPath;
+
+                if (httpMethod != "GET") {
+                    std::string resp = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    send(clientSock, resp.data(), static_cast<int>(resp.size()), 0);
+                    closesocket(clientSock);
+                    continue;
+                }
+
+                if (targetPath.rfind("/favicon.ico", 0) == 0) {
+                    std::string resp = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
+                    send(clientSock, resp.data(), static_cast<int>(resp.size()), 0);
+                    closesocket(clientSock);
+                    continue;
+                }
+
+                // We received the OAuth callback request — close the temporary listener immediately
+                closeListenIfActive();
+
+                std::string gotState = query_param_from_target(targetPath, "state");
+                std::string gotCode = query_param_from_target(targetPath, "code");
+                std::string gotErr = query_param_from_target(targetPath, "error");
+
+                auto sendHtmlAndClose = [&](int status, const std::string& heading, const std::string& msg) {
+                    std::string accent = (status == 200) ? "#F59E0B" : "#EF4444";
+                    std::string html =
+                        "<!doctype html><html><body style='background:#090B10;color:#F8FAFC;font-family:Segoe UI,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0'>"
+                        "<div style='max-width:450px;padding:32px;border-radius:16px;background:#111520;border:1px solid " + accent + ";text-align:center'>"
+                        "<h2 style='margin:0 0 10px'>" + heading + "</h2><p style='color:#CBD5E1;line-height:1.55;margin:0'>" + msg + "</p></div></body></html>";
+                    std::ostringstream resp;
+                    resp << "HTTP/1.1 " << status << (status == 200 ? " OK\r\n" : " Bad Request\r\n")
+                         << "Content-Type: text/html; charset=utf-8\r\n"
+                         << "Content-Length: " << html.size() << "\r\n"
+                         << "Connection: close\r\n\r\n" << html;
+                    std::string wire = resp.str();
+                    send(clientSock, wire.data(), static_cast<int>(wire.size()), 0);
+                    closesocket(clientSock);
                 };
-            } catch (const std::exception& ex) {
-                sendHtmlAndClose(400, ex.what());
-                authFlowState = {{"mode", "error"}, {"message", ex.what()}};
+
+                if (gotState.empty() || gotState != csrfState) {
+                    sendHtmlAndClose(400, "Security Verification Failed", "The sign-in callback state did not match your active Vespera session.");
+                    std::lock_guard<std::mutex> lk(mtx);
+                    authFlowState = {
+                        {"mode", "error"},
+                        {"errorCode", "invalid_callback"},
+                        {"userTitle", "Security Verification Failed"},
+                        {"message", "The sign-in response did not match your active Vespera session and was blocked for your security."}
+                    };
+                    return;
+                }
+
+                if (!gotErr.empty()) {
+                    bool cancelled = (gotErr == "access_denied");
+                    sendHtmlAndClose(400, cancelled ? "Sign-In Cancelled" : "Sign-In Could Not Complete",
+                                     cancelled ? "You cancelled Microsoft sign-in. You may close this tab." : "Microsoft could not complete sign-in.");
+                    std::lock_guard<std::mutex> lk(mtx);
+                    if (cancelled) {
+                        authFlowState = {{"mode", "idle"}, {"message", "Sign-in cancelled."}};
+                    } else {
+                        authFlowState = {
+                            {"mode", "error"},
+                            {"errorCode", "microsoft_auth_failed"},
+                            {"userTitle", "Microsoft Sign-In Failed"},
+                            {"message", "Microsoft could not complete your sign-in request. Please try again."},
+                            {"technicalDetail", gotErr}
+                        };
+                    }
+                    return;
+                }
+
+                if (gotCode.empty()) {
+                    sendHtmlAndClose(400, "Incomplete Sign-In Response", "Microsoft redirected back without an authorization code.");
+                    std::lock_guard<std::mutex> lk(mtx);
+                    authFlowState = {
+                        {"mode", "error"},
+                        {"errorCode", "invalid_callback"},
+                        {"userTitle", "Incomplete Sign-In Response"},
+                        {"message", "Microsoft redirected back without an authorization code. Please try again."}
+                    };
+                    return;
+                }
+
+                {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    if (consumedAuthCodes.count(gotCode) > 0) {
+                        sendHtmlAndClose(400, "Duplicate Sign-In Callback", "This authorization code has already been processed.");
+                        return;
+                    }
+                    if (consumedAuthCodes.size() > 128) consumedAuthCodes.clear();
+                    consumedAuthCodes.insert(gotCode);
+                    authFlowState["step"] = "verifying_microsoft";
+                    authFlowState["message"] = "Verifying Microsoft account...";
+                }
+
+                std::string tokenBody =
+                    "client_id=" + url_encode_comp(clientId) +
+                    "&grant_type=authorization_code" +
+                    "&code=" + url_encode_comp(gotCode) +
+                    "&redirect_uri=" + url_encode_comp(redirectUri) +
+                    "&code_verifier=" + url_encode_comp(codeVerifier) +
+                    "&scope=" + url_encode_comp("XboxLive.signin offline_access");
+
+                HttpResponse tokResp = winhttp_request(
+                    "POST",
+                    "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+                    tokenBody,
+                    "application/x-www-form-urlencoded"
+                );
+
+                std::lock_guard<std::mutex> lk(mtx);
+                try {
+                    if (tokResp.statusCode != 200) {
+                        throw std::runtime_error("Microsoft could not verify the authorization code (HTTP " + std::to_string(tokResp.statusCode) + ").");
+                    }
+                    json tokJson = json::parse(tokResp.body);
+                    json acc = completeXboxAndMinecraftExchange(tokJson.value("access_token", ""), tokJson.value("refresh_token", ""));
+                    sendHtmlAndClose(200, "Signed in as " + acc.value("username", ""),
+                                     "Your Minecraft: Java Edition account is connected! You can close this browser tab and return to Vespera Client.");
+                    authFlowState = {
+                        {"mode", "completed"},
+                        {"userTitle", "Signed in to Minecraft"},
+                        {"message", "Signed in as " + acc.value("username", "") + "."}
+                    };
+                } catch (const std::exception& ex) {
+                    sendHtmlAndClose(400, "Could Not Complete Sign-In", ex.what());
+                    authFlowState = {
+                        {"mode", "error"},
+                        {"errorCode", "microsoft_auth_failed"},
+                        {"userTitle", "Could Not Complete Sign-In"},
+                        {"message", ex.what()}
+                    };
+                }
+                return;
             }
         }).detach();
 
@@ -2100,7 +2259,7 @@ public:
                 closesocket(activePkceListenSocket);
                 activePkceListenSocket = INVALID_SOCKET;
             }
-            authFlowState = {{"mode", "cancelled"}, {"message", "Microsoft sign-in cancelled."}};
+            authFlowState = {{"mode", "idle"}, {"message", "Sign-in cancelled."}};
             refreshTelemetry();
             return state;
         }
@@ -2365,7 +2524,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
     VesperaNativeEngine engine;
 
     webview::webview w(false, nullptr);
-    w.set_title("Vespera Client v1.1.0 — Precision Minecraft Java Edition Client");
+    w.set_title("Vespera Client v1.1.1 — Precision Minecraft Java Edition Client");
     w.set_size(1340, 860, WEBVIEW_HINT_NONE);
 
     w.bind("vesperaNativeInvoke", [&engine](const std::string& reqArrayJson) -> std::string {

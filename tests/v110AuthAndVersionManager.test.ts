@@ -219,10 +219,10 @@ describe('Part 8.1 — Microsoft Authentication Overhaul & Legitimate Offline Si
     });
     expect(unconfiguredAuth.getOAuthConfigState().configured).toBe(false);
     await expect(unconfiguredAuth.startBrowserPkceSignIn()).rejects.toThrow(
-      /Developer Build Configuration Required/i
+      /does not include a registered Microsoft OAuth Application ID yet/i
     );
     await expect(unconfiguredAuth.startDeviceCodeFlow()).rejects.toThrow(
-      /Developer Build Configuration Required/i
+      /does not include a registered Microsoft OAuth Application ID yet/i
     );
   });
 
@@ -247,7 +247,7 @@ describe('Part 8.1 — Microsoft Authentication Overhaul & Legitimate Offline Si
 
     const flow = await auth.startBrowserPkceSignIn();
     expect(flow.mode).toBe('pkce_browser');
-    expect(flow.redirectUri).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/callback$/);
+    expect(flow.redirectUri).toMatch(/^http:\/\/localhost:\d+$/);
     expect(flow.authorizeUrl).toContain('code_challenge_method=S256');
     expect(flow.authorizeUrl).toContain(`client_id=${validPublicClientId}`);
 
@@ -723,7 +723,7 @@ describe('Part 8.4 — End-to-End UX Flow, Legacy 1.8.9 Args, Mod Isolation & v1
 
     const coord = new VesperaStateCoordinator(dataDir);
     const migratedSnap = coord.getSnapshot();
-    expect(migratedSnap.version).toBe('1.1.0');
+    expect(migratedSnap.version).toBe('1.1.1');
     expect(migratedSnap.profiles[0].name).toBe('My Preserved v1.0.0 Profile');
 
     // Verify Accounts UI has ZERO manual Client ID input fields and renders Offline Availability section

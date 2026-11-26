@@ -85,8 +85,8 @@ bool execute_installation(
     write_file_atomic(iconPath, kPayloadIconIco, kPayloadIconIcoSize);
 
     set_status_text(L"Provisioning verified Vespera Client Fabric 1.21.4 Mod JAR...", 75);
-    write_file_atomic(installDir / "mods" / "vespera-client-1.1.0+mc1.21.4.jar", kPayloadModJar, kPayloadModJarSize);
-    write_file_atomic(appData / "mods-pool" / "vespera-client-1.1.0+mc1.21.4.jar", kPayloadModJar, kPayloadModJarSize);
+    write_file_atomic(installDir / "mods" / "vespera-client-1.1.1+mc1.21.4.jar", kPayloadModJar, kPayloadModJarSize);
+    write_file_atomic(appData / "mods-pool" / "vespera-client-1.1.1+mc1.21.4.jar", kPayloadModJar, kPayloadModJarSize);
     write_text_atomic(installDir / "LICENSE.txt", kPayloadLicenseText);
 
     // 4. Register in Windows Apps & Features / Add or Remove Programs (HKCU — zero UAC prompt required)
@@ -102,7 +102,7 @@ bool execute_installation(
                            static_cast<DWORD>((val.size() + 1) * sizeof(wchar_t)));
         };
         setSz(L"DisplayName", L"Vespera Client");
-        setSz(L"DisplayVersion", L"1.1.0");
+        setSz(L"DisplayVersion", L"1.1.1");
         setSz(L"Publisher", L"Vespera Labs");
         setSz(L"DisplayIcon", iconPath.wstring());
         setSz(L"InstallLocation", installDir.wstring());
@@ -147,7 +147,7 @@ bool execute_installation(
         );
     }
 
-    set_status_text(L"Installation complete! Vespera Client v1.1.0 is ready.", 100);
+    set_status_text(L"Installation complete! Vespera Client v1.1.1 is ready.", 100);
     return true;
 }
 
@@ -164,7 +164,7 @@ LRESULT CALLBACK SetupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                                          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                          CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
 
-            HWND hTitle = CreateWindowExW(0, L"STATIC", L"VESPERA CLIENT v1.1.0 SETUP",
+            HWND hTitle = CreateWindowExW(0, L"STATIC", L"VESPERA CLIENT v1.1.1 SETUP",
                                           WS_CHILD | WS_VISIBLE, 26, 20, 560, 30, hwnd, nullptr, nullptr, nullptr);
             SendMessageW(hTitle, WM_SETFONT, reinterpret_cast<WPARAM>(g_ui.hFontTitle), TRUE);
 
@@ -271,7 +271,7 @@ LRESULT CALLBACK SetupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
                 MessageBoxW(
                     hwnd,
-                    L"Vespera Client v1.1.0 has been installed!\n\nManaged data directory: %APPDATA%\\VesperaClient\nUninstaller registered in Windows Apps & Features.",
+                    L"Vespera Client v1.1.1 has been installed!\n\nManaged data directory: %APPDATA%\\VesperaClient\nUninstaller registered in Windows Apps & Features.",
                     L"Setup Complete",
                     MB_ICONINFORMATION | MB_OK
                 );
@@ -336,7 +336,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR lpCmdLine, int nCmdShow) {
     g_ui.hwndMain = CreateWindowExW(
         0,
         wc.lpszClassName,
-        L"Vespera Client v1.1.0 — Windows 64-bit Setup",
+        L"Vespera Client v1.1.1 — Windows 64-bit Setup",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         (screenW - winW) / 2,
         (screenH - winH) / 2,

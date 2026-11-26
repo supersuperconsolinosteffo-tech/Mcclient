@@ -120,20 +120,54 @@ export interface MinecraftAccount {
 
 export interface OAuthAppConfigState {
   configured: boolean;
-  source: 'env_override' | 'developer_local' | 'release_config' | 'unconfigured';
+  source:
+    | 'env_override'
+    | 'developer_local'
+    | 'development_config'
+    | 'release_config'
+    | 'unconfigured';
   supportsPkceLoopback: boolean;
   supportsDeviceCodeFallback: boolean;
   developerSetupDocPath: string;
 }
 
+export type AuthProgressStep =
+  | 'opening_browser'
+  | 'waiting_for_login'
+  | 'verifying_microsoft'
+  | 'connecting_xbox'
+  | 'checking_ownership'
+  | 'retrieving_profile';
+
+export type AuthErrorCode =
+  | 'missing_app_config'
+  | 'user_cancelled'
+  | 'invalid_client_id'
+  | 'invalid_redirect_uri'
+  | 'microsoft_auth_failed'
+  | 'xbox_auth_failed'
+  | 'xsts_auth_failed'
+  | 'no_minecraft_entitlement'
+  | 'no_minecraft_profile'
+  | 'network_error'
+  | 'token_expired'
+  | 'callback_timeout'
+  | 'browser_launch_failed'
+  | 'invalid_callback';
+
 export interface AuthFlowState {
   mode: 'idle' | 'pkce_browser' | 'device_code' | 'completed' | 'cancelled' | 'error';
+  step?: AuthProgressStep;
+  errorCode?: AuthErrorCode;
+  userTitle?: string;
   authorizeUrl?: string;
   redirectUri?: string;
+  browserOpened?: boolean;
   startedAt?: number;
   expiresAt?: number;
   deviceChallenge?: DeviceCodeAuthChallenge | null;
   message: string;
+  technicalDetail?: string;
 }
 
 export interface OfflineAvailabilityState {

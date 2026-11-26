@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 2,
+  "provider": "microsoft_entra_public_client",
+  "environment": "development",
+  "clientId": "",
+  "tenant": "consumers",
+  "scopes": ["XboxLive.signin", "offline_access"],
+  "loopbackHost": "localhost",
+  "loopbackRedirectPath": "",
+  "notes": "Development Microsoft Entra public Client ID configuration. Developers may also use gitignored config/oauth.local.json or VESPERA_MSA_CLIENT_ID."
+}

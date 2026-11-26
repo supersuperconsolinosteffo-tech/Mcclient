@@ -1,9 +1,11 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "provider": "microsoft_entra_public_client",
+  "environment": "production",
   "clientId": "",
   "tenant": "consumers",
   "scopes": ["XboxLive.signin", "offline_access"],
-  "loopbackRedirectPath": "/callback",
-  "notes": "Maintainer build-time public Client ID configuration. Never place a client secret in desktop builds. Override locally via config/oauth.local.json or VESPERA_MSA_CLIENT_ID."
+  "loopbackHost": "localhost",
+  "loopbackRedirectPath": "",
+  "notes": "Production build-time Microsoft Entra public Client ID configuration. Register http://localhost under Mobile and desktop applications in Microsoft Entra ID. Never place a client secret in desktop builds."
 }

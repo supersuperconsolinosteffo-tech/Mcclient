@@ -797,10 +797,18 @@ function bindGlobalAndStageEvents(root: HTMLElement, snap: AppStateSnapshot): vo
         const { flow, snapshot } = await bridge.startPkceAuth();
         state.snapshot = snapshot;
         state.authChallenge = null;
-        showToast(flow.message, 'info');
+        // In browser preview mode where OS spawn may be sandboxed, also open the official Microsoft login tab cleanly
+        if (
+          snapshot.platformMode === 'node_preview_bridge' &&
+          flow.authorizeUrl &&
+          flow.authorizeUrl.startsWith('https://login.microsoftonline.com/')
+        ) {
+          window.open(flow.authorizeUrl, '_blank', 'noopener,noreferrer');
+        }
         renderApp();
 
-        // Automatically poll snapshot while user completes PKCE sign-in in system browser
+        let lastStep = flow.step;
+        // Poll snapshot smoothly (every 650ms) so live progress steps update and completion auto-refreshes Accounts
         const pkcePoll = setInterval(async () => {
           try {
             const nextSnap = await bridge.getSnapshot();
@@ -813,12 +821,21 @@ function bindGlobalAndStageEvents(root: HTMLElement, snap: AppStateSnapshot): vo
                 showToast(nextSnap.authFlow.message, 'error');
               }
               renderApp();
+            } else if (nextSnap.authFlow?.step !== lastStep) {
+              lastStep = nextSnap.authFlow?.step;
+              renderApp();
             }
           } catch {
             clearInterval(pkcePoll);
           }
-        }, 1200);
+        }, 650);
       } catch (err) {
+        try {
+          state.snapshot = await bridge.getSnapshot();
+        } catch {
+          // Keep existing snapshot
+        }
+        renderApp();
         showToast(err instanceof Error ? err.message : String(err), 'error');
       }
     },
