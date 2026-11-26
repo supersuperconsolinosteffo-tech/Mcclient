@@ -348,9 +348,14 @@ export function renderDiagnosticsPage(snap: AppStateSnapshot, isRunningBench: bo
       <div class="card">
         <div class="card-title">Automated Configuration & Crash Doctor</div>
         <div style="display:flex;flex-direction:column;gap:10px;margin-top:12px">
-          ${snap.diagnostics
-            .map(
-              (d) => `
+          ${
+            snap.diagnostics.length === 0
+              ? `<div style="padding:12px;background:var(--bg-canvas);border:1px dashed var(--border-strong);border-radius:6px;font-size:12px;color:var(--text-secondary)">
+                  Diagnostic findings are currently empty or temporarily unavailable. Click <strong>Verify &amp; Repair Files</strong> on Home/Play to run a fresh integrity check.
+                </div>`
+              : snap.diagnostics
+                  .map(
+                    (d) => `
             <div style="padding:10px 12px;background:var(--bg-canvas);border:1px solid var(--border-subtle);border-radius:6px">
               <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
                 <strong style="font-size:13px">${escapeHtml(d.title)}</strong>
@@ -365,8 +370,9 @@ export function renderDiagnosticsPage(snap: AppStateSnapshot, isRunningBench: bo
               }
             </div>
           `
-            )
-            .join('')}
+                  )
+                  .join('')
+          }
         </div>
       </div>
 

@@ -82,6 +82,13 @@ assert(zipList.includes('gg/vespera/client/VesperaClientMod.class'), 'Mod JAR in
 assert(zipList.includes('assets/vespera/icon.png'), 'Mod JAR includes custom Mod Menu icon');
 assert(!zipList.includes('net/fabricmc/api/ClientModInitializer.class'), 'Mod JAR excludes compile-only stub classes');
 
+// Verify C++ native launcher diagnostics contract (must assign DiagnosticFinding[] array, never object wrapper)
+const cppSource = fs.readFileSync(path.join(ROOT, 'native/src/vespera_launcher.cpp'), 'utf8');
+assert(
+  cppSource.includes('state["diagnostics"] = findings;') && !cppSource.includes('"overallHealth"'),
+  'Native C++ launcher emits DiagnosticFinding[] array contract for state["diagnostics"]'
+);
+
 // Verify SHA256SUMS.txt
 assert(fs.existsSync(sumsFile), 'SHA256SUMS.txt exists in release/');
 for (const line of fs.readFileSync(sumsFile, 'utf8').trim().split('\n')) {

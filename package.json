@@ -7,10 +7,12 @@
   "scripts": {
     "dev": "tsx scripts/dev-server.ts",
     "preview": "VESPERA_STATIC=1 tsx scripts/dev-server.ts",
+    "build:branding": "node scripts/generate-branding.mjs",
     "build:ui": "vite build",
     "build:mod": "node scripts/build-mod.mjs",
     "build:windows": "node scripts/build-windows.mjs",
     "build": "npm run build:ui && npm run build:mod && npm run build:windows",
+    "build:all": "npm run build:branding && npm run build",
     "test:unit": "vitest run",
     "test:mod": "node scripts/test-mod.mjs",
     "test:verify-artifacts": "node scripts/verify-artifacts.mjs",

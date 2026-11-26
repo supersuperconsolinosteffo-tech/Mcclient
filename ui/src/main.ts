@@ -39,6 +39,8 @@ import {
 
 interface UiSessionState {
   snapshot: AppStateSnapshot | null;
+  startupPhase: 'loading' | 'ready' | 'failed';
+  startupError: string | null;
   currentPage: PageId;
   modsSubTab: ModsSubTab;
   modSearchQuery: string;
@@ -54,6 +56,8 @@ interface UiSessionState {
 
 const state: UiSessionState = {
   snapshot: null,
+  startupPhase: 'loading',
+  startupError: null,
   currentPage: 'home',
   modsSubTab: 'discover',
   modSearchQuery: '',
@@ -161,12 +165,66 @@ function renderStageContent(snap: AppStateSnapshot): string {
   }
 }
 
+function safeRenderStageContent(snap: AppStateSnapshot): string {
+  try {
+    return renderStageContent(snap);
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    return `
+      <div class="card" style="border-color:rgba(239,68,68,0.45);max-width:720px;margin:24px auto">
+        <div class="card-title">
+          <span style="color:#fca5a5">Page Render Warning (${escapeHtml(state.currentPage)})</span>
+          <span class="badge badge-critical">Isolated Subsystem Boundary</span>
+        </div>
+        <div class="card-desc" style="margin-top:8px">
+          An unexpected error occurred while rendering the <strong>${escapeHtml(state.currentPage)}</strong> view. All other Vespera Client subsystems and navigation remain active.
+        </div>
+        <div class="console-box" style="margin-top:10px;max-height:140px">${escapeHtml(errMsg)}</div>
+        <div style="display:flex;gap:10px;margin-top:14px">
+          <button class="btn btn-primary" data-action="reload-engine-state">↻ Reload Engine State</button>
+          ${
+            state.currentPage !== 'home'
+              ? `<button class="btn" data-nav-page="home">Return to Home</button>`
+              : `<button class="btn" data-nav-page="play">Open Play &amp; Versions</button>`
+          }
+        </div>
+      </div>
+    `;
+  }
+}
+
 function renderApp(): void {
   const root = document.getElementById('app');
   if (!root) return;
 
   const snap = state.snapshot;
   if (!snap) {
+    if (state.startupPhase === 'failed') {
+      root.innerHTML = `
+        <div style="display:flex;height:100vh;align-items:center;justify-content:center;padding:24px">
+          <div class="card elevated" style="max-width:580px;width:100%;border-color:rgba(239,68,68,0.45)">
+            <div class="card-title">
+              <span style="color:#fca5a5">Vespera Client Engine Initialization Error</span>
+              <span class="badge badge-critical">Startup Halted</span>
+            </div>
+            <div class="card-desc" style="margin-top:8px">
+              The desktop UI could not establish a valid initial state snapshot from the local engine backend.
+            </div>
+            <div class="console-box" style="margin-top:12px;max-height:160px">${escapeHtml(
+              state.startupError || 'Unknown initialization error'
+            )}</div>
+            <div style="display:flex;gap:10px;margin-top:16px">
+              <button class="btn btn-primary" id="btn-retry-bootstrap">↻ Retry Engine Initialization</button>
+            </div>
+          </div>
+        </div>
+      `;
+      root.querySelector('#btn-retry-bootstrap')?.addEventListener('click', () => {
+        void bootstrap();
+      });
+      return;
+    }
+
     root.innerHTML = `<div style="display:flex;height:100vh;align-items:center;justify-content:center;font-family:var(--font-mono);color:var(--text-secondary)">Initializing Vespera Client Engine…</div>`;
     return;
   }
@@ -227,7 +285,7 @@ function renderApp(): void {
       </aside>
 
       <main class="stage" id="main-stage">
-        ${renderStageContent(snap)}
+        ${safeRenderStageContent(snap)}
       </main>
     </div>
 
@@ -277,14 +335,26 @@ function renderApp(): void {
 function bindGlobalAndStageEvents(root: HTMLElement, snap: AppStateSnapshot): void {
   const navigateTo = async (page: PageId) => {
     state.currentPage = page;
+    renderApp();
     if (page === 'mods' && !state.modSearchResults) {
       await refreshModSearch();
+      renderApp();
     }
     if (page === 'play' && !state.launchPrep) {
-      state.launchPrep = await bridge.prepareLaunch();
+      try {
+        state.launchPrep = await bridge.prepareLaunch();
+        renderApp();
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : String(err), 'error');
+      }
     }
-    renderApp();
   };
+
+  root.querySelectorAll<HTMLElement>('[data-action="reload-engine-state"]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      void bootstrap();
+    });
+  });
 
   root.querySelectorAll<HTMLElement>('[data-nav-page]').forEach((btn) => {
     btn.addEventListener('click', () => {
@@ -590,14 +660,31 @@ function bindGlobalAndStageEvents(root: HTMLElement, snap: AppStateSnapshot): vo
   });
 }
 
-async function bootstrap() {
+let activeBootstrapSeq = 0;
+
+export async function bootstrap(): Promise<void> {
+  const seq = ++activeBootstrapSeq;
+  if (!state.snapshot) {
+    state.startupPhase = 'loading';
+    state.startupError = null;
+  }
   renderApp();
+
   try {
-    state.snapshot = await bridge.getSnapshot();
+    const snap = await bridge.getSnapshot();
+    if (seq !== activeBootstrapSeq) return;
+    state.snapshot = snap;
+    state.startupPhase = 'ready';
+    state.startupError = null;
     renderApp();
   } catch (err) {
-    showToast(err instanceof Error ? err.message : String(err), 'error');
+    if (seq !== activeBootstrapSeq) return;
+    const msg = err instanceof Error ? err.message : String(err);
+    state.startupPhase = 'failed';
+    state.startupError = msg;
+    renderApp();
+    showToast(msg, 'error');
   }
 }
 
-bootstrap();
+void bootstrap();

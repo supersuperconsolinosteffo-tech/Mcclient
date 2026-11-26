@@ -79,6 +79,45 @@ public:
         if (ofs) ofs << clean << "\n";
     }
 
+    void sanitizeLoadedState(const json& defaults) {
+        if (!state.is_object()) {
+            state = defaults;
+            return;
+        }
+        // Migrate legacy object-wrapped diagnostics ({ generatedAt, overallHealth, findings }) to DiagnosticFinding[]
+        if (state.contains("diagnostics") && state["diagnostics"].is_object()) {
+            if (state["diagnostics"].contains("findings") && state["diagnostics"]["findings"].is_array()) {
+                state["diagnostics"] = state["diagnostics"]["findings"];
+            } else {
+                state["diagnostics"] = json::array();
+            }
+        } else if (!state.contains("diagnostics") || !state["diagnostics"].is_array()) {
+            state["diagnostics"] = json::array();
+        }
+
+        const char* arrayKeys[] = {
+            "profiles", "versions", "javaRuntimes", "profileBackups",
+            "installedMods", "curatedCatalog", "modHistory",
+            "shaderPacks", "resourcePacks", "hudLayouts", "accounts", "recentLogs"
+        };
+        for (const char* k : arrayKeys) {
+            if (!state.contains(k) || !state[k].is_array()) {
+                state[k] = defaults.value(k, json::array());
+            }
+        }
+        if (state["profiles"].empty()) state["profiles"] = defaults["profiles"];
+        if (state["versions"].empty()) state["versions"] = defaults["versions"];
+        if (state["hudLayouts"].empty()) state["hudLayouts"] = defaults["hudLayouts"];
+        if (state["curatedCatalog"].empty()) state["curatedCatalog"] = defaults["curatedCatalog"];
+        if (!state.contains("settings") || !state["settings"].is_object()) {
+            state["settings"] = defaults["settings"];
+        }
+        if (!state.contains("latestBenchmark") || state["latestBenchmark"].is_null()) {
+            state["latestBenchmark"] = defaults["latestBenchmark"];
+        }
+        state["platformMode"] = "windows_native_webview2";
+    }
+
     void initializeStateAndMod() {
         std::error_code ec;
         fs::create_directories(dataRoot / "logs", ec);
@@ -95,18 +134,21 @@ public:
             appendLog("[FirstLaunch] Provisioned verified vespera-client-1.0.0+mc1.21.4.jar to managed mods pool.");
         }
 
+        json defaults = json::parse(kDefaultSnapshotJson);
         if (fs::exists(statePath)) {
             try {
                 state = json::parse(read_text_file(statePath));
-                appendLog("[Core] Loaded Vespera Client Windows configuration.");
+                sanitizeLoadedState(defaults);
+                saveState();
+                appendLog("[Core] Loaded and verified Vespera Client Windows configuration.");
                 return;
             } catch (...) {
                 appendLog("[CrashRecovery] State file corrupted; restoring verified factory configuration.");
             }
         }
 
-        state = json::parse(kDefaultSnapshotJson);
-        state["platformMode"] = "windows_native_webview2";
+        state = defaults;
+        sanitizeLoadedState(defaults);
         state["settings"]["gameDataDir"] = wide_to_utf8((dataRoot / "minecraft").wstring());
         state["settings"]["instancesDir"] = wide_to_utf8(instancesDir.wstring());
         saveState();
@@ -302,7 +344,7 @@ public:
             sp["active"] = (!prof["activeShaderPackId"].is_null() && sp["id"] == prof["activeShaderPackId"]);
         }
 
-        // Compute live Windows Configuration Doctor diagnostics
+        // Compute live Windows Configuration Doctor diagnostics (DiagnosticFinding[] array contract)
         json findings = json::array();
         int allocMb = prof["performance"].value("allocatedRamMb", 4096);
         int recMb = computeRecommendedRamMb(totalMb);
@@ -313,20 +355,17 @@ public:
                 {"category", "memory"},
                 {"title", "Allocated JVM Heap Leaves Low OS Headroom"},
                 {"explanation", "Allocating " + std::to_string(allocMb) + " MB on a " + std::to_string(totalMb) + " MB Windows system can starve GPU driver shader caches."},
-                {"recommendation", "Click Auto-Fix to apply hardware-optimal " + std::to_string(recMb) + " MB heap."},
-                {"autoFixable", true},
+                {"recommendation", "Click Apply Automatic Fix to set hardware-optimal " + std::to_string(recMb) + " MB heap."},
                 {"autoFixActionId", "fix_ram_allocation"}
             });
         } else {
             findings.push_back({
                 {"id", "diag-ram-ok"},
-                {"severity", "info"},
+                {"severity", "healthy"},
                 {"category", "memory"},
                 {"title", "JVM Heap & Collector Balanced for Host Hardware"},
                 {"explanation", "Allocated " + std::to_string(allocMb) + " MB out of " + std::to_string(totalMb) + " MB physical RAM (" + prof["performance"].value("gcMode", "adaptive_g1gc") + ")."},
-                {"recommendation", "No memory tuning changes needed."},
-                {"autoFixable", false},
-                {"autoFixActionId", nullptr}
+                {"recommendation", "No memory tuning changes needed."}
             });
         }
         if (!java21Installed) {
@@ -336,17 +375,19 @@ public:
                 {"category", "java_runtime"},
                 {"title", "Adoptium Temurin Java 21 LTS Ready for Auto-Provisioning"},
                 {"explanation", "Vespera will automatically download and SHA-256 verify Eclipse Temurin OpenJDK 21 LTS on first launch."},
-                {"recommendation", "Zero manual Java installation required."},
-                {"autoFixable", false},
-                {"autoFixActionId", nullptr}
+                {"recommendation", "Zero manual Java installation required."}
+            });
+        } else {
+            findings.push_back({
+                {"id", "diag-java-ready"},
+                {"severity", "healthy"},
+                {"category", "java_runtime"},
+                {"title", "Adoptium Temurin Java 21 LTS Installed & Verified"},
+                {"explanation", "Managed 64-bit Windows Java 21 runtime is present and verified in %APPDATA%\\VesperaClient\\runtimes."},
+                {"recommendation", "Ready for immediate launch."}
             });
         }
-        state["diagnostics"] = {
-            {"generatedAt", iso_timestamp_now()},
-            {"overallHealth", findings[0]["severity"] == "warning" ? "attention_needed" : "healthy"},
-            {"findings", findings},
-            {"analyzedLogLines", static_cast<int>(logs.size())}
-        };
+        state["diagnostics"] = findings;
     }
 
     void createBackupSnapshot(const std::string& profileId, const std::string& reason) {
@@ -697,11 +738,21 @@ public:
         }
         if (method == "createProfile") {
             json copy = activeProfileRef();
+            std::string targetVer = params.value("mcVersion", "1.21.4");
             copy["id"] = "profile-" + std::to_string(std::time(nullptr));
             copy["name"] = params.value("name", "Custom Profile");
             copy["archetype"] = params.value("archetype", "custom");
-            copy["mcVersion"] = params.value("mcVersion", "1.21.4");
-            copy["loader"] = (copy["mcVersion"] == "1.8.9") ? "legacy_fabric" : "fabric";
+            copy["description"] = params.value("description", "Isolated Vespera profile targeting Minecraft " + targetVer + ".");
+            copy["mcVersion"] = targetVer;
+            copy["loader"] = (targetVer == "1.8.9") ? "legacy_fabric" : "fabric";
+            copy["loaderVersion"] = (targetVer == "1.8.9") ? "0.15.11" : "0.16.10";
+            copy["createdAt"] = iso_timestamp_now();
+            copy["updatedAt"] = iso_timestamp_now();
+            if (targetVer == "1.8.9") {
+                copy["enabledModIds"] = json::array();
+                copy["activeShaderPackId"] = nullptr;
+                copy["performance"]["gcMode"] = "adaptive_g1gc";
+            }
             state["profiles"].push_back(copy);
             state["activeProfileId"] = copy["id"];
             saveState();
@@ -820,6 +871,11 @@ public:
         if (method == "selectShaderPack") {
             auto& prof = activeProfileRef();
             prof["activeShaderPackId"] = params["shaderId"];
+            if (!params["shaderId"].is_null() && prof.value("mcVersion", "1.21.4") != "1.8.9") {
+                bool hasIris = false;
+                for (const auto& eid : prof["enabledModIds"]) if (eid == "iris") hasIris = true;
+                if (!hasIris) prof["enabledModIds"].push_back("iris");
+            }
             for (auto& sp : state["shaderPacks"]) {
                 sp["active"] = (!params["shaderId"].is_null() && sp["id"] == params["shaderId"]);
                 if (sp["active"] && params.contains("quality") && !params["quality"].is_null()) {
@@ -834,14 +890,14 @@ public:
             auto& prof = activeProfileRef();
             std::string packId = params.value("packId", "");
             bool en = params.value("enabled", false);
-            auto& arr = prof["enabledResourcePackIds"];
-            if (en) {
-                arr.push_back(packId);
-            } else {
-                json filtered = json::array();
-                for (const auto& x : arr) if (x != packId) filtered.push_back(x);
-                arr = filtered;
+            json filtered = json::array();
+            for (const auto& x : prof["enabledResourcePackIds"]) {
+                if (x != packId) filtered.push_back(x);
             }
+            if (en && !packId.empty()) {
+                filtered.push_back(packId);
+            }
+            prof["enabledResourcePackIds"] = filtered;
             saveState();
             refreshTelemetry();
             return state;
@@ -950,14 +1006,14 @@ public:
                             {"name", hit.value("title", slug)},
                             {"author", hit.value("author", "Modrinth Creator")},
                             {"summary", hit.value("description", "")},
-                            {"category", "utility_qol"},
+                            {"category", "utility"},
                             {"downloads", hit.value("downloads", 0)},
                             {"license", hit.value("license", "Open Source")},
                             {"supportedMcVersions", json::array({mcVer})},
                             {"loader", "fabric"},
                             {"requiredDependencies", json::array()},
                             {"incompatibleWith", json::array()},
-                            {"source", "modrinth_live"},
+                            {"source", "modrinth_api"},
                             {"installed", installed},
                             {"enabled", enabled},
                             {"compatibility", {
@@ -1064,12 +1120,12 @@ public:
                     {"name", vArr[0].value("name", modId)},
                     {"version", vArr[0].value("version_number", "1.0.0")},
                     {"author", "Modrinth Verified"},
-                    {"category", "utility_qol"},
+                    {"category", "utility"},
                     {"mcVersion", mcVer},
                     {"loader", "fabric"},
                     {"fileName", fn},
                     {"enabled", true},
-                    {"source", "modrinth_live"},
+                    {"source", "modrinth_api"},
                     {"sha256", actualSha},
                     {"sizeBytes", static_cast<size_t>(fs::file_size(destJar))},
                     {"installedAt", iso_timestamp_now()},
@@ -1079,6 +1135,16 @@ public:
                 });
                 prof["enabledModIds"].push_back(modId);
             }
+
+            state["modHistory"].insert(state["modHistory"].begin(), {
+                {"id", "hist-" + std::to_string(std::time(nullptr))},
+                {"timestamp", iso_timestamp_now()},
+                {"profileId", prof["id"]},
+                {"action", "install"},
+                {"modName", modId},
+                {"version", mcVer},
+                {"details", "Installed and verified " + modId + " into managed mods pool."}
+            });
 
             materializeInstance(prof);
             saveState();
@@ -1210,6 +1276,10 @@ public:
             return state;
         }
         if (method == "runBenchmarks") {
+            if (!state.contains("latestBenchmark") || state["latestBenchmark"].is_null()) {
+                state["latestBenchmark"] = json::parse(kDefaultSnapshotJson)["latestBenchmark"];
+                saveState();
+            }
             refreshTelemetry();
             return {{"report", state["latestBenchmark"]}, {"snapshot", state}};
         }

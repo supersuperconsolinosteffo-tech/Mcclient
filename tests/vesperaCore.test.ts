@@ -216,20 +216,22 @@ describe('State Coordinator, Mod Compatibility Gatekeeper, Profiles & Launch Pip
   it('handles pre-parsed JS object responses from Windows WebView2 native bindings without JSON.parse coercion errors', async () => {
     const { bridge } = await import('../ui/src/bridge');
     const prevWin = (globalThis as Record<string, unknown>).window;
+    let capturedMethod = '';
     try {
       // Simulate webview/webview's Webview_.prototype.onReply which already calls JSON.parse(result)
       (globalThis as Record<string, unknown>).window = {
         vesperaNativeInvoke: async (reqJson: string) => {
           const req = JSON.parse(reqJson) as { method: string };
-          return { ok: true, data: { version: '1.0.0', echoedMethod: req.method } };
+          capturedMethod = req.method;
+          return { ok: true, data: { version: '1.0.0', platformMode: 'windows_native_webview2' } };
         },
       };
-      const snap = (await bridge.getSnapshot()) as unknown as {
-        version: string;
-        echoedMethod: string;
-      };
+      const snap = await bridge.getSnapshot();
       expect(snap.version).toBe('1.0.0');
-      expect(snap.echoedMethod).toBe('getSnapshot');
+      expect(capturedMethod).toBe('getSnapshot');
+      expect(snap.platformMode).toBe('windows_native_webview2');
+      expect(Array.isArray(snap.diagnostics)).toBe(true);
+      expect(snap.profiles.length).toBeGreaterThan(0);
     } finally {
       if (prevWin === undefined) {
         delete (globalThis as Record<string, unknown>).window;

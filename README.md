@@ -23,8 +23,8 @@ All release binaries are compiled natively as 64-bit Windows (`PE32+ AMD64`, `IM
 
 | Deliverable | Path | Size | Description |
 | :--- | :--- | ---: | :--- |
-| **Windows Setup Installer** | `release/VesperaClient-1.0.0-win64-setup.exe` | `1,637.0 KB` | Self-contained GUI + silent (`/S`) Setup Wizard with SHA-256 payload verification, Start Menu/Desktop shortcuts, and Windows Add/Remove Programs registration |
-| **Native Desktop Launcher** | `release/bin/VesperaClient.exe` | `1,099.0 KB` | Lightweight C++17 + Microsoft Edge WebView2 native GUI launcher (~1.1 MB binary; <45 MB active RAM; auto-idles when Minecraft runs) |
+| **Windows Setup Installer** | `release/VesperaClient-1.0.0-win64-setup.exe` | `1,753.5 KB` | Self-contained GUI + silent (`/S`) Setup Wizard with SHA-256 payload verification, Start Menu/Desktop shortcuts, and Windows Add/Remove Programs registration |
+| **Native Desktop Launcher** | `release/bin/VesperaClient.exe` | `1,215.5 KB` | Lightweight C++17 + Microsoft Edge WebView2 native GUI launcher (~1.2 MB binary; <45 MB active RAM; auto-idles when Minecraft runs) |
 | **Native Windows Uninstaller** | `release/bin/VesperaUninstall.exe` | `223.0 KB` | Clean GUI + silent (`/S`) uninstaller with optional preservation of `%APPDATA%\VesperaClient` worlds, screenshots, and profiles |
 | **Custom Fabric Client Mod** | `release/mods/vespera-client-1.0.0+mc1.21.4.jar` | `57.5 KB` | Compiled Kotlin 2.4 / JVM 21 client-side Fabric mod (`1.21.4`) with HUD engine, HUD Studio, Zoom, Toggle Sprint, QoL helpers, and IPC sync |
 | **Windows Application Icon** | `release/vespera.ico` | `18.3 KB` | Custom 7-layer 32-bit RGBA `.ico` (`16`, `24`, `32`, `48`, `64`, `128`, `256` px) |
