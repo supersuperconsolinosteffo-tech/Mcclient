@@ -56,7 +56,7 @@ async function start() {
 
       if (urlObj.pathname === '/api/health') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, service: 'vespera-client', version: '1.2.1' }));
+        res.end(JSON.stringify({ ok: true, service: 'vespera-client', version: '1.2.2' }));
         return;
       }
 

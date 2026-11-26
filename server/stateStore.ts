@@ -87,7 +87,7 @@ export class VesperaStateCoordinator {
 
     const v120ModJar = path.resolve(
       process.cwd(),
-      'release/mods/vespera-client-1.2.1+mc1.21.4.jar'
+      'release/mods/vespera-client-1.2.2+mc1.21.4.jar'
     );
     const v111ModJar = path.resolve(
       process.cwd(),
@@ -208,9 +208,9 @@ export class VesperaStateCoordinator {
           const migrated = this.migratePersistedState(raw);
           if (raw.schemaVersion !== 2) {
             this.saveState(migrated);
-            this.appendLog('[Migration] Seamlessly upgraded v1.0.0 user profiles to v1.2.1 schema.');
+            this.appendLog('[Migration] Seamlessly upgraded v1.0.0 user profiles to v1.2.2 schema.');
           } else {
-            this.appendLog('[Core] Loaded persisted Vespera Client v1.2.1 configuration.');
+            this.appendLog('[Core] Loaded persisted Vespera Client v1.2.2 configuration.');
           }
           return migrated;
         }
@@ -239,7 +239,7 @@ export class VesperaStateCoordinator {
           profileId: profiles[0].id,
           action: 'install',
           modName: 'Vespera Optimization Bundle',
-          version: '1.2.1+mc1.21.4',
+          version: '1.2.2+mc1.21.4',
           details:
             'Initialized curated Sodium + Lithium + FerriteCore + ImmediatelyFast + Iris + Vespera Core stack.',
         },
@@ -262,7 +262,7 @@ export class VesperaStateCoordinator {
     };
 
     this.saveState(fresh);
-    this.appendLog(`[Core] Initialized Vespera Client v1.2.1 (Recommended Heap: ${recRam} MB).`);
+    this.appendLog(`[Core] Initialized Vespera Client v1.2.2 (Recommended Heap: ${recRam} MB).`);
     return fresh;
   }
 
@@ -1147,7 +1147,7 @@ export class VesperaStateCoordinator {
     }));
 
     return {
-      version: '1.2.1',
+      version: '1.2.2',
       platformMode: 'node_preview_bridge',
       oauthConfig: this.authService.getOAuthConfigState(),
       authFlow: this.authService.getAuthFlowState(),

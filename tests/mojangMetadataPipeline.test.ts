@@ -2,8 +2,9 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { afterEach, describe, expect, it } from 'vitest';
-import { MinecraftLauncherService } from '../server/minecraftLauncherService';
+import { MinecraftLauncherService, mavenCoordToRelPath, parseMavenCoordinate } from '../server/minecraftLauncherService';
 
 const tempDirs: string[] = [];
 function tempDir(): string {
@@ -11,6 +12,45 @@ function tempDir(): string {
   tempDirs.push(dir);
   return dir;
 }
+
+function zip(entries: Array<{ name: string; bytes: Buffer }>): Buffer {
+  const local: Buffer[] = [];
+  const central: Buffer[] = [];
+  let offset = 0;
+  for (const entry of entries) {
+    const name = Buffer.from(entry.name);
+    const compressed = zlib.deflateRawSync(entry.bytes);
+    const header = Buffer.alloc(30);
+    header.writeUInt32LE(0x04034b50, 0);
+    header.writeUInt16LE(20, 4);
+    header.writeUInt16LE(8, 8);
+    header.writeUInt32LE(compressed.length, 18);
+    header.writeUInt32LE(entry.bytes.length, 22);
+    header.writeUInt16LE(name.length, 26);
+    const record = Buffer.concat([header, name, compressed]);
+    local.push(record);
+    const centralHeader = Buffer.alloc(46);
+    centralHeader.writeUInt32LE(0x02014b50, 0);
+    centralHeader.writeUInt16LE(20, 4);
+    centralHeader.writeUInt16LE(20, 6);
+    centralHeader.writeUInt16LE(8, 10);
+    centralHeader.writeUInt32LE(compressed.length, 20);
+    centralHeader.writeUInt32LE(entry.bytes.length, 24);
+    centralHeader.writeUInt16LE(name.length, 28);
+    centralHeader.writeUInt32LE(offset, 42);
+    central.push(Buffer.concat([centralHeader, name]));
+    offset += record.length;
+  }
+  const centralBytes = Buffer.concat(central);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(entries.length, 8);
+  eocd.writeUInt16LE(entries.length, 10);
+  eocd.writeUInt32LE(centralBytes.length, 12);
+  eocd.writeUInt32LE(offset, 16);
+  return Buffer.concat([...local, centralBytes, eocd]);
+}
+
 afterEach(() => {
   while (tempDirs.length) fs.rmSync(tempDirs.pop()!, { recursive: true, force: true });
 });

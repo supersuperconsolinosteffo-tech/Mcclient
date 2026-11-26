@@ -13,12 +13,12 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "Vespera Labs"
       VALUE "FileDescription", "Vespera Client — High-Performance Minecraft Java Edition Client"
-      VALUE "FileVersion", "1.2.1.0"
+      VALUE "FileVersion", "1.2.2.0"
       VALUE "InternalName", "VesperaClient"
       VALUE "LegalCopyright", "Copyright (c) 2026 Vespera Labs. MIT License."
       VALUE "OriginalFilename", "VesperaClient.exe"
       VALUE "ProductName", "Vespera Client"
-      VALUE "ProductVersion", "1.2.1"
+      VALUE "ProductVersion", "1.2.2"
     END
   END
   BLOCK "VarFileInfo"

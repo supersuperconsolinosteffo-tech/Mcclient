@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <map>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -66,20 +67,108 @@ std::string query_param_from_target(const std::string& reqTarget, const std::str
     return "";
 }
 
-std::string maven_coord_to_rel_path(const std::string& coord) {
+struct ParsedMavenCoordinate {
+    std::string group;
+    std::string artifact;
+    std::string version;
+    std::string classifier;
+    std::string extension = "jar";
+    std::string relativePath;
+};
+
+bool parse_maven_coordinate(const std::string& raw, ParsedMavenCoordinate& out) {
+    const auto at = raw.find('@');
+    if (at != std::string::npos && raw.find('@', at + 1) != std::string::npos) return false;
+    const std::string base = at == std::string::npos ? raw : raw.substr(0, at);
+    if (at != std::string::npos) out.extension = raw.substr(at + 1);
     std::vector<std::string> parts;
-    std::istringstream iss(coord);
-    std::string tok;
-    while (std::getline(iss, tok, ':')) parts.push_back(tok);
-    if (parts.size() < 3) return coord;
-    std::string groupPath = parts[0];
+    std::istringstream stream(base);
+    std::string token;
+    while (std::getline(stream, token, ':')) parts.push_back(token);
+    if ((parts.size() != 3 && parts.size() != 4) || out.extension.empty()) return false;
+    auto validToken = [](const std::string& value) {
+        return !value.empty() && std::all_of(value.begin(), value.end(), [](unsigned char c) {
+            return std::isalnum(c) || c == '_' || c == '.' || c == '+' || c == '-' || c == '~';
+        });
+    };
+    out.group = parts[0]; out.artifact = parts[1]; out.version = parts[2];
+    if (parts.size() == 4) out.classifier = parts[3];
+    if (!validToken(out.artifact) || !validToken(out.version) ||
+        (!out.classifier.empty() && !validToken(out.classifier)) ||
+        !std::all_of(out.extension.begin(), out.extension.end(), [](unsigned char c) { return std::isalnum(c); })) return false;
+    std::istringstream groups(out.group);
+    while (std::getline(groups, token, '.')) {
+        if (token.empty() || !std::all_of(token.begin(), token.end(), [](unsigned char c) { return std::isalnum(c) || c == '_' || c == '-'; })) return false;
+    }
+    if (out.group.empty() || out.group.front() == '.' || out.group.back() == '.') return false;
+    std::string groupPath = out.group;
     std::replace(groupPath.begin(), groupPath.end(), '.', '/');
-    std::string artifact = parts[1];
-    std::string version = parts[2];
-    std::string fileName = (parts.size() >= 4 && !parts[3].empty())
-        ? (artifact + "-" + version + "-" + parts[3] + ".jar")
-        : (artifact + "-" + version + ".jar");
-    return groupPath + "/" + artifact + "/" + version + "/" + fileName;
+    const std::string filename = out.artifact + "-" + out.version +
+        (out.classifier.empty() ? "" : "-" + out.classifier) + "." + out.extension;
+    out.relativePath = groupPath + "/" + out.artifact + "/" + out.version + "/" + filename;
+    return true;
+}
+
+std::string maven_coord_to_rel_path(const std::string& coord) {
+    ParsedMavenCoordinate parsed;
+    if (!parse_maven_coordinate(coord, parsed)) throw std::runtime_error("Invalid Maven coordinate: " + coord);
+    return parsed.relativePath;
+}
+
+bool safe_maven_relative_path(const std::string& value) {
+    if (value.empty() || value.front() == '/' || value.front() == '\\' || value.find(':') != std::string::npos) return false;
+    std::string normalized = value;
+    std::replace(normalized.begin(), normalized.end(), '\\', '/');
+    std::istringstream stream(normalized);
+    std::string part;
+    while (std::getline(stream, part, '/')) if (part.empty() || part == "." || part == "..") return false;
+    return true;
+}
+
+bool is_valid_jar_archive(const fs::path& file, const std::string& requiredEntry = "") {
+    std::ifstream input(file, std::ios::binary);
+    if (!input) return false;
+    std::vector<unsigned char> data((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    if (data.size() < 22) return false;
+    const size_t minOffset = data.size() > 65557 ? data.size() - 65557 : 0;
+    size_t eocd = std::string::npos;
+    for (size_t i = data.size() - 22;; --i) {
+        if (data[i] == 0x50 && i + 4 <= data.size() && data[i + 1] == 0x4b && data[i + 2] == 0x05 && data[i + 3] == 0x06) { eocd = i; break; }
+        if (i == minOffset) break;
+    }
+    if (eocd == std::string::npos) return false;
+    auto u16 = [&](size_t at) -> uint16_t { return static_cast<uint16_t>(data[at] | (data[at + 1] << 8)); };
+    auto u32 = [&](size_t at) -> uint32_t { return static_cast<uint32_t>(data[at]) | (static_cast<uint32_t>(data[at + 1]) << 8) | (static_cast<uint32_t>(data[at + 2]) << 16) | (static_cast<uint32_t>(data[at + 3]) << 24); };
+    const uint16_t entries = u16(eocd + 10);
+    const uint32_t centralSize = u32(eocd + 12), centralOffset = u32(eocd + 16);
+    if (entries == 0 || static_cast<uint64_t>(centralOffset) + centralSize > eocd) return false;
+    size_t cursor = centralOffset;
+    bool found = requiredEntry.empty();
+    for (uint16_t n = 0; n < entries; ++n) {
+        if (cursor + 46 > eocd || u32(cursor) != 0x02014b50) return false;
+        const uint16_t nameLen = u16(cursor + 28), extraLen = u16(cursor + 30), commentLen = u16(cursor + 32);
+        const size_t end = cursor + 46ULL + nameLen + extraLen + commentLen;
+        if (end > eocd) return false;
+        if (!requiredEntry.empty() && std::string(data.begin() + cursor + 46, data.begin() + cursor + 46 + nameLen) == requiredEntry) found = true;
+        cursor = end;
+    }
+    return found && cursor <= static_cast<uint64_t>(centralOffset) + centralSize;
+}
+
+bool validate_fabric_profile(const json& profile) {
+    if (!profile.is_object() || !profile.contains("mainClass") || !profile["mainClass"].is_string() ||
+        profile["mainClass"].get<std::string>().empty() || !profile.contains("libraries") || !profile["libraries"].is_array()) return false;
+    for (const auto& library : profile["libraries"]) {
+        if (!library.is_object() || !library.contains("name") || !library["name"].is_string() ||
+            !library.contains("url") || !library["url"].is_string()) return false;
+        ParsedMavenCoordinate coordinate;
+        if (!parse_maven_coordinate(library["name"].get<std::string>(), coordinate) ||
+            library["url"].get<std::string>().rfind("https://", 0) != 0) return false;
+        if (library.contains("sha1") && !library["sha1"].is_null() && !library["sha1"].is_string()) return false;
+        const std::string sha1 = library.contains("sha1") && library["sha1"].is_string() ? library["sha1"].get<std::string>() : "";
+        if (!sha1.empty() && (sha1.size() != 40 || !std::all_of(sha1.begin(), sha1.end(), [](unsigned char c) { return std::isxdigit(c) != 0; }))) return false;
+    }
+    return true;
 }
 
 bool evaluate_mojang_windows_rules(const json& lib) {
@@ -328,7 +417,7 @@ public:
         if (state["profiles"].empty()) state["profiles"] = defaults["profiles"];
         if (state["versions"].empty()) state["versions"] = defaults["versions"];
         if (state["hudLayouts"].empty()) state["hudLayouts"] = defaults["hudLayouts"];
-        // Always refresh curatedCatalog to v1.2.1 definitions
+        // Always refresh curatedCatalog to v1.2.2 definitions
         state["curatedCatalog"] = defaults["curatedCatalog"];
         if (!state.contains("settings") || !state["settings"].is_object()) {
             state["settings"] = defaults["settings"];
@@ -347,7 +436,7 @@ public:
             bool vesperaOk = (p["loader"] == "fabric" && p.value("mcVersion", "") == "1.21.4");
             p["vesperaModCompatible"] = vesperaOk;
         }
-        state["version"] = "1.2.1";
+        state["version"] = "1.2.2";
         state["platformMode"] = "windows_native_webview2";
     }
 
@@ -360,10 +449,10 @@ public:
         }
         write_text_atomic(crashLockPath, "{\"active\":true}");
 
-        fs::path targetMod = modsPoolDir / "vespera-client-1.2.1+mc1.21.4.jar";
+        fs::path targetMod = modsPoolDir / "vespera-client-1.2.2+mc1.21.4.jar";
         if (!fs::exists(targetMod)) {
             write_file_atomic(targetMod, kEmbeddedModJarData, kEmbeddedModJarSize);
-            appendLog("[FirstLaunch] Provisioned verified vespera-client-1.2.1+mc1.21.4.jar to managed mods pool.");
+            appendLog("[FirstLaunch] Provisioned verified vespera-client-1.2.2+mc1.21.4.jar to managed mods pool.");
         }
 
         json defaults = json::parse(kDefaultSnapshotJson);
@@ -372,7 +461,7 @@ public:
                 state = json::parse(read_text_file(statePath));
                 sanitizeLoadedState(defaults);
                 saveState();
-                appendLog("[Core] Loaded and verified Vespera Client v1.2.1 Windows configuration.");
+                appendLog("[Core] Loaded and verified Vespera Client v1.2.2 Windows configuration.");
                 return;
             } catch (...) {
                 appendLog("[CrashRecovery] State file corrupted; restoring verified factory configuration.");
@@ -644,7 +733,25 @@ public:
                     }
                 }
                 if (complete && record.contains("verifiedAssets") && record["verifiedAssets"].is_array() &&
-                    record.contains("verifiedLibraryFiles") && record["verifiedLibraryFiles"].is_array()) return "ready";
+                    record.contains("verifiedLibraryFiles") && record["verifiedLibraryFiles"].is_array()) {
+                    for (const auto& rel : record["verifiedLibraryFiles"]) {
+                        if (!rel.is_string()) { complete = false; break; }
+                        fs::path libraryPath = getGameRootDir() / fs::u8path(rel.get<std::string>());
+                        if (!fs::exists(libraryPath, ec) || fs::file_size(libraryPath, ec) == 0 || !is_valid_jar_archive(libraryPath)) {
+                            complete = false; break;
+                        }
+                    }
+                    if (complete && record.contains("verifiedLibraryIntegrity") && record["verifiedLibraryIntegrity"].is_array()) {
+                        for (const auto& artifact : record["verifiedLibraryIntegrity"]) {
+                            if (!artifact.is_object()) { complete = false; break; }
+                            const std::string rel = artifact.value("path", "");
+                            const std::string requiredEntry = artifact.value("requiredEntry", "");
+                            fs::path libraryPath = getGameRootDir() / fs::u8path(rel);
+                            if (rel.empty() || !is_valid_jar_archive(libraryPath, requiredEntry)) { complete = false; break; }
+                        }
+                    }
+                    if (complete) return "ready";
+                }
             }
         }
         if (fs::exists(partJar, ec) || fs::exists(jar, ec)) return "partially_downloaded";
@@ -867,7 +974,7 @@ public:
             publicAccs.push_back(acc);
             if (acc.value("active", false)) activeAccId = acc.value("id", "");
         }
-        state["version"] = "1.2.1";
+        state["version"] = "1.2.2";
         state["accounts"] = publicAccs;
         state["activeAccountId"] = activeAccId.empty() ? json(nullptr) : json(activeAccId);
         state["oauthConfig"] = {
@@ -1027,8 +1134,8 @@ public:
             }
 
             // Provision custom 1.21.4 mod ONLY on Fabric 1.21.4 when enabled
-            fs::path srcMod = modsPoolDir / "vespera-client-1.2.1+mc1.21.4.jar";
-            fs::path dstMod = instDir / "mods" / "vespera-client-1.2.1+mc1.21.4.jar";
+            fs::path srcMod = modsPoolDir / "vespera-client-1.2.2+mc1.21.4.jar";
+            fs::path dstMod = instDir / "mods" / "vespera-client-1.2.2+mc1.21.4.jar";
             if (mcVer == "1.21.4" && enabledSet.count("vespera-client") > 0 && fs::exists(srcMod)) {
                 if (!fs::exists(dstMod)) {
                     fs::copy_file(srcMod, dstMod, fs::copy_options::overwrite_existing, ec);
@@ -1208,6 +1315,10 @@ public:
             fs::path dest;
             std::string sha1;
             size_t size;
+            std::string source = "Mojang";
+            std::string coordinate;
+            bool validateJar = false;
+            std::string requiredJarEntry;
         };
         std::vector<ItemPlan> plan;
         json verifiedLibs = json::array();
@@ -1220,35 +1331,78 @@ public:
         std::string clientUrl = meta["downloads"]["client"].value("url", "");
         std::string clientSha1 = meta["downloads"]["client"].value("sha1", "");
         size_t clientSz = meta["downloads"]["client"].value("size", 24000000ULL);
-        plan.push_back({"client_jar", clientUrl, vDir / (verId + ".jar"), clientSha1, clientSz});
+        plan.push_back({"client_jar", clientUrl, vDir / (verId + ".jar"), clientSha1, clientSz,
+                        "Mojang", verId + " client.jar", true, ""});
 
         if (meta.contains("libraries") && meta["libraries"].is_array()) {
             for (const auto& lib : meta["libraries"]) {
                 if (!evaluate_mojang_windows_rules(lib)) continue;
-                std::string name = lib.value("name", "");
-                if (lib.contains("downloads") && lib["downloads"].contains("artifact")) {
-                    const auto& art = lib["downloads"]["artifact"];
-                    std::string rel = art.value("path", maven_coord_to_rel_path(name));
-                    bool isNat = (name.find(":natives-windows") != std::string::npos);
-                    fs::path d = libRoot / fs::u8path(rel);
-                    plan.push_back({isNat ? "native_jar" : "library", art.value("url", ""), d, art.value("sha1", ""), art.value("size", 64000ULL)});
-                    verifiedLibraryFiles.push_back(d.lexically_relative(gameRoot).generic_string());
-                    if (isNat) nativeJars.push_back(d);
-                    else verifiedLibs.push_back(rel);
+                const std::string name = lib.value("name", "");
+                ParsedMavenCoordinate parsed;
+                if (name.empty() || !parse_maven_coordinate(name, parsed)) {
+                    std::string err = "Invalid Mojang library metadata for Minecraft " + verId + ": malformed Maven coordinate '" + name + "'.";
+                    updateDlState("failed", err, 0, err); throw std::runtime_error(err);
                 }
-                if (lib.contains("natives") && lib["natives"].contains("windows") &&
-                    lib.contains("downloads") && lib["downloads"].contains("classifiers")) {
+                auto addMojangArtifact = [&](const std::string& coordinate, const std::string& rel, const std::string& url,
+                                             const std::string& sha1, size_t size, bool isNative) {
+                    if (!safe_maven_relative_path(rel) || url.rfind("https://", 0) != 0 || (!sha1.empty() && !isSha1Hex(sha1))) {
+                        std::string err = "Invalid Mojang library metadata for Minecraft " + verId + ": coordinate " + coordinate +
+                            " requires a safe artifact path, HTTPS URL, and optional valid 40-digit SHA-1.";
+                        updateDlState("failed", err, 0, err); throw std::runtime_error(err);
+                    }
+                    fs::path destination = libRoot / fs::u8path(rel);
+                    plan.push_back({isNative ? "native_jar" : "library", url, destination, sha1, size,
+                                    "Mojang", coordinate, true, ""});
+                    verifiedLibraryFiles.push_back(destination.lexically_relative(gameRoot).generic_string());
+                    if (isNative) nativeJars.push_back(destination);
+                    else verifiedLibs.push_back(rel);
+                    appendLog("[LibraryResolver] Mojang coordinate=" + coordinate + " url=" + url +
+                              " upstreamSha1=" + (sha1.empty() ? "not-published" : sha1) + " destination=" + destination.string());
+                };
+
+                if (lib.contains("downloads") && lib["downloads"].is_object() && lib["downloads"].contains("artifact")) {
+                    const auto& artifact = lib["downloads"]["artifact"];
+                    const std::string rel = artifact.value("path", parsed.relativePath);
+                    std::string artifactUrl = artifact.value("url", "");
+                    if (artifactUrl.empty() && lib.contains("url") && lib["url"].is_string()) {
+                        std::string repo = lib.value("url", "");
+                        if (!repo.empty() && repo.rfind("https://", 0) == 0) {
+                            if (repo.back() != '/') repo.push_back('/');
+                            std::string encodedRel = rel;
+                            std::replace(encodedRel.begin(), encodedRel.end(), '\\', '/');
+                            artifactUrl = repo + encodedRel;
+                        }
+                    }
+                    const bool isNative = !parsed.classifier.empty() && parsed.classifier.find("natives-windows") != std::string::npos;
+                    addMojangArtifact(name, rel, artifactUrl, artifact.value("sha1", ""),
+                                      artifact.value("size", 64000ULL), isNative);
+                } else if (lib.value("downloads", json::object()).value("artifact", json::object()).empty() &&
+                           !lib.contains("natives") && lib.contains("url")) {
+                    // Legacy official schema: Maven coordinate plus repository base, with no artifact record.
+                    std::string repo = lib.value("url", "");
+                    if (repo.empty() || repo.rfind("https://", 0) != 0) {
+                        std::string err = "Invalid Mojang legacy library metadata for Minecraft " + verId + ": " + name + " has no HTTPS repository URL.";
+                        updateDlState("failed", err, 0, err); throw std::runtime_error(err);
+                    }
+                    if (!repo.empty() && repo.back() != '/') repo.push_back('/');
+                    addMojangArtifact(name, parsed.relativePath, repo + parsed.relativePath, "", 64000ULL, false);
+                }
+
+                if (lib.contains("natives") && lib["natives"].is_object() && lib["natives"].contains("windows")) {
                     std::string key = lib["natives"].value("windows", "");
                     auto pos = key.find("${arch}");
                     if (pos != std::string::npos) key.replace(pos, 7, "64");
-                    if (lib["downloads"]["classifiers"].contains(key)) {
-                        const auto& nat = lib["downloads"]["classifiers"][key];
-                        std::string rel = nat.value("path", maven_coord_to_rel_path(name + ":" + key));
-                        fs::path d = libRoot / fs::u8path(rel);
-                        plan.push_back({"native_jar", nat.value("url", ""), d, nat.value("sha1", ""), nat.value("size", 128000ULL)});
-                        verifiedLibraryFiles.push_back(d.lexically_relative(gameRoot).generic_string());
-                        nativeJars.push_back(d);
+                    if (!lib.contains("downloads") || !lib["downloads"].contains("classifiers") ||
+                        !lib["downloads"]["classifiers"].is_object() || !lib["downloads"]["classifiers"].contains(key)) {
+                        std::string err = "Missing Mojang Windows native classifier for library " + name + " (" + key + ").";
+                        updateDlState("failed", err, 0, err); throw std::runtime_error(err);
                     }
+                    const auto& nativeArtifact = lib["downloads"]["classifiers"][key];
+                    const std::string coordinate = name + ":" + key;
+                    ParsedMavenCoordinate nativeCoord;
+                    const std::string rel = nativeArtifact.value("path", parse_maven_coordinate(coordinate, nativeCoord) ? nativeCoord.relativePath : "");
+                    addMojangArtifact(coordinate, rel, nativeArtifact.value("url", ""), nativeArtifact.value("sha1", ""),
+                                      nativeArtifact.value("size", 128000ULL), true);
                 }
             }
         }
@@ -1294,16 +1448,25 @@ public:
             std::string fabUrl = "https://meta.fabricmc.net/v2/versions/loader/" + url_encode_comp(verId) + "/" +
                                  url_encode_comp(resolvedLoaderVer) + "/profile/json";
             fs::path fabPath = vDir / (verId + "-fabric-" + resolvedLoaderVer + ".json");
-            if (!winhttp_download_verified(fabUrl, fabPath, "", false, &cancelDownloadFlag,
-                                           [&](size_t n) { bytesDownloaded += n; }, dlErr)) {
-                updateDlState("failed", dlErr, 0, dlErr);
-                throw std::runtime_error(dlErr);
+            json fabJson;
+            bool validFabricProfile = false;
+            for (int profileAttempt = 1; profileAttempt <= 2 && !validFabricProfile; ++profileAttempt) {
+                if (fs::exists(fabPath, ec)) {
+                    fabJson = json::parse(read_text_file(fabPath), nullptr, false);
+                    if (validate_fabric_profile(fabJson)) { validFabricProfile = true; break; }
+                    fs::remove(fabPath, ec);
+                }
+                if (!winhttp_download_verified(fabUrl, fabPath, "", false, &cancelDownloadFlag,
+                                               [&](size_t n) { bytesDownloaded += n; }, dlErr)) break;
+                fabJson = json::parse(read_text_file(fabPath), nullptr, false);
+                validFabricProfile = validate_fabric_profile(fabJson);
+                if (!validFabricProfile) {
+                    fs::remove(fabPath, ec);
+                    dlErr = "Invalid Fabric Loader profile JSON/schema from " + fabUrl;
+                }
             }
-            json fabJson = json::parse(read_text_file(fabPath), nullptr, false);
-            if (fabJson.is_discarded() || !fabJson.is_object() || !fabJson.contains("mainClass") ||
-                !fabJson["mainClass"].is_string() || fabJson["mainClass"].get<std::string>().empty() ||
-                !fabJson.contains("libraries") || !fabJson["libraries"].is_array()) {
-                std::string err = "Invalid Fabric profile metadata from " + fabUrl + " for Minecraft " + verId;
+            if (!validFabricProfile) {
+                std::string err = "Invalid Fabric Loader profile metadata from " + fabUrl + " for Minecraft " + verId + ": " + dlErr;
                 updateDlState("failed", err, 0, err);
                 throw std::runtime_error(err);
             }
@@ -1311,24 +1474,66 @@ public:
                 mainClass = fabJson.value("mainClass", "net.fabricmc.loader.impl.launch.knot.Client");
                 if (fabJson.contains("libraries") && fabJson["libraries"].is_array()) {
                     for (const auto& fl : fabJson["libraries"]) {
-                        std::string fn = fl.value("name", "");
-                        if (fn.empty()) continue;
-                        std::string baseRepo = fl.value("url", "https://maven.fabricmc.net/");
-                        if (!baseRepo.empty() && baseRepo.back() != '/') baseRepo.push_back('/');
-                        std::string rel = maven_coord_to_rel_path(fn);
-                        fs::path fabricLib = libRoot / fs::u8path(rel);
-                        plan.push_back({"fabric_lib", baseRepo + rel, fabricLib, fl.value("sha1", ""), 96000ULL});
+                        const std::string coordinate = fl.value("name", "");
+                        ParsedMavenCoordinate parsed;
+                        const std::string repo = fl.value("url", "");
+                        const std::string sha1 = fl.value("sha1", "");
+                        if (coordinate.empty() || !parse_maven_coordinate(coordinate, parsed)) {
+                            std::string err = "Invalid Fabric Loader profile " + fabUrl + ": malformed Maven coordinate '" + coordinate + "'.";
+                            updateDlState("failed", err, 0, err); throw std::runtime_error(err);
+                        }
+                        if (repo.rfind("https://", 0) != 0 || !safe_maven_relative_path(parsed.relativePath) ||
+                            (!sha1.empty() && !isSha1Hex(sha1))) {
+                            std::string err = "Invalid Fabric Loader library metadata for Minecraft " + verId + ": coordinate " + coordinate +
+                                " requires an upstream HTTPS repository URL and optional valid SHA-1.";
+                            updateDlState("failed", err, 0, err); throw std::runtime_error(err);
+                        }
+                        std::string baseRepo = repo;
+                        if (baseRepo.back() != '/') baseRepo.push_back('/');
+                        fs::path fabricLib = libRoot / fs::u8path(parsed.relativePath);
+                        const std::string artifactUrl = baseRepo + parsed.relativePath;
+                        const std::string requiredEntry = parsed.artifact == "fabric-loader"
+                            ? "net/fabricmc/loader/impl/launch/knot/KnotClient.class"
+                            : (parsed.artifact == "intermediary" ? "mappings/mappings.tiny" : "");
+                        plan.push_back({"fabric_lib", artifactUrl, fabricLib, sha1, fl.value("size", 96000ULL),
+                                        "Fabric Loader", coordinate, true, requiredEntry});
                         verifiedLibraryFiles.push_back(fabricLib.lexically_relative(gameRoot).generic_string());
-                        verifiedLibs.push_back(rel);
+                        verifiedLibs.push_back(parsed.relativePath);
+                        appendLog("[LibraryResolver] Fabric Loader coordinate=" + coordinate + " url=" + artifactUrl +
+                                  " upstreamSha1=" + (sha1.empty() ? "not-published" : sha1) + " destination=" + fabricLib.string());
                     }
                 }
             }
         }
 
+        std::vector<ItemPlan> deduplicatedPlan;
+        std::map<std::string, size_t> destinationIndex;
         for (const auto& item : plan) {
-            if (item.url.rfind("https://", 0) != 0 || !isSha1Hex(item.sha1)) {
-                std::string label = item.kind == "asset" ? "Invalid asset metadata" : (item.kind == "client_jar" ? "Invalid client metadata" : "Invalid library metadata");
-                std::string err = label + " for Minecraft " + verId + ": missing HTTPS URL or valid SHA-1 for " + item.dest.string();
+            std::string key = fs::absolute(item.dest).lexically_normal().generic_string();
+            std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            auto found = destinationIndex.find(key);
+            if (found != destinationIndex.end()) {
+                auto& prior = deduplicatedPlan[found->second];
+                if ((!prior.sha1.empty() && !item.sha1.empty() && _stricmp(prior.sha1.c_str(), item.sha1.c_str()) != 0) ||
+                    (prior.url != item.url && !( !prior.sha1.empty() && !item.sha1.empty() && _stricmp(prior.sha1.c_str(), item.sha1.c_str()) == 0))) {
+                    std::string err = "Conflicting library dependency for coordinate " + item.coordinate + " at " + item.dest.string() +
+                        " (" + prior.url + " vs " + item.url + ").";
+                    updateDlState("failed", err, 0, err); throw std::runtime_error(err);
+                }
+                if (prior.sha1.empty()) prior.sha1 = item.sha1;
+                continue;
+            }
+            destinationIndex[key] = deduplicatedPlan.size();
+            deduplicatedPlan.push_back(item);
+        }
+        plan.swap(deduplicatedPlan);
+        for (const auto& item : plan) {
+            const bool checksumRequired = item.kind == "client_jar" || item.kind == "asset";
+            if (item.url.rfind("https://", 0) != 0 || !safe_maven_relative_path(item.dest.lexically_relative(libRoot).generic_string()) &&
+                (item.kind == "library" || item.kind == "native_jar" || item.kind == "fabric_lib") ||
+                (checksumRequired && !isSha1Hex(item.sha1)) || (!item.sha1.empty() && !isSha1Hex(item.sha1))) {
+                const std::string origin = item.source + (item.coordinate.empty() ? "" : " coordinate " + item.coordinate);
+                std::string err = "Invalid " + origin + " metadata for Minecraft " + verId + ": URL, artifact path, or optional upstream SHA-1 is invalid for " + item.dest.string();
                 updateDlState("failed", err, 0, err);
                 throw std::runtime_error(err);
             }
@@ -1345,13 +1550,27 @@ public:
             std::string stageMsg = "Downloading & verifying " + it.kind + " (" + std::to_string(completedFiles + 1) + "/" + std::to_string(totalFiles) + ")...";
             updateDlState("downloading", stageMsg, -1);
             size_t chunkBytes = 0;
-            if (!winhttp_download_verified(it.url, it.dest, it.sha1, true, &cancelDownloadFlag,
-                                           [&](size_t n) { chunkBytes += n; bytesDownloaded += n; }, dlErr)) {
+            bool artifactReady = false;
+            for (int formatAttempt = 1; formatAttempt <= 2 && !artifactReady; ++formatAttempt) {
+                if (it.validateJar && fs::exists(it.dest, ec) && !is_valid_jar_archive(it.dest, it.requiredJarEntry)) fs::remove(it.dest, ec);
+                if (!winhttp_download_verified(it.url, it.dest, it.sha1, true, &cancelDownloadFlag,
+                                               [&](size_t n) { chunkBytes += n; bytesDownloaded += n; }, dlErr)) break;
+                if (!it.validateJar || is_valid_jar_archive(it.dest, it.requiredJarEntry)) {
+                    artifactReady = true;
+                } else {
+                    fs::remove(it.dest, ec);
+                    fs::path part = it.dest; part += ".part"; fs::remove(part, ec);
+                    dlErr = "Invalid JAR archive received from " + it.url + " for " + it.source + " coordinate " + it.coordinate + ".";
+                    appendLog("[LibraryResolver] Rejected invalid JAR for " + it.source + " coordinate=" + it.coordinate + " URL=" + it.url);
+                }
+            }
+            if (!artifactReady) {
                 if (cancelDownloadFlag.load()) {
                     updateDlState("partially_downloaded", "Download cancelled — partial progress saved.", -1);
                 } else {
                     std::string label = it.kind == "asset" ? "Missing asset" : (it.kind == "client_jar" ? "Missing client JAR" : "Missing required library");
-                    dlErr = label + " (" + it.dest.string() + "): " + dlErr;
+                    const std::string origin = it.source + (it.coordinate.empty() ? "" : " coordinate " + it.coordinate);
+                    dlErr = label + " (" + origin + "; " + it.dest.string() + "): " + dlErr;
                     updateDlState("failed", dlErr, -1, dlErr);
                 }
                 throw std::runtime_error(dlErr);
@@ -1397,11 +1616,39 @@ public:
         }
         if (!assetIndexPath.empty()) verifiedHashes[assetIndexPath.lexically_relative(gameRoot).generic_string()] = meta["assetIndex"].value("sha1", "");
         verifiedHashes[metaPath.lexically_relative(gameRoot).generic_string()] = expectedMetaSha1;
+        if (!is_valid_jar_archive(vDir / (verId + ".jar"))) {
+            std::string err = "Invalid JAR archive for Minecraft " + verId + " client artifact from " + clientUrl;
+            updateDlState("failed", err, -1, err); throw std::runtime_error(err);
+        }
         std::string finalJarSha1 = bcrypt_hash_file(vDir / (verId + ".jar"), BCRYPT_SHA1_ALGORITHM);
         if (_stricmp(finalJarSha1.c_str(), clientSha1.c_str()) != 0) {
             std::string err = "SHA-1 mismatch for Minecraft " + verId + " client JAR (expected " + clientSha1 + ", got " + finalJarSha1 + ").";
             updateDlState("failed", err, -1, err);
             throw std::runtime_error(err);
+        }
+        auto deduplicateJsonStrings = [](json& values) {
+            if (!values.is_array()) return;
+            std::set<std::string> seen;
+            json unique = json::array();
+            for (const auto& value : values) {
+                if (!value.is_string()) continue;
+                const std::string text = value.get<std::string>();
+                if (seen.insert(text).second) unique.push_back(text);
+            }
+            values = std::move(unique);
+        };
+        deduplicateJsonStrings(verifiedLibs);
+        deduplicateJsonStrings(verifiedLibraryFiles);
+        deduplicateJsonStrings(verifiedAssets);
+        json verifiedLibraryIntegrity = json::array();
+        std::set<std::string> integrityPaths;
+        for (const auto& item : plan) {
+            if (!item.validateJar) continue;
+            const std::string relative = item.dest.lexically_relative(gameRoot).generic_string();
+            if (integrityPaths.insert(relative).second) {
+                verifiedLibraryIntegrity.push_back({{"path", relative}, {"source", item.source},
+                    {"coordinate", item.coordinate}, {"requiredEntry", item.requiredJarEntry}});
+            }
         }
         json receipt = {
             {"schemaVersion", 1},
@@ -1413,6 +1660,7 @@ public:
             {"assetIndexId", assetIndexId},
             {"clientJarSha1", finalJarSha1},
             {"verifiedLibraries", verifiedLibs},
+            {"verifiedLibraryIntegrity", verifiedLibraryIntegrity},
             {"verifiedLibraryFiles", verifiedLibraryFiles},
             {"verifiedAssets", verifiedAssets},
             {"verifiedHashes", verifiedHashes},
@@ -1697,7 +1945,7 @@ public:
     }
 
     /**
-     * Primary Vespera v1.2.1 Windows Sign-In: OAuth 2.0 Authorization Code + PKCE (`S256`)
+     * Primary Vespera v1.2.2 Windows Sign-In: OAuth 2.0 Authorization Code + PKCE (`S256`)
      * via default system browser (`ShellExecuteW`) + temporary loopback listener (`http://localhost:<port>`).
      */
     json startBrowserPkceAuthNative() {
@@ -2914,7 +3162,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
     VesperaNativeEngine engine;
 
     webview::webview w(false, nullptr);
-    w.set_title("Vespera Client v1.2.1 — Precision Minecraft Java Edition Client");
+    w.set_title("Vespera Client v1.2.2 — Precision Minecraft Java Edition Client");
     w.set_size(1340, 860, WEBVIEW_HINT_NONE);
 
     w.bind("vesperaNativeInvoke", [&engine](const std::string& reqArrayJson) -> std::string {

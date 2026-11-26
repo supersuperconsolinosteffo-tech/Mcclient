@@ -39,7 +39,7 @@ export interface MojangLibraryArtifact {
   path?: string;
   sha1?: string;
   size?: number;
-  url: string;
+  url?: string;
 }
 
 export interface MojangLibraryEntry {
@@ -95,6 +95,7 @@ export interface InstallReceipt {
   assetIndexId: string;
   clientJarSha1: string;
   verifiedLibraries: string[];
+  verifiedLibraryIntegrity?: Array<{ path: string; source: string; coordinate: string; requiredEntry?: string }>;
   verifiedAssets?: string[];
   verifiedHashes?: Record<string, string>;
   nativesExtractedCount: number;
@@ -163,14 +164,117 @@ function validateVersionMetadata(value: unknown, expectedId: string): value is M
  * Converts Maven coordinates (`org.lwjgl:lwjgl:3.3.3` or `org.lwjgl:lwjgl:3.3.3:natives-windows`)
  * into standard repository relative path (`org/lwjgl/lwjgl/3.3.3/lwjgl-3.3.3[-natives-windows].jar`).
  */
-export function mavenCoordToRelPath(coord: string): string {
-  const parts = coord.split(':');
+export interface ParsedMavenCoordinate {
+  group: string;
+  artifact: string;
+  version: string;
+  classifier?: string;
+  extension: string;
+  relativePath: string;
+}
+
+/** Strict Maven coordinate resolver supporting classifiers and the optional @extension form. */
+export function parseMavenCoordinate(coordinate: string): ParsedMavenCoordinate {
+  const raw = coordinate.trim();
+  const at = raw.indexOf('@');
+  if (at !== raw.lastIndexOf('@')) throw new Error(`Invalid Maven coordinate "${coordinate}": multiple extensions.`);
+  const base = at >= 0 ? raw.slice(0, at) : raw;
+  const extension = at >= 0 ? raw.slice(at + 1) : 'jar';
+  const parts = base.split(':');
+  if ((parts.length !== 3 && parts.length !== 4) || parts.some((part) => !part)) {
+    throw new Error(`Invalid Maven coordinate "${coordinate}": expected group:artifact:version[:classifier][@extension].`);
+  }
   const [group, artifact, version, classifier] = parts;
+  const validToken = /^[A-Za-z0-9_.+~-]+$/;
+  if (!group.split('.').every((part) => /^[A-Za-z0-9_-]+$/.test(part)) ||
+      !validToken.test(artifact) || !validToken.test(version) ||
+      (classifier !== undefined && !validToken.test(classifier)) || !/^[A-Za-z0-9]+$/.test(extension)) {
+    throw new Error(`Invalid Maven coordinate "${coordinate}": unsupported path characters.`);
+  }
   const groupPath = group.replace(/\./g, '/');
-  const fileName = classifier
-    ? `${artifact}-${version}-${classifier}.jar`
-    : `${artifact}-${version}.jar`;
-  return `${groupPath}/${artifact}/${version}/${fileName}`;
+  const fileName = `${artifact}-${version}${classifier ? `-${classifier}` : ''}.${extension}`;
+  const relativePath = `${groupPath}/${artifact}/${version}/${fileName}`;
+  if (relativePath.split('/').some((part) => !part || part === '.' || part === '..')) {
+    throw new Error(`Invalid Maven coordinate "${coordinate}": unsafe resolved path.`);
+  }
+  return { group, artifact, version, classifier, extension, relativePath };
+}
+
+export function mavenCoordToRelPath(coord: string): string {
+  return parseMavenCoordinate(coord).relativePath;
+}
+
+function validHttpsRepository(value: unknown): value is string {
+  if (typeof value !== 'string' || !value.trim()) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && !url.username && !url.password && !url.search && !url.hash;
+  } catch { return false; }
+}
+
+function safeLibraryDestination(root: string, relativePath: string): string {
+  const normalized = relativePath.replace(/\\/g, '/');
+  if (!normalized || normalized.startsWith('/') || /^[A-Za-z]:/.test(normalized) ||
+      normalized.split('/').some((part) => !part || part === '.' || part === '..')) {
+    throw new Error(`Unsafe Maven artifact path "${relativePath}".`);
+  }
+  const resolvedRoot = path.resolve(root);
+  const resolved = path.resolve(resolvedRoot, ...normalized.split('/'));
+  if (!resolved.startsWith(`${resolvedRoot}${path.sep}`)) throw new Error(`Maven artifact path escaped libraries directory: ${relativePath}`);
+  return resolved;
+}
+
+function validOptionalSha1(value: unknown, context: string): string | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (typeof value !== 'string' || !/^[a-f0-9]{40}$/i.test(value)) {
+    throw new Error(`${context}: upstream SHA-1 is malformed.`);
+  }
+  return value;
+}
+
+/** Validate a ZIP/JAR central directory and optionally require a key entry. */
+function validateJarArchive(bytes: Buffer, expectedEntry?: string): boolean {
+  if (bytes.length < 22) return false;
+  const minOffset = Math.max(0, bytes.length - 65_557);
+  let eocd = -1;
+  for (let i = bytes.length - 22; i >= minOffset; i--) {
+    if (bytes.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0 || eocd + 22 > bytes.length) return false;
+  const entries = bytes.readUInt16LE(eocd + 10);
+  const centralSize = bytes.readUInt32LE(eocd + 12);
+  const centralOffset = bytes.readUInt32LE(eocd + 16);
+  if (!entries || centralOffset + centralSize > eocd) return false;
+  let cursor = centralOffset;
+  let found = false;
+  for (let n = 0; n < entries; n++) {
+    if (cursor + 46 > eocd || bytes.readUInt32LE(cursor) !== 0x02014b50) return false;
+    const nameLen = bytes.readUInt16LE(cursor + 28);
+    const extraLen = bytes.readUInt16LE(cursor + 30);
+    const commentLen = bytes.readUInt16LE(cursor + 32);
+    const recordEnd = cursor + 46 + nameLen + extraLen + commentLen;
+    if (recordEnd > eocd) return false;
+    if (expectedEntry && bytes.subarray(cursor + 46, cursor + 46 + nameLen).toString('utf8') === expectedEntry) found = true;
+    cursor = recordEnd;
+  }
+  return cursor <= centralOffset + centralSize && (!expectedEntry || found);
+}
+
+function validateFabricProfileBytes(bytes: Buffer): boolean {
+  try {
+    const profile = JSON.parse(bytes.toString('utf8')) as {
+      mainClass?: unknown;
+      libraries?: Array<{ name?: unknown; url?: unknown; sha1?: unknown }>;
+    };
+    if (typeof profile.mainClass !== 'string' || !profile.mainClass || !Array.isArray(profile.libraries)) return false;
+    for (const library of profile.libraries) {
+      if (typeof library?.name !== 'string') return false;
+      parseMavenCoordinate(library.name);
+      if (!validHttpsRepository(library.url)) return false;
+      validOptionalSha1(library.sha1, `Fabric Loader library ${library.name}`);
+    }
+    return true;
+  } catch { return false; }
 }
 
 /**
@@ -435,7 +539,16 @@ export class MinecraftLauncherService {
         if (verifiedMetadata && receipt.clientJarSha1 && fs.statSync(jarPath).size > 0 &&
             sha1File(jarPath).toLowerCase() === receipt.clientJarSha1.toLowerCase() &&
             validateVersionMetadata(parsedMeta, versionId) &&
-            receipt.verifiedLibraries.every((rel) => fs.existsSync(path.join(path.dirname(path.dirname(versionDir)), 'libraries', rel))) &&
+            receipt.verifiedLibraries.every((rel) => {
+              const libraryPath = path.join(path.dirname(path.dirname(versionDir)), 'libraries', rel);
+              return fs.existsSync(libraryPath) && fs.statSync(libraryPath).size > 0 &&
+                validateJarArchive(fs.readFileSync(libraryPath));
+            }) &&
+            (!receipt.verifiedLibraryIntegrity || receipt.verifiedLibraryIntegrity.every((artifact) => {
+              const fullPath = path.join(gameDataDir, artifact.path);
+              return fs.existsSync(fullPath) && fs.statSync(fullPath).size > 0 &&
+                validateJarArchive(fs.readFileSync(fullPath), artifact.requiredEntry);
+            })) &&
             Array.isArray(receipt.verifiedAssets) &&
             receipt.verifiedAssets.every((rel) => fs.existsSync(path.join(path.dirname(path.dirname(versionDir)), rel))) &&
             Object.entries(receipt.verifiedHashes || {}).every(([rel, expected]) => {
@@ -919,19 +1032,19 @@ export class MinecraftLauncherService {
     expectedSha1?: string;
     verifyHashes: boolean;
     signal: AbortSignal;
+    validateArtifact?: (bytes: Buffer) => boolean;
     onChunkBytes?: (deltaBytes: number) => void;
   }): Promise<Buffer> {
-    const { url, destPath, expectedSha1, verifyHashes, signal, onChunkBytes } = params;
+    const { url, destPath, expectedSha1, verifyHashes, signal, validateArtifact, onChunkBytes } = params;
     fs.mkdirSync(path.dirname(destPath), { recursive: true });
 
-    // Skip network fetch if file already exists and matches expected SHA-1
+    // Reuse only a non-empty file that passes every available upstream integrity check.
     if (fs.existsSync(destPath)) {
       const existingBuf = fs.readFileSync(destPath);
-      if (!expectedSha1 || !verifyHashes) {
-        if (existingBuf.length > 0) return existingBuf;
-      } else if (sha1Hex(existingBuf).toLowerCase() === expectedSha1.toLowerCase()) {
-        return existingBuf;
-      }
+      const hashOk = !expectedSha1 || !verifyHashes || sha1Hex(existingBuf).toLowerCase() === expectedSha1.toLowerCase();
+      const contentOk = !validateArtifact || validateArtifact(existingBuf);
+      if (existingBuf.length > 0 && hashOk && contentOk) return existingBuf;
+      try { fs.unlinkSync(destPath); } catch { /* invalid cache entry; download below will fail closed */ }
     }
 
     const partPath = `${destPath}.part`;
@@ -972,15 +1085,15 @@ export class MinecraftLauncherService {
         if (expectedSha1 && (verifyHashes || /\/(?:assets|libraries|versions)\//i.test(destPath))) {
           const actualSha1 = sha1Hex(combined);
           if (actualSha1.toLowerCase() !== expectedSha1.toLowerCase()) {
-            try {
-              fs.unlinkSync(partPath);
-            } catch {
-              // Ignore
-            }
+            try { fs.unlinkSync(partPath); } catch { /* ignore */ }
             throw new Error(
               `SHA-1 integrity mismatch for ${path.basename(destPath)} (expected ${expectedSha1}, got ${actualSha1}).`
             );
           }
+        }
+        if (validateArtifact && !validateArtifact(combined)) {
+          try { fs.unlinkSync(partPath); } catch { /* invalid or incomplete content must not be resumed */ }
+          throw new Error(`Artifact content validation failed for ${url}: ${path.basename(destPath)} has invalid format or required contents.`);
         }
 
         fs.renameSync(partPath, destPath);
@@ -1003,7 +1116,7 @@ export class MinecraftLauncherService {
     }
 
     const finalError = lastError ?? new Error(`Failed downloading ${url}`);
-    if (/^HTTP \d{3}\b|SHA-1 integrity mismatch|HTTP 403|HTTP 404/.test(finalError.message)) throw finalError;
+    if (/^HTTP \d{3}\b|SHA-1 integrity mismatch|Artifact content validation failed|HTTP 403|HTTP 404/.test(finalError.message)) throw finalError;
     throw errorWithNetworkCategory(finalError, url);
   }
 
@@ -1160,6 +1273,10 @@ export class MinecraftLauncherService {
         destPath: string;
         sha1?: string;
         size: number;
+        source?: 'Mojang' | 'Fabric Loader';
+        coordinate?: string;
+        validateJar?: boolean;
+        requiredJarEntry?: string;
         excludePrefixes?: string[];
         legacyVirtualRelPath?: string;
       }
@@ -1171,6 +1288,9 @@ export class MinecraftLauncherService {
           destPath: path.join(versionDir, `${versionId}.jar`),
           sha1: clientInfo.sha1,
           size: clientInfo.size || 24_000_000,
+          source: 'Mojang',
+          coordinate: `${versionId} client.jar`,
+          validateJar: true,
         },
       ];
 
@@ -1179,28 +1299,52 @@ export class MinecraftLauncherService {
       for (const lib of metaJson.libraries || []) {
         if (!evaluateMojangRules(lib.rules, this.targetOs)) continue;
 
-        if (lib.downloads?.artifact?.url) {
-          const relPath = lib.downloads.artifact.path || mavenCoordToRelPath(lib.name);
-          const isNativeCoord = lib.name.includes(`:natives-${this.targetOs}`);
+        if (lib.downloads?.artifact) {
+          const coordinate = String(lib.name || '');
+          const maven = parseMavenCoordinate(coordinate);
+          const artifact = lib.downloads.artifact;
+          const relPath = artifact.path || maven.relativePath;
+          const destPath = safeLibraryDestination(librariesRoot, relPath);
+          const sha1 = validOptionalSha1(artifact.sha1, `Mojang library ${coordinate}`);
+          let artifactUrl = artifact.url;
+          if (!artifactUrl && validHttpsRepository(lib.url)) {
+            const repository = lib.url.endsWith('/') ? lib.url : `${lib.url}/`;
+            artifactUrl = new URL(relPath.replace(/\\/g, '/').split('/').map(encodeURIComponent).join('/'), repository).toString();
+          }
+          if (!validHttpsRepository(artifactUrl)) {
+            throw new Error(`Invalid Mojang library metadata for Minecraft ${versionId}: ${coordinate} has no valid HTTPS artifact or declared repository URL.`);
+          }
+          const isNativeCoord = Boolean(maven.classifier?.includes(`natives-${this.targetOs}`));
           planned.push({
             kind: isNativeCoord ? 'native_jar' : 'library',
-            url: lib.downloads.artifact.url,
-            destPath: path.join(librariesRoot, relPath),
-            sha1: lib.downloads.artifact.sha1,
-            size: lib.downloads.artifact.size || 64_000,
+            url: artifactUrl,
+            destPath,
+            sha1,
+            size: artifact.size || 64_000,
+            source: 'Mojang',
+            coordinate,
+            validateJar: true,
             excludePrefixes: lib.extract?.exclude,
           });
-          if (!isNativeCoord) {
-            verifiedLibraryRelPaths.push(relPath);
-          }
+          verifiedLibraryRelPaths.push(relPath.replace(/\\/g, '/'));
         } else if (lib.name) {
-          const baseRepo = (lib.url || 'https://libraries.minecraft.net/').replace(/\/?$/, '/');
-          const relPath = mavenCoordToRelPath(lib.name);
+          // Legacy Mojang entries may publish a repository base and Maven coordinate instead of downloads.artifact.
+          // Use only the repository supplied by Mojang metadata; do not synthesize a repository URL.
+          const coordinate = String(lib.name);
+          const relPath = mavenCoordToRelPath(coordinate);
+          const baseRepo = lib.url;
+          if (!validHttpsRepository(baseRepo)) {
+            throw new Error(`Invalid Mojang library metadata for Minecraft ${versionId}: ${coordinate} has no valid HTTPS repository URL.`);
+          }
+          const url = new URL(relPath.split('/').map(encodeURIComponent).join('/'), baseRepo.endsWith('/') ? baseRepo : `${baseRepo}/`).toString();
           planned.push({
             kind: 'library',
-            url: `${baseRepo}${relPath}`,
-            destPath: path.join(librariesRoot, relPath),
+            url,
+            destPath: safeLibraryDestination(librariesRoot, relPath),
             size: 64_000,
+            source: 'Mojang',
+            coordinate,
+            validateJar: true,
           });
           verifiedLibraryRelPaths.push(relPath);
         }
@@ -1212,12 +1356,25 @@ export class MinecraftLauncherService {
           if (natArt?.url) {
             const natRel =
               natArt.path || mavenCoordToRelPath(`${lib.name}:${classifierKey}`);
+            const natCoordinate = `${lib.name}:${classifierKey}`;
+            const natSha1 = validOptionalSha1(natArt.sha1, `Mojang native library ${natCoordinate}`);
+            let natUrl = natArt.url;
+            if (!natUrl && validHttpsRepository(lib.url)) {
+              const repository = lib.url.endsWith('/') ? lib.url : `${lib.url}/`;
+              natUrl = new URL(natRel.replace(/\\/g, '/').split('/').map(encodeURIComponent).join('/'), repository).toString();
+            }
+            if (!validHttpsRepository(natUrl)) {
+              throw new Error(`Invalid Mojang native library metadata for Minecraft ${versionId}: ${natCoordinate} has no valid HTTPS artifact or declared repository URL.`);
+            }
             planned.push({
               kind: 'native_jar',
-              url: natArt.url,
-              destPath: path.join(librariesRoot, natRel),
-              sha1: natArt.sha1,
+              url: natUrl,
+              destPath: safeLibraryDestination(librariesRoot, natRel),
+              sha1: natSha1,
               size: natArt.size || 128_000,
+              source: 'Mojang',
+              coordinate: `${lib.name}:${classifierKey}`,
+              validateJar: true,
               excludePrefixes: lib.extract?.exclude,
             });
             verifiedLibraryRelPaths.push(natRel);
@@ -1304,30 +1461,74 @@ export class MinecraftLauncherService {
           destPath: fabricJsonPath,
           verifyHashes: false,
           signal: abortController.signal,
+          validateArtifact: validateFabricProfileBytes,
           onChunkBytes: (n) => {
             bytesDownloaded += n;
           },
         });
-        const fabricMeta = JSON.parse(fabricBuf.toString('utf8')) as {
+        let fabricMeta: {
           mainClass?: string;
-          libraries?: Array<{ name: string; url?: string; sha1?: string; size?: number }>;
+          libraries?: Array<{ name?: string; url?: string; sha1?: string; size?: number }>;
         };
-        if (fabricMeta.mainClass) {
-          mainClass = fabricMeta.mainClass;
+        try {
+          fabricMeta = JSON.parse(fabricBuf.toString('utf8'));
+        } catch (err) {
+          throw new Error(`Invalid Fabric Loader profile JSON from ${fabricProfileUrl}: ${err instanceof Error ? err.message : String(err)}`);
         }
-        for (const flib of fabricMeta.libraries || []) {
-          if (!flib.name) continue;
-          const repoBase = (flib.url || 'https://maven.fabricmc.net/').replace(/\/?$/, '/');
-          const relPath = mavenCoordToRelPath(flib.name);
+        if (typeof fabricMeta.mainClass !== 'string' || !fabricMeta.mainClass || !Array.isArray(fabricMeta.libraries)) {
+          throw new Error(`Invalid Fabric Loader profile from ${fabricProfileUrl}: expected mainClass and libraries array.`);
+        }
+        mainClass = fabricMeta.mainClass;
+        for (const flib of fabricMeta.libraries) {
+          const coordinate = String(flib.name || '');
+          if (!coordinate) throw new Error(`Invalid Fabric Loader library metadata from ${fabricProfileUrl}: missing Maven coordinate.`);
+          const maven = parseMavenCoordinate(coordinate);
+          if (!validHttpsRepository(flib.url)) {
+            throw new Error(`Invalid Fabric Loader library metadata from ${fabricProfileUrl}: ${coordinate} has no valid HTTPS repository URL.`);
+          }
+          const sha1 = validOptionalSha1(flib.sha1, `Fabric Loader library ${coordinate}`);
+          const repository = flib.url.endsWith('/') ? flib.url : `${flib.url}/`;
+          const artifactUrl = new URL(maven.relativePath.split('/').map(encodeURIComponent).join('/'), repository).toString();
+          const relPath = maven.relativePath;
+          const requiredJarEntry = maven.artifact === 'fabric-loader'
+            ? 'net/fabricmc/loader/impl/launch/knot/KnotClient.class'
+            : maven.artifact === 'intermediary' ? 'mappings/mappings.tiny' : undefined;
           planned.push({
             kind: 'fabric_lib',
-            url: `${repoBase}${relPath}`,
-            destPath: path.join(librariesRoot, relPath),
-            sha1: flib.sha1,
+            url: artifactUrl,
+            destPath: safeLibraryDestination(librariesRoot, relPath),
+            sha1,
             size: flib.size || 96_000,
+            source: 'Fabric Loader',
+            coordinate,
+            validateJar: true,
+            requiredJarEntry,
           });
           verifiedLibraryRelPaths.push(relPath);
         }
+      }
+
+      // Collapse duplicate coordinates before scheduling downloads. Conflicting hashes or unresolved
+      // same-path repository definitions are rejected rather than silently choosing one.
+      const uniquePlanned: PlannedDownload[] = [];
+      const plannedByPath = new Map<string, PlannedDownload>();
+      for (const item of planned) {
+        const key = path.resolve(item.destPath).toLowerCase();
+        const prior = plannedByPath.get(key);
+        if (prior) {
+          if ((prior.sha1 && item.sha1 && prior.sha1.toLowerCase() !== item.sha1.toLowerCase()) ||
+              (prior.url !== item.url && !(prior.sha1 && item.sha1 && prior.sha1.toLowerCase() === item.sha1.toLowerCase()))) {
+            throw new Error(`Conflicting dependency metadata for ${item.source || item.kind} coordinate ${item.coordinate || item.destPath}: ${prior.url} vs ${item.url}.`);
+          }
+          if (!prior.sha1 && item.sha1) prior.sha1 = item.sha1;
+          continue;
+        }
+        plannedByPath.set(key, item);
+        uniquePlanned.push(item);
+      }
+      planned.splice(0, planned.length, ...uniquePlanned);
+      for (const item of planned.filter((entry) => entry.kind === 'library' || entry.kind === 'native_jar' || entry.kind === 'fabric_lib')) {
+        console.info(`[LibraryResolver] source=${item.source || 'Mojang'} coordinate=${item.coordinate || item.destPath} url=${item.url} upstreamSha1=${item.sha1 || 'not-published'} destination=${item.destPath}`);
       }
 
       // Stage 5: Execute concurrent verified downloads with live speed & ETA
@@ -1370,6 +1571,9 @@ export class MinecraftLauncherService {
               expectedSha1: item.sha1,
               verifyHashes: true,
               signal: abortController.signal,
+              validateArtifact: item.validateJar
+                ? (bytes) => validateJarArchive(bytes, item.requiredJarEntry)
+                : undefined,
               onChunkBytes: (n) => {
                 countedChunkBytes += n;
                 bytesDownloaded += n;
@@ -1377,6 +1581,11 @@ export class MinecraftLauncherService {
             });
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
+            if (item.kind === 'library' || item.kind === 'native_jar' || item.kind === 'fabric_lib') {
+              const source = item.source || 'Mojang';
+              const coordinate = item.coordinate || item.destPath;
+              throw new Error(`Missing/invalid ${source} library ${coordinate} (${item.destPath}): ${message}`);
+            }
             const kindLabel = item.kind === 'asset' ? 'Missing asset' : item.kind === 'client_jar' ? 'Missing client JAR' : 'Missing required library';
             throw new Error(`${kindLabel} (${item.destPath}): ${message}`);
           }
@@ -1450,6 +1659,14 @@ export class MinecraftLauncherService {
         assetIndexId,
         clientJarSha1: finalJarSha1,
         verifiedLibraries: Array.from(new Set(verifiedLibraryRelPaths)),
+        verifiedLibraryIntegrity: planned
+          .filter((item) => item.validateJar && item.coordinate && item.source)
+          .map((item) => ({
+            path: path.relative(settings.gameDataDir, item.destPath),
+            source: item.source!,
+            coordinate: item.coordinate!,
+            requiredEntry: item.requiredJarEntry,
+          })),
         verifiedAssets: planned.filter((item) => item.kind === 'asset').map((item) => path.relative(settings.gameDataDir, item.destPath)),
         verifiedHashes: Object.fromEntries([
           ...planned.filter((item) => item.sha1).map((item) => [path.relative(settings.gameDataDir, item.destPath), item.sha1!]),
@@ -1526,6 +1743,14 @@ export class MinecraftLauncherService {
         const libFull = path.join(settings.gameDataDir, 'libraries', relLib);
         if (!fs.existsSync(libFull) || fs.statSync(libFull).size === 0) {
           issues.push(`Missing required library: ${relLib}`);
+        } else if (!validateJarArchive(fs.readFileSync(libFull))) {
+          issues.push(`Invalid JAR archive for required library: ${relLib}`);
+        }
+      }
+      for (const artifact of receipt.verifiedLibraryIntegrity || []) {
+        const fullPath = path.join(settings.gameDataDir, artifact.path);
+        if (!fs.existsSync(fullPath) || !validateJarArchive(fs.readFileSync(fullPath), artifact.requiredEntry)) {
+          issues.push(`Library integrity check failed for ${artifact.source} coordinate ${artifact.coordinate} (${artifact.path}).`);
         }
       }
       for (const relAsset of receipt.verifiedAssets || []) {
@@ -1693,7 +1918,7 @@ export class MinecraftLauncherService {
         process.cwd(),
         'release',
         'mods',
-        'vespera-client-1.2.1+mc1.21.4.jar'
+        'vespera-client-1.2.2+mc1.21.4.jar'
       );
       const legacyReleaseModJar = path.join(
         process.cwd(),
@@ -1936,7 +2161,7 @@ export class MinecraftLauncherService {
       ...baseFlags,
       `-Djava.library.path=${nativesDir}`,
       `-Dminecraft.launcher.brand=VesperaClient`,
-      `-Dminecraft.launcher.version=1.2.1`,
+      `-Dminecraft.launcher.version=1.2.2`,
       ...(sessionMode === 'offline_account' ? ['-Dvespera.accountType=offline'] : []),
       ...(sessionMode === 'offline_singleplayer'
         ? ['-Dvespera.offlineSingleplayer=true']
@@ -1996,7 +2221,7 @@ export class MinecraftLauncherService {
         '--userType',
         userType,
         '--versionType',
-        profile.loader === 'vanilla' ? 'Vespera-Vanilla/1.2.1' : 'Vespera-Fabric/1.2.1',
+        profile.loader === 'vanilla' ? 'Vespera-Vanilla/1.2.2' : 'Vespera-Fabric/1.2.2',
         '--width',
         String(profile.graphics.resolutionWidth),
         '--height',

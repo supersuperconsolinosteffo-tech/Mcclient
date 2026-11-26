@@ -1,4 +1,4 @@
-# Vespera Client v1.2.1 — One-Time Microsoft Entra OAuth Setup (Maintainers Only)
+# Vespera Client v1.2.2 — One-Time Microsoft Entra OAuth Setup (Maintainers Only)
 
 ## Architectural Principle
 
@@ -51,4 +51,4 @@ Vespera resolves the Application (client) ID in the following priority order (`s
    }
    ```
 3. **Development Configuration (`config/oauth.development.json`)** — Used when `NODE_ENV=development`.
-4. **Production Release Configuration (`config/oauth.release.json`)** — Embedded into `VesperaClient.exe` and `VesperaClient-1.2.1-win64-setup.exe` during production builds.
+4. **Production Release Configuration (`config/oauth.release.json`)** — Embedded into `VesperaClient.exe` and `VesperaClient-1.2.2-win64-setup.exe` during production builds.

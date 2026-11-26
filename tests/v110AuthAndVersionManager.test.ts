@@ -508,10 +508,14 @@ describe('Part 8.2 & 8.3 — Dynamic Version Manager, Multi-Stage Installer, Res
 
   it('downloads, SHA-1 verifies, resumes via HTTP Range, repairs corrupted files, and deletes versions without touching profiles', async () => {
     const dataDir = makeTempDir();
-    const clientJarBytes = Buffer.from('MOCK_MINECRAFT_1_20_4_CLIENT_JAR_BINARY_PAYLOAD');
+    const clientJarBytes = buildMinimalZipBuffer([
+      { name: 'net/minecraft/client/Main.class', content: Buffer.from('MOCK_MINECRAFT_CLIENT_CLASS') },
+    ]);
     const clientJarSha1 = sha1Hex(clientJarBytes);
 
-    const libBytes = Buffer.from('MOCK_LWJGL_CORE_JAR');
+    const libBytes = buildMinimalZipBuffer([
+      { name: 'org/lwjgl/Version.class', content: Buffer.from('MOCK_LWJGL_CORE_CLASS') },
+    ]);
     const libSha1 = sha1Hex(libBytes);
 
     const nativeZipBytes = buildMinimalZipBuffer([
@@ -620,13 +624,13 @@ describe('Part 8.2 & 8.3 — Dynamic Version Manager, Multi-Stage Installer, Res
       if (url === 'https://mock.mojang.test/client/1.20.4.jar') {
         if (corruptClientJarOnce) {
           corruptClientJarOnce = false;
-          return new Response(Buffer.from('CORRUPTED_BYTES'), { status: 200 });
+          return new Response(new Uint8Array(Buffer.from('CORRUPTED_BYTES')), { status: 200 });
         }
         if (hdrs.Range && hdrs.Range.startsWith('bytes=')) {
           const offset = Number(hdrs.Range.replace('bytes=', '').replace('-', ''));
-          return new Response(clientJarBytes.subarray(offset), { status: 206 });
+          return new Response(new Uint8Array(clientJarBytes.subarray(offset)), { status: 206 });
         }
-        return new Response(clientJarBytes, { status: 200 });
+        return new Response(new Uint8Array(clientJarBytes), { status: 200 });
       }
       if (url === 'https://mock.mojang.test/assets/12.json') {
         return new Response(assetIndexBytes, { status: 200 });
@@ -635,7 +639,7 @@ describe('Part 8.2 & 8.3 — Dynamic Version Manager, Multi-Stage Installer, Res
         return new Response(soundAssetBytes, { status: 200 });
       }
       if (url === 'https://mock.mojang.test/libs/lwjgl-3.3.2.jar') {
-        return new Response(libBytes, { status: 200 });
+        return new Response(new Uint8Array(libBytes), { status: 200 });
       }
       if (url === 'https://mock.mojang.test/libs/lwjgl-3.3.2-natives-windows.jar') {
         return new Response(new Uint8Array(nativeZipBytes), { status: 200 });
@@ -746,7 +750,7 @@ describe('Part 8.4 — End-to-End UX Flow, Legacy 1.8.9 Args, Mod Isolation & v1
 
     const coord = new VesperaStateCoordinator(dataDir);
     const migratedSnap = coord.getSnapshot();
-    expect(migratedSnap.version).toBe('1.2.1');
+    expect(migratedSnap.version).toBe('1.2.2');
     expect(migratedSnap.profiles[0].name).toBe('My Preserved v1.0.0 Profile');
 
     // Verify Accounts UI has ZERO manual Client ID input fields and renders Offline Availability section

@@ -1,4 +1,4 @@
-# Vespera Client v1.2.1
+# Vespera Client v1.2.2
 
 **Precision Minecraft Java Edition Client & Native Windows 10/11 Launcher**  
 *Performance + Visual Fidelity + Dynamic Multi-Version Management + Offline Accounts + Seamless Microsoft Sign-In — Zero Electron Bloat*
@@ -9,11 +9,12 @@
 
 **Vespera Client** (`gg.vespera.client`) is a production-grade Minecraft Java Edition client ecosystem and native 64-bit Windows desktop launcher engineered as a modern, transparent, open-architecture alternative to Lunar Client and Badlion Client.
 
-### Highlights in v1.2.1 — Mojang Metadata Recovery
-1. **Resilient Official Metadata Pipeline**:
-   - Refreshes the official Mojang version manifest when stale (and before installs from the embedded fallback), resolves metadata by exact version ID, verifies the manifest-provided metadata SHA-1, and retries metadata HTTP 404s once after forcing a manifest refresh.
-   - Caches manifests and version JSON atomically, invalidates corrupt or unverified metadata, and refuses to write a successful install receipt when required metadata, libraries, assets, or the client JAR is missing or invalid.
-   - Reports HTTP status, timeout/DNS, invalid JSON, SHA-1, missing library, and missing asset failures with actionable context. The embedded seed remains a browse-only offline fallback.
+### Highlights in v1.2.2 — Source-Aware Fabric Library Resolution
+1. **Mojang and Fabric Dependency Metadata Are Parsed Separately**:
+   - Mojang library URLs and optional SHA-1 checksums are taken from Mojang's metadata; Fabric libraries are resolved from the Fabric loader profile's Maven coordinates and declared repository URLs. [Fabric Meta's profile builder](https://github.com/FabricMC/fabric-meta/blob/master/src/main/java/net/fabricmc/meta/web/ProfileHandler.java#L114-L181) generates intermediary/loader entries with only `name` and `url`, while [Fabric Loader 0.16.10 metadata](https://github.com/FabricMC/fabric-loader/blob/0.16.10/src/main/resources/fabric-installer.json) shows common library records can include checksums.
+   - Missing upstream checksums are not fabricated or treated as an invalid URL. Published hashes are verified; hashless library downloads must pass HTTP, JAR/ZIP structure, and Fabric Loader entry validation.
+   - Maven classifiers/extensions and Windows-safe artifact paths are validated, duplicate downloads are collapsed, incomplete/corrupt files are retried or invalidated, and complete artifacts are required before an install receipt is written.
+   - Library diagnostics include upstream source, full Maven coordinate, resolved URL, checksum availability, and destination. The previous Mojang metadata refresh/retry and cache-corruption protections remain in place.
 2. **Offline Accounts for Singleplayer, LAN & Offline Servers**:
    - Create multiple local Minecraft usernames without Microsoft credentials; each receives Minecraft's deterministic `OfflinePlayer:<username>` UUID (MD5 v3) and is clearly labeled as an Offline Account.
    - Offline accounts launch with legacy authentication (`--accessToken 0 --userType legacy`) and retain multiplayer support for LAN and servers configured with `online-mode=false`. Servers requiring online authentication receive a clear in-launcher explanation.
@@ -28,20 +29,20 @@
    - Executes the complete **Microsoft OAuth $\rightarrow$ Xbox Live $\rightarrow$ XSTS $\rightarrow$ Minecraft Services $\rightarrow$ Java Edition Entitlement Verification $\rightarrow$ Minecraft Profile** chain with DPAPI / AES-256-GCM encrypted token storage, multi-account switching, silent session refresh, and clear human-readable error messages.
    - **External Registration Status**: No fabricated Client ID is included in the repository (`config/oauth.release.json` and `config/oauth.development.json` ship with `"clientId": ""`). Before live Microsoft authentication can complete end-to-end, a maintainer must supply a registered Microsoft Entra Public Client ID (`http://localhost` Mobile & desktop redirect URI) via `VESPERA_MSA_CLIENT_ID`, `config/oauth.local.json`, or `config/oauth.release.json` (see [`docs/OAUTH_DEVELOPER_SETUP.md`](docs/OAUTH_DEVELOPER_SETUP.md)). If unset, Vespera surfaces a friendly notice *only* when attempting sign-in.
 6. **Dynamic Official Minecraft Version Manager & Honest Mod Isolation**:
-   - Live sync with Mojang's official `version_manifest_v2.json` across **Releases**, **Snapshots**, **Old Beta**, and **Old Alpha**, with 12-stage SHA-1 verified downloading, HTTP `Range` `.part` resumption, native `.dll`/`.so` extraction, automatic Java 8/17/21 provisioning, and strict isolation of `vespera-client-1.2.1+mc1.21.4.jar` to Minecraft `1.21.4`.
+   - Live sync with Mojang's official `version_manifest_v2.json` across **Releases**, **Snapshots**, **Old Beta**, and **Old Alpha**, with 12-stage SHA-1 verified downloading, HTTP `Range` `.part` resumption, native `.dll`/`.so` extraction, automatic Java 8/17/21 provisioning, and strict isolation of `vespera-client-1.2.2+mc1.21.4.jar` to Minecraft `1.21.4`.
 
 ---
 
-## v1.2.1 Windows 10/11 (x86_64) Release Deliverables
+## v1.2.2 Windows 10/11 (x86_64) Release Deliverables
 
 Build the release artifacts with `npm run build`. The build produces:
 
 | Deliverable | Path |
 | :--- | :--- |
-| **Windows Setup Installer** | `release/VesperaClient-1.2.1-win64-setup.exe` |
+| **Windows Setup Installer** | `release/VesperaClient-1.2.2-win64-setup.exe` |
 | **Native Desktop Launcher** | `release/bin/VesperaClient.exe` |
 | **Native Windows Uninstaller** | `release/bin/VesperaUninstall.exe` |
-| **Custom Fabric Client Mod** | `release/mods/vespera-client-1.2.1+mc1.21.4.jar` |
+| **Custom Fabric Client Mod** | `release/mods/vespera-client-1.2.2+mc1.21.4.jar` |
 | **Windows Application Icon** | `release/vespera.ico` |
 | **Release Checksums** | `release/SHA256SUMS.txt` (SHA-256 for all release binaries) |
 
@@ -52,7 +53,7 @@ Run `npm run test:verify-artifacts` to validate the Windows PE64 binaries and th
 ## Quickstart Commands
 
 ```bash
-# Run full automated verification (36 Vitest tests + 23 Kotlin JVM 21 mod tests + PE32+ binary & UX verification)
+# Run full automated verification (Vitest + Kotlin JVM 21 mod tests + PE32+ binary & UX verification)
 npm test
 
 # Rebuild everything from source (UI -> Kotlin Fabric Mod JAR -> 64-bit Windows Binaries & Setup Installer)
