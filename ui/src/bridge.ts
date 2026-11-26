@@ -301,7 +301,7 @@ class VesperaRpcBridge {
         preparation?: LaunchPreparationReport;
       };
       snapshot: unknown;
-    }>('launchMinecraft', mode ? { mode } : {}, 300000);
+    }>('launchMinecraft', mode ? { mode } : {}, 600000);
     return {
       launchRes: raw.launchRes,
       snapshot: validateAndNormalizeSnapshot(raw.snapshot),

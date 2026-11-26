@@ -555,9 +555,17 @@ function bindGlobalAndStageEvents(root: HTMLElement, snap: AppStateSnapshot): vo
 
   root.querySelectorAll<HTMLElement>('[data-action="launch-now"]').forEach((btn) => {
     btn.addEventListener('click', async () => {
+      state.launchingGame = true;
+      renderApp();
+      const progressTimer = setInterval(async () => {
+        try {
+          state.snapshot = await bridge.getSnapshot();
+          renderApp();
+        } catch {
+          // A failed progress poll must not cancel or hide the native task.
+        }
+      }, 500);
       try {
-        state.launchingGame = true;
-        renderApp();
         const { launchRes, snapshot } = await bridge.launchMinecraft();
         state.snapshot = snapshot;
         state.launchPrep = launchRes.preparation ?? null;
@@ -580,6 +588,8 @@ function bindGlobalAndStageEvents(root: HTMLElement, snap: AppStateSnapshot): vo
         state.launchingGame = false;
         showToast(err instanceof Error ? err.message : String(err), 'error');
         renderApp();
+      } finally {
+        clearInterval(progressTimer);
       }
     });
   });

@@ -750,7 +750,7 @@ describe('Part 8.4 — End-to-End UX Flow, Legacy 1.8.9 Args, Mod Isolation & v1
 
     const coord = new VesperaStateCoordinator(dataDir);
     const migratedSnap = coord.getSnapshot();
-    expect(migratedSnap.version).toBe('1.2.2');
+    expect(migratedSnap.version).toBe('1.2.3');
     expect(migratedSnap.profiles[0].name).toBe('My Preserved v1.0.0 Profile');
 
     // Verify Accounts UI has ZERO manual Client ID input fields and renders Offline Availability section

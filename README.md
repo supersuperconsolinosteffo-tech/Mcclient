@@ -1,4 +1,4 @@
-# Vespera Client v1.2.2
+# Vespera Client v1.2.3
 
 **Precision Minecraft Java Edition Client & Native Windows 10/11 Launcher**  
 *Performance + Visual Fidelity + Dynamic Multi-Version Management + Offline Accounts + Seamless Microsoft Sign-In — Zero Electron Bloat*
@@ -9,7 +9,7 @@
 
 **Vespera Client** (`gg.vespera.client`) is a production-grade Minecraft Java Edition client ecosystem and native 64-bit Windows desktop launcher engineered as a modern, transparent, open-architecture alternative to Lunar Client and Badlion Client.
 
-### Highlights in v1.2.2 — Source-Aware Fabric Library Resolution
+### Highlights in v1.2.3 — Responsive Native Installer & Recoverable Artifact Journal
 1. **Mojang and Fabric Dependency Metadata Are Parsed Separately**:
    - Mojang library URLs and optional SHA-1 checksums are taken from Mojang's metadata; Fabric libraries are resolved from the Fabric loader profile's Maven coordinates and declared repository URLs. [Fabric Meta's profile builder](https://github.com/FabricMC/fabric-meta/blob/master/src/main/java/net/fabricmc/meta/web/ProfileHandler.java#L114-L181) generates intermediary/loader entries with only `name` and `url`, while [Fabric Loader 0.16.10 metadata](https://github.com/FabricMC/fabric-loader/blob/0.16.10/src/main/resources/fabric-installer.json) shows common library records can include checksums.
    - Missing upstream checksums are not fabricated or treated as an invalid URL. Published hashes are verified; hashless library downloads must pass HTTP, JAR/ZIP structure, and Fabric Loader entry validation.
@@ -31,15 +31,23 @@
 6. **Dynamic Official Minecraft Version Manager & Honest Mod Isolation**:
    - Live sync with Mojang's official `version_manifest_v2.json` across **Releases**, **Snapshots**, **Old Beta**, and **Old Alpha**, with 12-stage SHA-1 verified downloading, HTTP `Range` `.part` resumption, native `.dll`/`.so` extraction, automatic Java 8/17/21 provisioning, and strict isolation of `vespera-client-1.2.2+mc1.21.4.jar` to Minecraft `1.21.4`.
 
+### Installation engine changes in v1.2.3
+
+- Long native install, launch, manifest-sync and verification RPCs are dispatched through WebView's asynchronous binding. Snapshot polling and cancellation remain serviceable while a job runs, and a second long task is refused instead of queued against the same files.
+- The Windows installer writes an atomic per-install artifact journal (source, coordinate, URL, destination, expected size/hash, state, and failure) and revalidates existing files when resuming. Valid files are retained; corrupt or incomplete files are repaired individually.
+- Download totals are indeterminate when upstream sizes are absent. HTTP response lengths and declared artifact sizes are checked, and native archive extraction failures/timeouts now stop installation instead of being silently accepted.
+- Audit and evidence: [`docs/INSTALLATION_AUDIT_V1.2.3.md`](docs/INSTALLATION_AUDIT_V1.2.3.md). The audit could confirm the UI-thread blocking mechanism and the missing native persistent journal. It could not identify the exact historical Mojang package URL or Fabric coordinate without the original Windows logs.
+- **Test scope:** the native Windows executable/installer is cross-compiled and checked as a PE64 artifact, and automated mock-based regression suites run in this environment. Actual Windows installation, Minecraft launch, interruption/restart recovery, and Java 8/17/21 runtime matrix tests have not been run here; no live game launch is claimed.
+
 ---
 
-## v1.2.2 Windows 10/11 (x86_64) Release Deliverables
+## v1.2.3 Windows 10/11 (x86_64) Release Deliverables
 
 Build the release artifacts with `npm run build`. The build produces:
 
 | Deliverable | Path |
 | :--- | :--- |
-| **Windows Setup Installer** | `release/VesperaClient-1.2.2-win64-setup.exe` |
+| **Windows Setup Installer** | `release/VesperaClient-1.2.3-win64-setup.exe` |
 | **Native Desktop Launcher** | `release/bin/VesperaClient.exe` |
 | **Native Windows Uninstaller** | `release/bin/VesperaUninstall.exe` |
 | **Custom Fabric Client Mod** | `release/mods/vespera-client-1.2.2+mc1.21.4.jar` |

@@ -9,12 +9,17 @@ export type SupportTier =
 
 export type VersionInstallStatus =
   | 'not_installed'
+  | 'preparing'
   | 'metadata_cached'
   | 'partially_downloaded'
   | 'downloading'
   | 'installing'
+  | 'verifying'
   | 'installed'
   | 'ready'
+  | 'launching'
+  | 'running'
+  | 'cancelled'
   | 'update_available'
   | 'failed';
 

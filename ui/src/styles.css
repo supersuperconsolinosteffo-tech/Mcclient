@@ -54,6 +54,16 @@ body {
   flex-direction: column;
 }
 
+@keyframes install-progress-sweep {
+  0% { transform: translateX(-110%); }
+  100% { transform: translateX(310%); }
+}
+.install-progress-indeterminate {
+  position: relative;
+  overflow: hidden;
+  animation: install-progress-sweep 1.4s ease-in-out infinite alternate;
+}
+
 /* Custom lightweight scrollbars */
 ::-webkit-scrollbar {
   width: 7px;

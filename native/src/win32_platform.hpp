@@ -269,7 +269,8 @@ inline HttpResponse winhttp_request(
     const std::string& urlUtf8,
     const std::string& requestBody = "",
     const std::string& contentType = "application/json",
-    const std::string& bearerToken = ""
+    const std::string& bearerToken = "",
+    std::atomic<bool>* cancelFlag = nullptr
 ) {
     HttpResponse res;
     std::wstring wurl = utf8_to_wide(urlUtf8);
@@ -288,7 +289,7 @@ inline HttpResponse winhttp_request(
         return res;
     }
 
-    HINTERNET hSession = WinHttpOpen(L"VesperaClient/1.2.2 (Windows NT 10.0; Win64; x64)",
+    HINTERNET hSession = WinHttpOpen(L"VesperaClient/1.2.3 (Windows NT 10.0; Win64; x64)",
                                      WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                      WINHTTP_NO_PROXY_NAME,
                                      WINHTTP_NO_PROXY_BYPASS, 0);
@@ -327,6 +328,14 @@ inline HttpResponse winhttp_request(
         headers += L"Authorization: Bearer " + utf8_to_wide(bearerToken) + L"\r\n";
     }
 
+    if (cancelFlag && cancelFlag->load()) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        res.error = "Request cancelled by user: " + urlUtf8;
+        return res;
+    }
+
     BOOL sent = WinHttpSendRequest(
         hRequest,
         headers.c_str(),
@@ -346,6 +355,10 @@ inline HttpResponse winhttp_request(
 
         DWORD avail = 0;
         do {
+            if (cancelFlag && cancelFlag->load()) {
+                res.error = "Request cancelled by user: " + urlUtf8;
+                break;
+            }
             avail = 0;
             if (!WinHttpQueryDataAvailable(hRequest, &avail) || avail == 0) break;
             std::vector<char> chunk(avail);
@@ -365,9 +378,10 @@ inline HttpResponse winhttp_request(
     return res;
 }
 
-inline bool winhttp_download_file(const std::string& urlUtf8, const std::filesystem::path& destFile) {
-    HttpResponse r = winhttp_request("GET", urlUtf8);
-    if (r.statusCode < 200 || r.statusCode >= 300 || r.body.empty()) return false;
+inline bool winhttp_download_file(const std::string& urlUtf8, const std::filesystem::path& destFile,
+                                  std::atomic<bool>* cancelFlag = nullptr) {
+    HttpResponse r = winhttp_request("GET", urlUtf8, "", "application/json", "", cancelFlag);
+    if ((cancelFlag && cancelFlag->load()) || r.statusCode < 200 || r.statusCode >= 300 || r.body.empty()) return false;
     return write_file_atomic(destFile, r.body.data(), r.body.size());
 }
 
@@ -422,19 +436,27 @@ inline bool winhttp_download_verified(
     bool verifyHashes,
     std::atomic<bool>* cancelFlag,
     const std::function<void(size_t)>& onChunkBytes,
-    std::string& outError
+    std::string& outError,
+    uint64_t expectedSize = 0
 ) {
     std::error_code ec;
     std::filesystem::create_directories(destFile.parent_path(), ec);
 
     if (std::filesystem::exists(destFile, ec) && std::filesystem::file_size(destFile, ec) > 0) {
-        if (!verifyHashes || expectedSha1.empty()) return true;
-        std::string curSha = bcrypt_hash_file(destFile, BCRYPT_SHA1_ALGORITHM);
-        if (_stricmp(curSha.c_str(), expectedSha1.c_str()) == 0) return true;
+        const uintmax_t currentSize = std::filesystem::file_size(destFile, ec);
+        const bool sizeMatches = expectedSize == 0 || currentSize == expectedSize;
+        const bool hashMatches = !verifyHashes || expectedSha1.empty() ||
+            _stricmp(bcrypt_hash_file(destFile, BCRYPT_SHA1_ALGORITHM).c_str(), expectedSha1.c_str()) == 0;
+        if (sizeMatches && hashMatches) return true;
+        std::filesystem::remove(destFile, ec);
     }
 
     std::filesystem::path partFile = destFile;
     partFile += ".part";
+    if (expectedSize > 0 && std::filesystem::exists(partFile, ec) &&
+        std::filesystem::file_size(partFile, ec) > expectedSize) {
+        std::filesystem::remove(partFile, ec);
+    }
 
     for (int attempt = 1; attempt <= 3; ++attempt) {
         if (cancelFlag && cancelFlag->load()) {
@@ -461,7 +483,7 @@ inline bool winhttp_download_verified(
             return false;
         }
 
-        HINTERNET hSession = WinHttpOpen(L"VesperaClient/1.2.2 (Windows NT 10.0; Win64; x64)",
+        HINTERNET hSession = WinHttpOpen(L"VesperaClient/1.2.3 (Windows NT 10.0; Win64; x64)",
                                          WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                          WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         if (!hSession) {
@@ -502,10 +524,17 @@ inline bool winhttp_download_verified(
             WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                                 WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX);
             if (status == 200 || status == 206) {
-                std::ios_base::openmode mode = std::ios::binary | ((status == 206 && existingBytes > 0) ? std::ios::app : std::ios::trunc);
+                DWORD contentLength = 0;
+                DWORD contentLengthSize = sizeof(contentLength);
+                const bool contentLengthKnown = WinHttpQueryHeaders(hRequest,
+                    WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
+                    WINHTTP_HEADER_NAME_BY_INDEX, &contentLength, &contentLengthSize, WINHTTP_NO_HEADER_INDEX) != FALSE;
+                const std::ios_base::openmode mode = std::ios::binary | ((status == 206 && existingBytes > 0) ? std::ios::app : std::ios::trunc);
                 std::ofstream ofs(partFile, mode);
                 if (ofs) {
                     okAttempt = true;
+                    uint64_t responseBytes = 0;
+                    bool readFailed = false;
                     DWORD avail = 0;
                     do {
                         if (cancelFlag && cancelFlag->load()) {
@@ -514,15 +543,43 @@ inline bool winhttp_download_verified(
                             break;
                         }
                         avail = 0;
-                        if (!WinHttpQueryDataAvailable(hRequest, &avail) || avail == 0) break;
+                        if (!WinHttpQueryDataAvailable(hRequest, &avail)) {
+                            readFailed = true;
+                            break;
+                        }
+                        if (avail == 0) break;
                         std::vector<char> chunk(avail);
                         DWORD readBytes = 0;
-                        if (WinHttpReadData(hRequest, chunk.data(), avail, &readBytes) && readBytes > 0) {
-                            ofs.write(chunk.data(), readBytes);
-                            if (onChunkBytes) onChunkBytes(readBytes);
+                        if (!WinHttpReadData(hRequest, chunk.data(), avail, &readBytes)) {
+                            readFailed = true;
+                            break;
                         }
+                        if (readBytes == 0) break;
+                        ofs.write(chunk.data(), readBytes);
+                        if (!ofs) {
+                            readFailed = true;
+                            break;
+                        }
+                        responseBytes += readBytes;
+                        if (onChunkBytes) onChunkBytes(readBytes);
                     } while (avail > 0);
                     ofs.close();
+                    if (readFailed) {
+                        okAttempt = false;
+                        outError = "Incomplete or failed HTTP response body from " + urlUtf8;
+                    } else if (contentLengthKnown && responseBytes != contentLength) {
+                        okAttempt = false;
+                        outError = "Incomplete HTTP response from " + urlUtf8 + ": received " + std::to_string(responseBytes) +
+                            " of " + std::to_string(contentLength) + " response bytes.";
+                    } else if (expectedSize > 0 && std::filesystem::file_size(partFile, ec) != expectedSize) {
+                        okAttempt = false;
+                        const uintmax_t partialSize = std::filesystem::file_size(partFile, ec);
+                        if (partialSize > expectedSize) std::filesystem::remove(partFile, ec);
+                        outError = "Downloaded artifact size mismatch for " + urlUtf8 + ": expected " +
+                            std::to_string(expectedSize) + " bytes.";
+                    }
+                } else {
+                    outError = "Could not open temporary download file " + partFile.string();
                 }
             } else {
                 outError = "HTTP " + std::to_string(status) + " fetching " + urlUtf8;

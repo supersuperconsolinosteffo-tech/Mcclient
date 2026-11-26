@@ -14,6 +14,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <tuple>
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -286,6 +287,12 @@ public:
     json authFlowState = {{"mode", "idle"}, {"message", "Ready to sign in with Microsoft."}};
     json activeDownloadState = nullptr;
     std::string activeSessionMode = "online_authenticated";
+    std::atomic<bool> backgroundInstallActive{false};
+    std::mutex jobControlMtx;
+    mutable std::mutex progressMtx;
+    std::mutex installSnapshotMtx;
+    json installSnapshotCache = nullptr;
+    std::mutex logsMtx;
     std::string manifestSource = "embedded_seed";
     std::string manifestError;
     int64_t manifestFetchedAtMs = 0;
@@ -351,12 +358,152 @@ public:
 
     void appendLog(const std::string& msg) {
         std::string clean = "[" + iso_timestamp_now().substr(11, 8) + "] " + redact_tokens(msg);
+        std::lock_guard<std::mutex> logLock(logsMtx);
         logs.push_back(clean);
         if (logs.size() > 250) {
             logs.erase(logs.begin(), logs.begin() + (logs.size() - 250));
         }
         std::ofstream ofs(dataRoot / "logs" / "launcher.log", std::ios::app);
         if (ofs) ofs << clean << "\n";
+    }
+
+    bool beginBackgroundInstallOperation() {
+        {
+            std::lock_guard<std::mutex> jobLock(jobControlMtx);
+            if (backgroundInstallActive.load()) return false;
+            cancelDownloadFlag.store(false);
+            backgroundInstallActive.store(true);
+        }
+        try {
+            std::lock_guard<std::mutex> stateLock(mtx);
+            refreshTelemetry();
+            const auto& profile = activeProfileRef();
+            json progress = {
+                {"active", true}, {"versionId", profile.value("mcVersion", "")},
+                {"profileId", state.value("activeProfileId", "")},
+                {"loader", profile.value("loader", "vanilla")}, {"status", "installing"},
+                {"stage", "Preparing installation and launch task…"}, {"percent", 0},
+                {"bytesDownloaded", 0}, {"totalBytes", 0}, {"speedBytesPerSec", 0},
+                {"etaSeconds", nullptr}, {"completedFiles", 0}, {"totalFiles", 0},
+                {"cancellable", true}, {"error", nullptr}
+            };
+            {
+                std::lock_guard<std::mutex> progressLock(progressMtx);
+                activeDownloadState = progress;
+            }
+            std::lock_guard<std::mutex> snapshotLock(installSnapshotMtx);
+            installSnapshotCache = state;
+            installSnapshotCache["activeDownload"] = progress;
+        } catch (...) {
+            std::lock_guard<std::mutex> jobLock(jobControlMtx);
+            backgroundInstallActive.store(false);
+            throw;
+        }
+        return true;
+    }
+
+    void endBackgroundInstallOperation() {
+        try {
+            json snapshot;
+            {
+                std::lock_guard<std::mutex> stateLock(mtx);
+                refreshTelemetry();
+                snapshot = state;
+            }
+            {
+                std::lock_guard<std::mutex> progressLock(progressMtx);
+                if (activeDownloadState.is_object() && activeDownloadState.value("active", false)) {
+                    activeDownloadState["active"] = false;
+                    activeDownloadState["cancellable"] = false;
+                    activeDownloadState["stage"] = "Launcher task finished.";
+                }
+                snapshot["activeDownload"] = activeDownloadState;
+            }
+            {
+                std::lock_guard<std::mutex> snapshotLock(installSnapshotMtx);
+                installSnapshotCache = std::move(snapshot);
+            }
+        } catch (...) {
+            // Even if snapshot refresh fails, release the task gate so the UI can retry.
+        }
+        {
+            std::lock_guard<std::mutex> jobLock(jobControlMtx);
+            backgroundInstallActive.store(false);
+        }
+    }
+
+    void updateBackgroundTaskStage(const std::string& status, const std::string& stage) {
+        json progress;
+        {
+            std::lock_guard<std::mutex> progressLock(progressMtx);
+            if (!activeDownloadState.is_object()) activeDownloadState = json::object();
+            activeDownloadState["active"] = true;
+            activeDownloadState["cancellable"] = true;
+            activeDownloadState["status"] = status;
+            activeDownloadState["stage"] = stage;
+            activeDownloadState["error"] = nullptr;
+            progress = activeDownloadState;
+        }
+        std::lock_guard<std::mutex> snapshotLock(installSnapshotMtx);
+        if (installSnapshotCache.is_object()) installSnapshotCache["activeDownload"] = std::move(progress);
+    }
+
+    void recordBackgroundJournalFailure(const std::string& message) {
+        json progress;
+        {
+            std::lock_guard<std::mutex> progressLock(progressMtx);
+            progress = activeDownloadState;
+        }
+        if (!progress.is_object()) return;
+        const std::string versionId = progress.value("versionId", "");
+        const std::string loader = progress.value("loader", "vanilla");
+        if (versionId.empty()) return;
+        const std::string loaderKey = loader == "fabric" ? "fabric" : (loader == "legacy_fabric" ? "legacy_fabric" : "vanilla");
+        const fs::path journalPath = getGameRootDir() / "versions" / versionId / ("vespera-install-journal-" + loaderKey + ".json");
+        std::error_code ec;
+        if (!fs::exists(journalPath, ec)) return;
+        json journal = json::parse(read_text_file(journalPath), nullptr, false);
+        if (!journal.is_object() || journal.value("state", "") == "installed") return;
+        journal["state"] = cancelDownloadFlag.load() ? "partially_downloaded" : "failed";
+        journal["failureReason"] = cancelDownloadFlag.load() ? "Cancelled by user; verified artifacts retained." : message;
+        journal["updatedAt"] = iso_timestamp_now();
+        write_text_atomic(journalPath, journal.dump(2));
+    }
+
+    void markBackgroundTaskFailure(const std::string& message) {
+        json progress;
+        {
+            std::lock_guard<std::mutex> progressLock(progressMtx);
+            if (!activeDownloadState.is_object()) activeDownloadState = json::object();
+            activeDownloadState["active"] = false;
+            activeDownloadState["cancellable"] = false;
+            if (cancelDownloadFlag.load()) {
+                activeDownloadState["status"] = "cancelled";
+                activeDownloadState["stage"] = "Cancelled · verified files preserved for recovery";
+                activeDownloadState["error"] = "Cancelled by user.";
+            } else {
+                activeDownloadState["status"] = "failed";
+                activeDownloadState["stage"] = "Task failed";
+                activeDownloadState["error"] = message;
+            }
+            progress = activeDownloadState;
+        }
+        std::lock_guard<std::mutex> snapshotLock(installSnapshotMtx);
+        if (installSnapshotCache.is_object()) installSnapshotCache["activeDownload"] = std::move(progress);
+    }
+
+    json getBackgroundInstallSnapshot() {
+        json snapshot;
+        {
+            std::lock_guard<std::mutex> snapshotLock(installSnapshotMtx);
+            snapshot = installSnapshotCache;
+        }
+        if (!snapshot.is_object()) return snapshot;
+        {
+            std::lock_guard<std::mutex> progressLock(progressMtx);
+            snapshot["activeDownload"] = activeDownloadState;
+        }
+        return snapshot;
     }
 
     static bool isValidPublicClientUuid(const std::string& s) {
@@ -436,7 +583,7 @@ public:
             bool vesperaOk = (p["loader"] == "fabric" && p.value("mcVersion", "") == "1.21.4");
             p["vesperaModCompatible"] = vesperaOk;
         }
-        state["version"] = "1.2.2";
+        state["version"] = "1.2.3";
         state["platformMode"] = "windows_native_webview2";
     }
 
@@ -461,7 +608,7 @@ public:
                 state = json::parse(read_text_file(statePath));
                 sanitizeLoadedState(defaults);
                 saveState();
-                appendLog("[Core] Loaded and verified Vespera Client v1.2.2 Windows configuration.");
+                appendLog("[Core] Loaded and verified Vespera Client v1.2.3 Windows configuration.");
                 return;
             } catch (...) {
                 appendLog("[CrashRecovery] State file corrupted; restoring verified factory configuration.");
@@ -557,7 +704,7 @@ public:
     bool refreshOfficialManifest(bool force) {
         if (!force && manifestIsFresh()) return true;
         const std::string url = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
-        HttpResponse response = winhttp_request("GET", url);
+        HttpResponse response = winhttp_request("GET", url, "", "application/json", "", &cancelDownloadFlag);
         if (response.statusCode != 200) {
             manifestError = response.statusCode > 0
                 ? "HTTP " + std::to_string(response.statusCode) + " fetching official Mojang version manifest " + url
@@ -710,9 +857,12 @@ public:
     }
 
     std::string getVersionInstallStatusOnDisk(const std::string& verId) const {
-        if (!activeDownloadState.is_null() && activeDownloadState.value("active", false) &&
-            activeDownloadState.value("versionId", "") == verId) {
-            return activeDownloadState.value("status", "downloading");
+        {
+            std::lock_guard<std::mutex> progressLock(progressMtx);
+            if (!activeDownloadState.is_null() && activeDownloadState.value("active", false) &&
+                activeDownloadState.value("versionId", "") == verId) {
+                return activeDownloadState.value("status", "downloading");
+            }
         }
         fs::path vDir = getGameRootDir() / "versions" / verId;
         std::error_code ec;
@@ -974,7 +1124,7 @@ public:
             publicAccs.push_back(acc);
             if (acc.value("active", false)) activeAccId = acc.value("id", "");
         }
-        state["version"] = "1.2.2";
+        state["version"] = "1.2.3";
         state["accounts"] = publicAccs;
         state["activeAccountId"] = activeAccId.empty() ? json(nullptr) : json(activeAccId);
         state["oauthConfig"] = {
@@ -991,8 +1141,14 @@ public:
         state["latestSnapshotId"] = latestSnapshotId;
         state["manifestSource"] = manifestSource;
         state["manifestError"] = manifestError.empty() ? json(nullptr) : json(manifestError);
-        state["activeDownload"] = activeDownloadState;
-        state["recentLogs"] = logs;
+        {
+            std::lock_guard<std::mutex> progressLock(progressMtx);
+            state["activeDownload"] = activeDownloadState;
+        }
+        {
+            std::lock_guard<std::mutex> logLock(logsMtx);
+            state["recentLogs"] = logs;
+        }
 
         bool java21Installed = false;
         for (auto& rt : state["javaRuntimes"]) {
@@ -1162,13 +1318,14 @@ public:
     }
 
     bool provisionAdoptiumJavaIfNeeded(int major) {
+        if (cancelDownloadFlag.load()) return false;
         fs::path javaw = runtimesDir / ("temurin-" + std::to_string(major)) / "bin" / "javaw.exe";
         if (fs::exists(javaw)) return true;
 
         std::string api = "https://api.adoptium.net/v3/assets/latest/" + std::to_string(major) +
                           "/hotspot?architecture=x64&image_type=jre&os=windows";
         appendLog("[JavaManager] Querying official Adoptium Temurin Java " + std::to_string(major) + " LTS...");
-        HttpResponse r = winhttp_request("GET", api);
+        HttpResponse r = winhttp_request("GET", api, "", "application/json", "", &cancelDownloadFlag);
         if (r.statusCode != 200) return false;
 
         auto arr = json::parse(r.body, nullptr, false);
@@ -1179,7 +1336,7 @@ public:
         if (link.empty()) return false;
 
         fs::path zipPath = runtimesDir / zipName;
-        if (!winhttp_download_file(link, zipPath)) return false;
+        if (!winhttp_download_file(link, zipPath, &cancelDownloadFlag)) return false;
 
         std::string actualSha = bcrypt_hash_file(zipPath, BCRYPT_SHA256_ALGORITHM);
         if (!expectedSha.empty() && _stricmp(actualSha.c_str(), expectedSha.c_str()) != 0) {
@@ -1188,6 +1345,7 @@ public:
             appendLog("[JavaManager] SHA-256 verification failed for downloaded Java archive!");
             return false;
         }
+        if (cancelDownloadFlag.load()) return false;
 
         fs::path destDir = runtimesDir / ("temurin-" + std::to_string(major));
         std::error_code ec;
@@ -1197,12 +1355,22 @@ public:
         STARTUPINFOW si{};
         si.cb = sizeof(si);
         PROCESS_INFORMATION pi{};
-        if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-            WaitForSingleObject(pi.hProcess, 120000);
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
+        if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+            fs::remove(zipPath, ec);
+            appendLog("[JavaManager] Could not start tar.exe to extract Temurin Java (Win32 error " + std::to_string(GetLastError()) + ").");
+            return false;
         }
+        DWORD waitResult = WaitForSingleObject(pi.hProcess, 120000);
+        DWORD exitCode = STILL_ACTIVE;
+        if (waitResult == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &exitCode);
+        else {
+            TerminateProcess(pi.hProcess, 1);
+            WaitForSingleObject(pi.hProcess, 5000);
+        }
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
         fs::remove(zipPath, ec);
+        if (cancelDownloadFlag.load() || waitResult != WAIT_OBJECT_0 || exitCode != 0) return false;
         return fs::exists(javaw);
     }
 
@@ -1216,7 +1384,7 @@ public:
         const std::string& reqLoaderVer,
         bool forceRepair
     ) {
-        cancelDownloadFlag.store(false);
+        const std::string activeProfileId = state.value("activeProfileId", "");
         bool verifyHashes = state["settings"].value("verifyFileHashes", true);
         fs::path gameRoot = getGameRootDir();
         fs::path vDir = gameRoot / "versions" / verId;
@@ -1232,11 +1400,40 @@ public:
         fs::create_directories(assetsRoot / "objects", ec);
         fs::create_directories(nativesDir, ec);
 
+        const std::string journalLoaderKey = loader == "fabric" ? "fabric" : (loader == "legacy_fabric" ? "legacy_fabric" : "vanilla");
+        const fs::path journalPath = vDir / ("vespera-install-journal-" + journalLoaderKey + ".json");
+        json journal = {
+            {"schemaVersion", 1},
+            {"installationId", verId + "/" + journalLoaderKey + "/" + reqLoaderVer},
+            {"versionId", verId}, {"loader", journalLoaderKey}, {"loaderVersion", reqLoaderVer},
+            {"state", "preparing"}, {"lastSuccessfulOperation", "task_started"},
+            {"failureReason", nullptr}, {"updatedAt", iso_timestamp_now()}, {"artifacts", json::array()}
+        };
+        auto persistJournal = [&]() {
+            journal["updatedAt"] = iso_timestamp_now();
+            if (!write_text_atomic(journalPath, journal.dump(2))) {
+                throw std::runtime_error("Unable to atomically persist installation recovery journal " + journalPath.string());
+            }
+        };
+        if (fs::exists(journalPath, ec)) {
+            json previousJournal = json::parse(read_text_file(journalPath), nullptr, false);
+            if (previousJournal.is_object() && previousJournal.value("versionId", "") == verId &&
+                previousJournal.value("loader", "") == journalLoaderKey) {
+                journal["recoveredFrom"] = {
+                    {"state", previousJournal.value("state", "unknown")},
+                    {"updatedAt", previousJournal.value("updatedAt", "")},
+                    {"lastSuccessfulOperation", previousJournal.value("lastSuccessfulOperation", "")}
+                };
+                appendLog("[Recovery] Re-reading journal for Minecraft " + verId + " (" + journalLoaderKey + "); existing files will be revalidated before reuse.");
+            }
+        }
+        persistJournal();
+
         if (fs::exists(receiptPath, ec)) fs::remove(receiptPath, ec);
 
         auto startTime = std::chrono::steady_clock::now();
         size_t bytesDownloaded = 0;
-        size_t totalBytes = 1;
+        size_t totalBytes = 0;
         int completedFiles = 0;
         int totalFiles = 1;
 
@@ -1245,11 +1442,12 @@ public:
             size_t speed = bytesDownloaded > 0 ? static_cast<size_t>(bytesDownloaded / elapsedSec) : 0;
             size_t rem = (totalBytes > bytesDownloaded) ? (totalBytes - bytesDownloaded) : 0;
             json eta = (speed > 0 && rem > 0) ? json(static_cast<int>((rem + speed - 1) / speed)) : json(nullptr);
-            int pct = pctOverride >= 0 ? pctOverride : static_cast<int>(std::min<size_t>(99, (bytesDownloaded * 100) / std::max<size_t>(1, totalBytes)));
-            activeDownloadState = {
-                {"active", status == "downloading" || status == "installing"},
+            (void)pctOverride;
+            int pct = status == "ready" ? 100 : (totalBytes > 0 ? static_cast<int>(std::min<size_t>(99, (bytesDownloaded * 100) / totalBytes)) : 0);
+            json progress = {
+                {"active", status == "preparing" || status == "downloading" || status == "installing" || status == "verifying" || status == "launching"},
                 {"versionId", verId},
-                {"profileId", state.value("activeProfileId", "")},
+                {"profileId", activeProfileId},
                 {"loader", loader},
                 {"status", status},
                 {"stage", stage},
@@ -1260,15 +1458,27 @@ public:
                 {"etaSeconds", eta},
                 {"completedFiles", completedFiles},
                 {"totalFiles", totalFiles},
-                {"cancellable", status == "downloading" || status == "installing"},
+                {"cancellable", status == "preparing" || status == "downloading" || status == "installing" || status == "verifying" || status == "launching"},
                 {"error", errStr.empty() ? json(nullptr) : json(errStr)}
             };
+            {
+                std::lock_guard<std::mutex> progressLock(progressMtx);
+                activeDownloadState = progress;
+            }
+            {
+                std::lock_guard<std::mutex> snapshotLock(installSnapshotMtx);
+                if (installSnapshotCache.is_object()) installSnapshotCache["activeDownload"] = std::move(progress);
+            }
         };
 
+        std::string metadataUrl;
         updateDlState("downloading", "Refreshing/validating official Mojang metadata for Minecraft " + verId + "...", 3);
+        journal["state"] = "refreshing_manifest";
+        journal["lastSuccessfulOperation"] = "installation_initialized";
+        persistJournal();
         refreshOfficialManifest(true); // online install must consult the authoritative manifest; cached data is offline fallback only
         json* manifestEntry = findManifestEntry(verId);
-        std::string manifestUrl = manifestEntry ? manifestEntry->value("manifestUrl", "") : "";
+        metadataUrl = manifestEntry ? manifestEntry->value("manifestUrl", "") : "";
         std::string expectedMetaSha1 = manifestEntry ? manifestEntry->value("sha1", "") : "";
         if (manifestSource == "live_mojang" && !manifestEntry) {
             std::string err = "Minecraft " + verId + " is not present in the current official Mojang version manifest.";
@@ -1280,13 +1490,13 @@ public:
         json meta;
         bool haveVerifiedMeta = !forceRepair && loadVerifiedCachedMetadata(verId, metaPath, expectedMetaSha1, meta, dlErr);
         if (!haveVerifiedMeta) {
-            if (manifestUrl.empty() || !isSha1Hex(expectedMetaSha1)) {
+            if (metadataUrl.empty() || !isSha1Hex(expectedMetaSha1)) {
                 std::string err = "Cannot install Minecraft " + verId + ": official manifest did not provide a trusted metadata URL and SHA-1." +
                     (manifestError.empty() ? "" : " Manifest diagnostic: " + manifestError);
                 updateDlState("failed", err, 0, err);
                 throw std::runtime_error(err);
             }
-            if (!downloadVersionMetadata(verId, metaPath, manifestUrl, expectedMetaSha1, dlErr)) {
+            if (!downloadVersionMetadata(verId, metaPath, metadataUrl, expectedMetaSha1, dlErr)) {
                 updateDlState("failed", dlErr, 0, dlErr);
                 std::error_code rmEc; fs::remove(receiptPath, rmEc);
                 throw std::runtime_error(dlErr);
@@ -1326,11 +1536,13 @@ public:
         json verifiedHashes = json::object();
         json verifiedLibraryFiles = json::array();
         fs::path assetIndexPath;
+        fs::path fabricProfilePath;
+        std::string fabricProfileUrl;
         std::vector<fs::path> nativeJars;
 
         std::string clientUrl = meta["downloads"]["client"].value("url", "");
         std::string clientSha1 = meta["downloads"]["client"].value("sha1", "");
-        size_t clientSz = meta["downloads"]["client"].value("size", 24000000ULL);
+        size_t clientSz = meta["downloads"]["client"].value("size", 0ULL);
         plan.push_back({"client_jar", clientUrl, vDir / (verId + ".jar"), clientSha1, clientSz,
                         "Mojang", verId + " client.jar", true, ""});
 
@@ -1375,7 +1587,7 @@ public:
                     }
                     const bool isNative = !parsed.classifier.empty() && parsed.classifier.find("natives-windows") != std::string::npos;
                     addMojangArtifact(name, rel, artifactUrl, artifact.value("sha1", ""),
-                                      artifact.value("size", 64000ULL), isNative);
+                                      artifact.value("size", 0ULL), isNative);
                 } else if (lib.value("downloads", json::object()).value("artifact", json::object()).empty() &&
                            !lib.contains("natives") && lib.contains("url")) {
                     // Legacy official schema: Maven coordinate plus repository base, with no artifact record.
@@ -1402,7 +1614,7 @@ public:
                     ParsedMavenCoordinate nativeCoord;
                     const std::string rel = nativeArtifact.value("path", parse_maven_coordinate(coordinate, nativeCoord) ? nativeCoord.relativePath : "");
                     addMojangArtifact(coordinate, rel, nativeArtifact.value("url", ""), nativeArtifact.value("sha1", ""),
-                                      nativeArtifact.value("size", 128000ULL), true);
+                                      nativeArtifact.value("size", 0ULL), true);
                 }
             }
         }
@@ -1413,7 +1625,8 @@ public:
             assetIndexPath = idxPath;
             if (!winhttp_download_verified(meta["assetIndex"].value("url", ""), idxPath,
                                            meta["assetIndex"].value("sha1", ""), true, &cancelDownloadFlag,
-                                           [&](size_t n) { bytesDownloaded += n; }, dlErr)) {
+                                           [&](size_t n) { bytesDownloaded += n; }, dlErr,
+                                           meta["assetIndex"].value("size", 0ULL))) {
                 dlErr = "Missing asset index " + assetIndexId + ": " + dlErr;
                 updateDlState("failed", dlErr, 0, dlErr);
                 throw std::runtime_error(dlErr);
@@ -1435,7 +1648,7 @@ public:
                     std::string pfx = h.substr(0, 2);
                     fs::path assetPath = assetsRoot / "objects" / pfx / h;
                     plan.push_back({"asset", "https://resources.download.minecraft.net/" + pfx + "/" + h,
-                                    assetPath, h, obj.value("size", 4096ULL)});
+                                    assetPath, h, obj.value("size", 0ULL)});
                     verifiedAssets.push_back(assetPath.lexically_relative(gameRoot).generic_string());
                 }
             }
@@ -1448,6 +1661,8 @@ public:
             std::string fabUrl = "https://meta.fabricmc.net/v2/versions/loader/" + url_encode_comp(verId) + "/" +
                                  url_encode_comp(resolvedLoaderVer) + "/profile/json";
             fs::path fabPath = vDir / (verId + "-fabric-" + resolvedLoaderVer + ".json");
+            fabricProfilePath = fabPath;
+            fabricProfileUrl = fabUrl;
             json fabJson;
             bool validFabricProfile = false;
             for (int profileAttempt = 1; profileAttempt <= 2 && !validFabricProfile; ++profileAttempt) {
@@ -1495,7 +1710,7 @@ public:
                         const std::string requiredEntry = parsed.artifact == "fabric-loader"
                             ? "net/fabricmc/loader/impl/launch/knot/KnotClient.class"
                             : (parsed.artifact == "intermediary" ? "mappings/mappings.tiny" : "");
-                        plan.push_back({"fabric_lib", artifactUrl, fabricLib, sha1, fl.value("size", 96000ULL),
+                        plan.push_back({"fabric_lib", artifactUrl, fabricLib, sha1, fl.value("size", 0ULL),
                                         "Fabric Loader", coordinate, true, requiredEntry});
                         verifiedLibraryFiles.push_back(fabricLib.lexically_relative(gameRoot).generic_string());
                         verifiedLibs.push_back(parsed.relativePath);
@@ -1539,22 +1754,87 @@ public:
             }
         }
         totalFiles = static_cast<int>(plan.size());
-        totalBytes = bytesDownloaded + 1;
-        for (const auto& it : plan) totalBytes += std::max<size_t>(1, it.size);
-
+        bool knownTotalSize = true;
+        size_t plannedBytes = bytesDownloaded;
         for (const auto& it : plan) {
+            if (it.size == 0) knownTotalSize = false;
+            else if (knownTotalSize) plannedBytes += it.size;
+        }
+        totalBytes = knownTotalSize ? plannedBytes : 0;
+
+        journal["installationId"] = verId + "/" + journalLoaderKey + "/" + resolvedLoaderVer;
+        journal["loaderVersion"] = resolvedLoaderVer;
+        journal["state"] = "downloading";
+        journal["lastSuccessfulOperation"] = "dependency_plan_resolved";
+        journal["failureReason"] = nullptr;
+        journal["artifacts"] = json::array();
+        for (const auto& item : plan) {
+            journal["artifacts"].push_back({
+                {"source", item.source}, {"kind", item.kind}, {"coordinate", item.coordinate},
+                {"url", item.url}, {"path", item.dest.lexically_relative(gameRoot).generic_string()},
+                {"status", "pending"}, {"downloadedSize", 0},
+                {"expectedSize", item.size == 0 ? json(nullptr) : json(item.size)},
+                {"checksumAlgorithm", item.sha1.empty() ? json(nullptr) : json("SHA-1")},
+                {"checksum", item.sha1.empty() ? json(nullptr) : json(item.sha1)},
+                {"failureReason", nullptr}
+            });
+        }
+        auto appendVerifiedMetadataArtifact = [&](const std::string& source, const std::string& kind,
+                                                  const std::string& coordinate, const std::string& url,
+                                                  const fs::path& artifactPath, const std::string& sha1) {
+            if (artifactPath.empty() || !fs::exists(artifactPath, ec)) return;
+            const size_t actualSize = static_cast<size_t>(fs::file_size(artifactPath, ec));
+            journal["artifacts"].push_back({
+                {"source", source}, {"kind", kind}, {"coordinate", coordinate}, {"url", url},
+                {"path", artifactPath.lexically_relative(gameRoot).generic_string()},
+                {"status", "complete"}, {"downloadedSize", actualSize}, {"expectedSize", nullptr},
+                {"checksumAlgorithm", sha1.empty() ? json(nullptr) : json("SHA-1")},
+                {"checksum", sha1.empty() ? json(nullptr) : json(sha1)}, {"failureReason", nullptr}
+            });
+        };
+        appendVerifiedMetadataArtifact("Mojang", "version_metadata", verId, metadataUrl, metaPath, expectedMetaSha1);
+        if (!assetIndexPath.empty()) appendVerifiedMetadataArtifact("Mojang", "asset_index", assetIndexId,
+            meta["assetIndex"].value("url", ""), assetIndexPath, meta["assetIndex"].value("sha1", ""));
+        if (!fabricProfilePath.empty()) appendVerifiedMetadataArtifact("Fabric Meta", "loader_profile", resolvedLoaderVer,
+            fabricProfileUrl, fabricProfilePath, "");
+        auto setJournalArtifactState = [&](size_t index, const std::string& status, size_t downloadedSize, const std::string& failure = "") {
+            auto& artifact = journal["artifacts"][index];
+            artifact["status"] = status;
+            fs::path journalArtifactPath = gameRoot / fs::u8path(artifact.value("path", ""));
+            fs::path partialArtifactPath = journalArtifactPath; partialArtifactPath += ".part";
+            std::error_code journalEc;
+            if (status == "complete" && fs::exists(journalArtifactPath, journalEc))
+                downloadedSize = static_cast<size_t>(fs::file_size(journalArtifactPath, journalEc));
+            else if (fs::exists(partialArtifactPath, journalEc))
+                downloadedSize = static_cast<size_t>(fs::file_size(partialArtifactPath, journalEc));
+            artifact["downloadedSize"] = downloadedSize;
+            artifact["failureReason"] = failure.empty() ? json(nullptr) : json(failure);
+            if (status == "complete") journal["lastSuccessfulOperation"] = "verified:" + artifact.value("path", "");
+            if (!failure.empty()) journal["failureReason"] = failure;
+            persistJournal();
+        };
+        persistJournal();
+
+        for (size_t itemIndex = 0; itemIndex < plan.size(); ++itemIndex) {
+            const auto& it = plan[itemIndex];
             if (cancelDownloadFlag.load()) {
+                journal["state"] = "partially_downloaded";
+                journal["failureReason"] = "Cancelled by user before next artifact.";
+                persistJournal();
                 updateDlState("partially_downloaded", "Download cancelled — partial progress saved for resume.", -1);
                 throw std::runtime_error("Download cancelled by user.");
             }
-            std::string stageMsg = "Downloading & verifying " + it.kind + " (" + std::to_string(completedFiles + 1) + "/" + std::to_string(totalFiles) + ")...";
+            const std::string stageMsg = "Downloading & verifying " + it.kind + " (" + std::to_string(completedFiles + 1) + "/" + std::to_string(totalFiles) + "): " + it.coordinate;
+            journal["state"] = "downloading";
+            journal["failureReason"] = nullptr;
+            setJournalArtifactState(itemIndex, "downloading", 0);
             updateDlState("downloading", stageMsg, -1);
             size_t chunkBytes = 0;
             bool artifactReady = false;
             for (int formatAttempt = 1; formatAttempt <= 2 && !artifactReady; ++formatAttempt) {
                 if (it.validateJar && fs::exists(it.dest, ec) && !is_valid_jar_archive(it.dest, it.requiredJarEntry)) fs::remove(it.dest, ec);
                 if (!winhttp_download_verified(it.url, it.dest, it.sha1, true, &cancelDownloadFlag,
-                                               [&](size_t n) { chunkBytes += n; bytesDownloaded += n; }, dlErr)) break;
+                                               [&](size_t n) { chunkBytes += n; bytesDownloaded += n; }, dlErr, it.size)) break;
                 if (!it.validateJar || is_valid_jar_archive(it.dest, it.requiredJarEntry)) {
                     artifactReady = true;
                 } else {
@@ -1566,37 +1846,61 @@ public:
             }
             if (!artifactReady) {
                 if (cancelDownloadFlag.load()) {
+                    journal["state"] = "partially_downloaded";
+                    dlErr = "Cancelled while downloading " + it.coordinate;
+                    setJournalArtifactState(itemIndex, "interrupted", chunkBytes, dlErr);
                     updateDlState("partially_downloaded", "Download cancelled — partial progress saved.", -1);
                 } else {
                     std::string label = it.kind == "asset" ? "Missing asset" : (it.kind == "client_jar" ? "Missing client JAR" : "Missing required library");
                     const std::string origin = it.source + (it.coordinate.empty() ? "" : " coordinate " + it.coordinate);
                     dlErr = label + " (" + origin + "; " + it.dest.string() + "): " + dlErr;
+                    journal["state"] = "failed";
+                    setJournalArtifactState(itemIndex, "failed", chunkBytes, dlErr);
                     updateDlState("failed", dlErr, -1, dlErr);
                 }
                 throw std::runtime_error(dlErr);
             }
-            if (chunkBytes == 0) bytesDownloaded += it.size;
+            setJournalArtifactState(itemIndex, "complete", chunkBytes);
             completedFiles++;
         }
+
+        journal["state"] = "verifying";
+        journal["lastSuccessfulOperation"] = "all_planned_artifacts_downloaded";
+        persistJournal();
 
         // Extract Windows native DLLs via built-in tar.exe
         updateDlState("installing", "Extracting Windows x64 native libraries...", 96);
         int extractedNatives = 0;
         for (const auto& nj : nativeJars) {
-            if (!fs::exists(nj, ec)) continue;
+            if (cancelDownloadFlag.load()) throw std::runtime_error("Installation cancelled while extracting native libraries.");
+            if (!fs::exists(nj, ec)) {
+                throw std::runtime_error("Required native library archive is missing: " + nj.string());
+            }
             std::wstring cmd = L"tar.exe -xf \"" + nj.wstring() + L"\" -C \"" + nativesDir.wstring() + L"\"";
             STARTUPINFOW si{};
             si.cb = sizeof(si);
             PROCESS_INFORMATION pi{};
-            if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-                WaitForSingleObject(pi.hProcess, 30000);
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
-                extractedNatives++;
+            if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+                throw std::runtime_error("Unable to start tar.exe to extract native archive " + nj.string() + ". Win32 error " + std::to_string(GetLastError()));
             }
+            DWORD waitResult = WaitForSingleObject(pi.hProcess, 30000);
+            DWORD exitCode = STILL_ACTIVE;
+            if (waitResult == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &exitCode);
+            else {
+                TerminateProcess(pi.hProcess, 1);
+                WaitForSingleObject(pi.hProcess, 5000);
+            }
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            if (waitResult != WAIT_OBJECT_0 || exitCode != 0) {
+                throw std::runtime_error("Native archive extraction failed for " + nj.string() +
+                    (waitResult == WAIT_TIMEOUT ? " (timed out after 30 seconds)." : " (tar.exe exit code " + std::to_string(exitCode) + ")."));
+            }
+            extractedNatives++;
         }
         fs::remove_all(nativesDir / "META-INF", ec);
 
+        updateDlState("verifying", "Revalidating metadata, client JAR, libraries, and assets…", -1);
         for (const auto& item : plan) {
             if (item.url.empty() || !fs::exists(item.dest, ec) || fs::file_size(item.dest, ec) == 0) {
                 std::string label = item.kind == "asset" ? "Missing asset" : (item.kind == "client_jar" ? "Missing client JAR" : "Missing required library");
@@ -1650,6 +1954,11 @@ public:
                     {"coordinate", item.coordinate}, {"requiredEntry", item.requiredJarEntry}});
             }
         }
+        journal["state"] = "verified";
+        journal["failureReason"] = nullptr;
+        journal["lastSuccessfulOperation"] = "complete_artifact_integrity_validation";
+        persistJournal();
+
         json receipt = {
             {"schemaVersion", 1},
             {"versionId", verId},
@@ -1667,7 +1976,12 @@ public:
             {"nativesExtractedCount", extractedNatives},
             {"installedAt", iso_timestamp_now()}
         };
-        write_text_atomic(receiptPath, receipt.dump(2));
+        if (!write_text_atomic(receiptPath, receipt.dump(2))) {
+            throw std::runtime_error("Could not atomically write verified installation receipt for Minecraft " + verId + ".");
+        }
+        journal["state"] = "installed";
+        journal["lastSuccessfulOperation"] = "receipt_committed";
+        persistJournal();
         updateDlState("ready", "Minecraft " + verId + " verified and ready to launch.", 100);
         appendLog("[VersionManager] Verified & installed Minecraft " + verId + " (" + loader + ").");
         return receipt;
@@ -1945,7 +2259,7 @@ public:
     }
 
     /**
-     * Primary Vespera v1.2.2 Windows Sign-In: OAuth 2.0 Authorization Code + PKCE (`S256`)
+     * Primary Vespera v1.2.3 Windows Sign-In: OAuth 2.0 Authorization Code + PKCE (`S256`)
      * via default system browser (`ShellExecuteW`) + temporary loopback listener (`http://localhost:<port>`).
      */
     json startBrowserPkceAuthNative() {
@@ -2299,6 +2613,19 @@ public:
     }
 
     json handleRpc(const std::string& method, const json& params) {
+        if (backgroundInstallActive.load()) {
+            if (method == "getSnapshot") return getBackgroundInstallSnapshot();
+            if (method == "cancelVersionDownload") {
+                {
+                    std::lock_guard<std::mutex> jobLock(jobControlMtx);
+                    if (backgroundInstallActive.load()) cancelDownloadFlag.store(true);
+                }
+                return {{"cancelled", true}, {"snapshot", getBackgroundInstallSnapshot()}};
+            }
+            if (method != "installVersion" && method != "launchMinecraft" && method != "syncVersions" && method != "verifyAndRepair" && method != "getFabricLoaders") {
+                throw std::runtime_error("An installation or launch task is active; retry this operation when it finishes.");
+            }
+        }
         if (method == "installVersion") {
             std::string verId;
             std::string loader;
@@ -2949,7 +3276,7 @@ public:
         if (method == "getFabricLoaders") {
             std::string mcVer = params.value("mcVersion", activeProfileRef().value("mcVersion", "1.21.4"));
             json loaders = json::array();
-            HttpResponse r = winhttp_request("GET", "https://meta.fabricmc.net/v2/versions/loader/" + url_encode_comp(mcVer));
+            HttpResponse r = winhttp_request("GET", "https://meta.fabricmc.net/v2/versions/loader/" + url_encode_comp(mcVer), "", "application/json", "", &cancelDownloadFlag);
             if (r.statusCode == 200) {
                 json arr = json::parse(r.body, nullptr, false);
                 if (arr.is_array()) {
@@ -3076,10 +3403,12 @@ public:
                 installMinecraftVersionNative(mcVer, loader, prof.value("loaderVersion", "0.16.10"), false);
             }
 
+            updateBackgroundTaskStage("launching", "Configuring Java runtime and validating launch arguments…");
             json prep = buildLaunchPreparation(prof, mode);
             int javaMajor = prep.value("javaMajor", infer_java_major_cpp(mcVer, "release", ""));
             fs::path javaw = fs::u8path(prep.value("javaExecutable", ""));
             if (!fs::exists(javaw)) {
+                updateBackgroundTaskStage("launching", "Provisioning compatible Eclipse Temurin Java " + std::to_string(javaMajor) + "…");
                 if (!provisionAdoptiumJavaIfNeeded(javaMajor)) {
                     throw std::runtime_error("Unable to auto-provision Adoptium Temurin Java " + std::to_string(javaMajor));
                 }
@@ -3097,6 +3426,7 @@ public:
                 cmd << "\"" << s << "\" ";
             }
 
+            updateBackgroundTaskStage("launching", "Starting Minecraft Java process…");
             std::wstring wcmd = utf8_to_wide(cmd.str());
             STARTUPINFOW si{};
             si.cb = sizeof(si);
@@ -3152,6 +3482,11 @@ public:
     }
 };
 
+struct NativeRpcTaskGroup {
+    std::mutex mutex;
+    std::vector<std::thread> workers;
+};
+
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
@@ -3162,25 +3497,80 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
     VesperaNativeEngine engine;
 
     webview::webview w(false, nullptr);
-    w.set_title("Vespera Client v1.2.2 — Precision Minecraft Java Edition Client");
+    w.set_title("Vespera Client v1.2.3 — Precision Minecraft Java Edition Client");
     w.set_size(1340, 860, WEBVIEW_HINT_NONE);
 
-    w.bind("vesperaNativeInvoke", [&engine](const std::string& reqArrayJson) -> std::string {
+    NativeRpcTaskGroup rpcTasks;
+    std::tuple<VesperaNativeEngine*, NativeRpcTaskGroup*, webview::webview*> rpcContext{&engine, &rpcTasks, &w};
+    w.bind("vesperaNativeInvoke", [](std::string id, std::string reqArrayJson, void* context) {
+        auto* tuple = static_cast<std::tuple<VesperaNativeEngine*, NativeRpcTaskGroup*, webview::webview*>*>(context);
+        VesperaNativeEngine& engine = *std::get<0>(*tuple);
+        NativeRpcTaskGroup& tasks = *std::get<1>(*tuple);
+        webview::webview& webviewRef = *std::get<2>(*tuple);
+        std::string method;
+        json params = json::object();
         try {
             json args = json::parse(reqArrayJson);
-            std::string payloadStr = args.at(0).get<std::string>();
-            json req = json::parse(payloadStr);
-            std::string method = req.value("method", "");
-            json params = req.value("params", json::object());
-            json result = engine.handleRpc(method, params);
-            return json({{"ok", true}, {"data", result}}).dump();
+            json req = json::parse(args.at(0).get<std::string>());
+            method = req.value("method", "");
+            params = req.value("params", json::object());
         } catch (const std::exception& ex) {
-            return json({{"ok", false}, {"error", ex.what()}}).dump();
+            webviewRef.resolve(id, 0, json({{"ok", false}, {"error", ex.what()}}).dump());
+            return;
         }
-    });
+
+        if (method == "installVersion" || method == "launchMinecraft" || method == "syncVersions" || method == "verifyAndRepair" || method == "getFabricLoaders") {
+            std::lock_guard<std::mutex> taskLock(tasks.mutex);
+            webview::webview* webviewPtr = &webviewRef;
+            tasks.workers.emplace_back([&engine, webviewPtr, id = std::move(id), method = std::move(method), params = std::move(params)]() mutable {
+                try {
+                    if (!engine.beginBackgroundInstallOperation()) {
+                        webviewPtr->resolve(id, 0, json({{"ok", false}, {"error", "An installation or launch task is already active."}}).dump());
+                        return;
+                    }
+                } catch (const std::exception& ex) {
+                    webviewPtr->resolve(id, 0, json({{"ok", false}, {"error", ex.what()}}).dump());
+                    return;
+                }
+                try {
+                    json result = engine.handleRpc(method, params);
+                    engine.endBackgroundInstallOperation();
+                    webviewPtr->resolve(id, 0, json({{"ok", true}, {"data", result}}).dump());
+                } catch (const std::exception& ex) {
+                    if (method == "installVersion" || method == "launchMinecraft") engine.recordBackgroundJournalFailure(ex.what());
+                    engine.markBackgroundTaskFailure(ex.what());
+                    engine.endBackgroundInstallOperation();
+                    webviewPtr->resolve(id, 0, json({{"ok", false}, {"error", ex.what()}}).dump());
+                } catch (...) {
+                    if (method == "installVersion" || method == "launchMinecraft") engine.recordBackgroundJournalFailure("Unknown native RPC failure.");
+                    engine.markBackgroundTaskFailure("Unknown native RPC failure.");
+                    engine.endBackgroundInstallOperation();
+                    webviewPtr->resolve(id, 0, json({{"ok", false}, {"error", "Unknown native RPC failure."}}).dump());
+                }
+            });
+            return;
+        }
+
+        try {
+            json result = engine.handleRpc(method, params);
+            webviewRef.resolve(id, 0, json({{"ok", true}, {"data", result}}).dump());
+        } catch (const std::exception& ex) {
+            webviewRef.resolve(id, 0, json({{"ok", false}, {"error", ex.what()}}).dump());
+        } catch (...) {
+            webviewRef.resolve(id, 0, json({{"ok", false}, {"error", "Unknown native RPC failure."}}).dump());
+        }
+    }, &rpcContext);
 
     w.set_html(kEmbeddedUiHtml);
     w.run();
+    engine.cancelDownloadFlag.store(true);
+    engine.cancelAuthFlag.store(true);
+    {
+        std::lock_guard<std::mutex> taskLock(rpcTasks.mutex);
+        for (auto& worker : rpcTasks.workers) {
+            if (worker.joinable()) worker.join();
+        }
+    }
 
     CoUninitialize();
     return 0;

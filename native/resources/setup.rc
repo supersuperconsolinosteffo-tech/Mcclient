@@ -13,12 +13,12 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "Vespera Labs"
       VALUE "FileDescription", "Vespera Client Setup Installer (64-bit)"
-      VALUE "FileVersion", "1.2.2.0"
+      VALUE "FileVersion", "1.2.3.0"
       VALUE "InternalName", "VesperaSetup"
       VALUE "LegalCopyright", "Copyright (c) 2026 Vespera Labs"
-      VALUE "OriginalFilename", "VesperaClient-1.2.2-win64-setup.exe"
+      VALUE "OriginalFilename", "VesperaClient-1.2.3-win64-setup.exe"
       VALUE "ProductName", "Vespera Client Setup"
-      VALUE "ProductVersion", "1.2.2"
+      VALUE "ProductVersion", "1.2.3"
     END
   END
   BLOCK "VarFileInfo"

@@ -53,6 +53,8 @@ function installStatusBadgeHtml(status: VersionInstallStatus | undefined): strin
     case 'ready':
     case 'installed':
       return `<span class="badge badge-supported">✓ Ready to Launch</span>`;
+    case 'preparing':
+      return `<span class="badge badge-experimental">◌ Preparing…</span>`;
     case 'downloading':
       return `<span class="badge badge-experimental">⬇ Downloading…</span>`;
     case 'installing':
@@ -63,6 +65,14 @@ function installStatusBadgeHtml(status: VersionInstallStatus | undefined): strin
       return `<span class="badge badge-legacy">◌ Metadata Cached</span>`;
     case 'update_available':
       return `<span class="badge badge-warning">↑ Update Available</span>`;
+    case 'verifying':
+      return `<span class="badge badge-experimental">✓ Verifying…</span>`;
+    case 'launching':
+      return `<span class="badge badge-experimental">▶ Launching…</span>`;
+    case 'running':
+      return `<span class="badge badge-supported">● Running</span>`;
+    case 'cancelled':
+      return `<span class="badge badge-warning">Ⅱ Cancelled · recovery available</span>`;
     case 'failed':
       return `<span class="badge badge-critical">✕ Install Failed</span>`;
     default:
@@ -427,7 +437,7 @@ export function renderPlayPage(
       </div>
 
       ${
-        dl && (dl.active || dl.status === 'failed' || dl.percent === 100)
+        dl && (dl.active || dl.status === 'failed' || dl.status === 'cancelled' || dl.status === 'partially_downloaded' || dl.percent === 100)
           ? `
         <div style="margin-top:16px;padding:12px 14px;border-radius:8px;background:var(--bg-canvas);border:1px solid ${
           dl.status === 'failed' ? 'rgba(239,68,68,0.45)' : 'var(--accent-cyan)'
@@ -440,7 +450,7 @@ export function renderPlayPage(
               <span style="font-size:12px;color:var(--text-secondary);margin-left:8px">${escapeHtml(dl.stage)}</span>
             </div>
             <div style="display:flex;align-items:center;gap:12px;font-family:var(--font-mono);font-size:11.5px">
-              <span>${formatBytesHuman(dl.bytesDownloaded)} / ${formatBytesHuman(dl.totalBytes)}</span>
+              <span>${dl.totalBytes > 0 ? `${formatBytesHuman(dl.bytesDownloaded)} / ${formatBytesHuman(dl.totalBytes)}` : `${formatBytesHuman(dl.bytesDownloaded)} transferred · total size unknown`}</span>
               ${
                 dl.active && dl.speedBytesPerSec > 0
                   ? `<span style="color:var(--accent-cyan)">${formatBytesHuman(dl.speedBytesPerSec)}/s</span>`
@@ -451,16 +461,21 @@ export function renderPlayPage(
                   ? `<span>ETA ${dl.etaSeconds}s</span>`
                   : ''
               }
-              <strong>${dl.percent}%</strong>
+              <strong>${dl.totalBytes > 0 ? `${dl.percent}%` : '…'}</strong>
               ${
                 dl.cancellable
                   ? `<button class="btn btn-sm btn-danger" id="btn-cancel-version-download">✕ Cancel</button>`
                   : ''
               }
+              ${
+                dl.status === 'failed' || dl.status === 'cancelled' || dl.status === 'partially_downloaded'
+                  ? `<button class="btn btn-sm" id="btn-retry-version-download" data-version-id="${escapeHtml(dl.versionId || activeProfile.mcVersion)}">↻ Retry / Resume</button>`
+                  : ''
+              }
             </div>
           </div>
           <div style="margin-top:8px;height:8px;border-radius:999px;background:rgba(148,163,184,0.16);overflow:hidden">
-            <div style="height:100%;width:${Math.max(2, dl.percent)}%;background:${
+            <div class="${dl.totalBytes > 0 ? '' : 'install-progress-indeterminate'}" style="height:100%;width:${dl.totalBytes > 0 ? Math.max(2, dl.percent) : 36}%;background:${
               dl.status === 'failed'
                 ? '#ef4444'
                 : dl.status === 'ready'
@@ -886,6 +901,10 @@ export function bindHomeAndPlayEvents(
 
   stage.querySelector('#btn-cancel-version-download')?.addEventListener('click', () => {
     callbacks.onCancelDownload();
+  });
+  stage.querySelector('#btn-retry-version-download')?.addEventListener('click', (event) => {
+    const versionId = (event.currentTarget as HTMLElement).dataset.versionId || '';
+    callbacks.onInstallVersion(versionId, false);
   });
 
   stage.querySelectorAll<HTMLElement>('[data-delete-version-id]').forEach((btn) => {
